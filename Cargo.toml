@@ -1,0 +1,33 @@
+[package]
+name = "wayland-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Wayland proxy, capture, and compositor-side input MCP server"
+readme = "README.md"
+publish = false
+exclude = ["/.private/**"]
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+rmcp = { version = "1.8.0", default-features = false, features = ["base64", "server", "transport-async-rw"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+serial_test = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

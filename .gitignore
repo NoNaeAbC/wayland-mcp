@@ -1,0 +1,10 @@
+/target/
+
+# Machine-specific acceptance harnesses and retained results are private.
+/.private/
+
+# Editor and interpreter by-products.
+**/__pycache__/
+*.py[cod]
+*.swp
+.DS_Store
