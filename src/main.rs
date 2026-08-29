@@ -44,6 +44,7 @@ struct WaylandMcp {
 
 pub(crate) struct ArtifactStore {
     directory: PathBuf,
+    secure_directory: bool,
     next_id: AtomicU64,
     event_log_lock: Mutex<()>,
 }
@@ -152,6 +153,7 @@ impl WaylandMcp {
 impl ArtifactStore {
     pub(crate) fn new() -> Self {
         let configured_directory = std::env::var_os("WAYLAND_MCP_ARTIFACT_DIR");
+        let secure_directory = configured_directory.is_none();
         let directory = configured_directory
             .as_ref()
             .map(PathBuf::from)
@@ -166,29 +168,36 @@ impl ArtifactStore {
                     std::process::id(),
                 ))
             });
-        if let Err(err) = std::fs::create_dir_all(&directory) {
-            eprintln!(
-                "wayland-mcp: failed to create artifact directory {}: {err}",
-                directory.display()
-            );
-        }
-        #[cfg(unix)]
-        if configured_directory.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(err) =
-                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            {
-                eprintln!(
-                    "wayland-mcp: failed to secure artifact directory {}: {err}",
-                    directory.display()
-                );
-            }
-        }
-        Self {
+        let store = Self {
             directory,
+            secure_directory,
             next_id: AtomicU64::new(1),
             event_log_lock: Mutex::new(()),
+        };
+        if let Err(err) = store.ensure_directory() {
+            eprintln!(
+                "wayland-mcp: failed to create artifact directory {}: {err}",
+                store.directory.display()
+            );
         }
+        store
+    }
+
+    fn ensure_directory(&self) -> std::io::Result<()> {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        if self.secure_directory {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&self.directory)?;
+        #[cfg(unix)]
+        if self.secure_directory {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn record(&self, event: &str, data: serde_json::Value) {
@@ -202,6 +211,13 @@ impl ArtifactStore {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if let Err(err) = self.ensure_directory() {
+            eprintln!(
+                "wayland-mcp: failed to prepare artifact directory {}: {err}",
+                self.directory.display()
+            );
+            return;
+        }
         let mut encoded = match serde_json::to_vec(&entry) {
             Ok(encoded) => encoded,
             Err(err) => {
@@ -236,6 +252,12 @@ impl ArtifactStore {
         let path = self
             .directory
             .join(format!("{id:06}-{operation}-{window}.png"));
+        self.ensure_directory().map_err(|err| {
+            format!(
+                "failed to prepare artifact directory {}: {err}",
+                self.directory.display()
+            )
+        })?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -424,5 +446,45 @@ mod tests {
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(|properties| !properties.contains_key("action"))
         );
+    }
+
+    #[test]
+    fn artifact_store_recreates_missing_directory_for_events_and_pngs() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let directory = temporary.path().join("artifacts");
+        let store = ArtifactStore {
+            directory: directory.clone(),
+            secure_directory: true,
+            next_id: AtomicU64::new(1),
+            event_log_lock: Mutex::new(()),
+        };
+
+        store.ensure_directory().expect("initialize artifact store");
+        std::fs::remove_dir_all(&directory).expect("remove artifact directory");
+        store.record("directory_recreated", json!({"write": "event"}));
+        let events = std::fs::read_to_string(directory.join("events.jsonl"))
+            .expect("event log should be recreated");
+        assert!(events.contains("directory_recreated"));
+
+        std::fs::remove_dir_all(&directory).expect("remove artifact directory again");
+        let png = store
+            .save_png("test", Some("window/1"), b"png bytes")
+            .expect("PNG write should recreate the artifact directory");
+        assert_eq!(
+            std::fs::read(&png).expect("read retained PNG"),
+            b"png bytes"
+        );
+        assert!(directory.join("events.jsonl").is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&directory)
+                .expect("artifact directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 }
