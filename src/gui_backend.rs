@@ -42,6 +42,31 @@ pub(crate) struct GuiWaylandKeyboardEventRequest {
     pub(crate) event: GuiWaylandKeyboardEvent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuiKeyboardTextPlanRequest {
+    pub(crate) window_id: Option<String>,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct GuiKeyboardTextStroke {
+    pub(crate) key: u32,
+    pub(crate) modifiers: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct GuiKeyboardTextPlan {
+    pub(crate) layout_group: u32,
+    pub(crate) restore_mods_depressed: u32,
+    pub(crate) restore_mods_latched: u32,
+    pub(crate) restore_mods_locked: u32,
+    pub(crate) shift_modifier: Option<u32>,
+    pub(crate) control_modifier: Option<u32>,
+    pub(crate) alt_modifier: Option<u32>,
+    pub(crate) logo_modifier: Option<u32>,
+    pub(crate) strokes: Vec<GuiKeyboardTextStroke>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum GuiWaylandPointerEvent {
@@ -185,6 +210,11 @@ pub(crate) trait GuiBackend: Send + Sync {
         &self,
         request: GuiWaylandKeyboardEventRequest,
     ) -> Result<String, String>;
+
+    async fn keyboard_text_plan(
+        &self,
+        request: GuiKeyboardTextPlanRequest,
+    ) -> Result<GuiKeyboardTextPlan, String>;
 }
 
 #[derive(Clone)]
@@ -192,6 +222,8 @@ pub(crate) enum GuiBackendHandle {
     Command(Arc<CommandGuiBackend>),
     #[cfg(unix)]
     Wayland(Arc<WaylandGuiBackend>),
+    #[cfg(test)]
+    Test(Arc<dyn GuiBackend>),
 }
 
 impl GuiBackendHandle {
@@ -200,6 +232,8 @@ impl GuiBackendHandle {
             Self::Command(backend) => backend.list_windows().await,
             #[cfg(unix)]
             Self::Wayland(backend) => backend.list_windows().await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.list_windows().await,
         }
     }
 
@@ -211,6 +245,8 @@ impl GuiBackendHandle {
             Self::Command(backend) => backend.screenshot(request).await,
             #[cfg(unix)]
             Self::Wayland(backend) => backend.screenshot(request).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.screenshot(request).await,
         }
     }
 
@@ -222,6 +258,8 @@ impl GuiBackendHandle {
             Self::Command(backend) => backend.capture_next_frame(request).await,
             #[cfg(unix)]
             Self::Wayland(backend) => backend.capture_next_frame(request).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.capture_next_frame(request).await,
         }
     }
 
@@ -233,6 +271,8 @@ impl GuiBackendHandle {
             Self::Command(backend) => backend.emit_wayland_pointer_event(request).await,
             #[cfg(unix)]
             Self::Wayland(backend) => backend.emit_wayland_pointer_event(request).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.emit_wayland_pointer_event(request).await,
         }
     }
 
@@ -244,6 +284,21 @@ impl GuiBackendHandle {
             Self::Command(backend) => backend.emit_wayland_keyboard_event(request).await,
             #[cfg(unix)]
             Self::Wayland(backend) => backend.emit_wayland_keyboard_event(request).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.emit_wayland_keyboard_event(request).await,
+        }
+    }
+
+    pub(crate) async fn keyboard_text_plan(
+        &self,
+        request: GuiKeyboardTextPlanRequest,
+    ) -> Result<GuiKeyboardTextPlan, String> {
+        match self {
+            Self::Command(backend) => backend.keyboard_text_plan(request).await,
+            #[cfg(unix)]
+            Self::Wayland(backend) => backend.keyboard_text_plan(request).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.keyboard_text_plan(request).await,
         }
     }
 }
@@ -292,9 +347,11 @@ pub(crate) fn ensure_default_gui_backend_initialized() {
                 std::env::remove_var("DISPLAY");
                 std::env::remove_var("XAUTHORITY");
             }
-            for (key, value) in backend.sandbox_env() {
-                unsafe {
-                    std::env::set_var(key, value);
+            if let Ok(environment) = backend.sandbox_env() {
+                for (key, value) in environment {
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
                 }
             }
         }
@@ -377,6 +434,13 @@ impl GuiBackend for CommandGuiBackend {
     ) -> Result<String, String> {
         Err("raw Wayland keyboard events are unavailable on the command backend".to_string())
     }
+
+    async fn keyboard_text_plan(
+        &self,
+        _request: GuiKeyboardTextPlanRequest,
+    ) -> Result<GuiKeyboardTextPlan, String> {
+        Err("text entry is unavailable on the command backend".to_string())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -438,10 +502,9 @@ mod tests {
         ensure_default_gui_backend_initialized();
 
         let startup_error = match default_gui_backend() {
-            GuiBackendHandle::Wayland(backend) => {
-                backend.transport_startup_error().map(str::to_string)
-            }
+            GuiBackendHandle::Wayland(backend) => backend.transport_startup_error(),
             GuiBackendHandle::Command(_) => Some("command backend selected".to_string()),
+            GuiBackendHandle::Test(_) => Some("test backend selected".to_string()),
         };
         if startup_error.is_some() {
             assert_eq!(env::var_os("DISPLAY"), Some(":1".into()));

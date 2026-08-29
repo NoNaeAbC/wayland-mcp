@@ -11,8 +11,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::ArtifactStore;
 use crate::gui_backend::{
-    GuiBackendHandle, GuiCaptureNextFrameRequest, GuiScreenshotRequest, GuiWaylandKeyboardEvent,
-    GuiWaylandKeyboardEventRequest, GuiWaylandPointerEvent, GuiWaylandPointerEventRequest,
+    GuiBackendHandle, GuiCaptureNextFrameRequest, GuiKeyboardTextPlanRequest, GuiScreenshotRequest,
+    GuiWaylandKeyboardEvent, GuiWaylandKeyboardEventRequest, GuiWaylandPointerEvent,
+    GuiWaylandPointerEventRequest,
 };
 
 const NODE_RUNTIME: &str = include_str!("wayland_console_runtime.mjs");
@@ -304,8 +305,10 @@ async fn handle_native_call(
     match method {
         "environment" => {
             let environment = match backend {
-                GuiBackendHandle::Wayland(backend) => backend.sandbox_env(),
+                GuiBackendHandle::Wayland(backend) => backend.sandbox_env()?,
                 GuiBackendHandle::Command(_) => HashMap::new(),
+                #[cfg(test)]
+                GuiBackendHandle::Test(_) => HashMap::new(),
             };
             Ok((
                 serde_json::to_value(environment).map_err(|err| err.to_string())?,
@@ -320,6 +323,11 @@ async fn handle_native_call(
                 GuiBackendHandle::Command(_) => json!({
                     "running": false,
                     "last_runtime_error": "Wayland proxy backend is not active"
+                }),
+                #[cfg(test)]
+                GuiBackendHandle::Test(_) => json!({
+                    "running": true,
+                    "last_runtime_error": null
                 }),
             };
             Ok((diagnostics, None))
@@ -390,6 +398,21 @@ async fn handle_native_call(
             );
             Ok((json!({"delivered": true, "detail": result}), None))
         }
+        "keyboard_text_plan" => {
+            let window_id = optional_string(&args, "windowId");
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "typeText requires text".to_string())?
+                .to_string();
+            let plan = backend
+                .keyboard_text_plan(GuiKeyboardTextPlanRequest { window_id, text })
+                .await?;
+            Ok((
+                serde_json::to_value(plan).map_err(|err| err.to_string())?,
+                None,
+            ))
+        }
         other => Err(format!("unknown JavaScript native call `{other}`")),
     }
 }
@@ -441,6 +464,104 @@ fn fail_pending(pending: &mut HashMap<u64, PendingEval>, error: String) {
 mod tests {
     use super::*;
     use crate::gui_backend::CommandGuiBackend;
+    use crate::gui_backend::GuiBackend;
+    use crate::gui_backend::GuiKeyboardTextPlan;
+    use crate::gui_backend::GuiKeyboardTextStroke;
+    use crate::gui_backend::GuiWindowInfo;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        keyboard_events: StdMutex<Vec<GuiWaylandKeyboardEventRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GuiBackend for RecordingBackend {
+        async fn list_windows(&self) -> Result<Vec<GuiWindowInfo>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn screenshot(&self, _request: GuiScreenshotRequest) -> Result<Vec<u8>, String> {
+            Err("screenshot is not used by this test backend".to_string())
+        }
+
+        async fn capture_next_frame(
+            &self,
+            _request: GuiCaptureNextFrameRequest,
+        ) -> Result<Vec<u8>, String> {
+            Err("capture is not used by this test backend".to_string())
+        }
+
+        async fn emit_wayland_pointer_event(
+            &self,
+            _request: GuiWaylandPointerEventRequest,
+        ) -> Result<String, String> {
+            Err("pointer input is not used by this test backend".to_string())
+        }
+
+        async fn emit_wayland_keyboard_event(
+            &self,
+            request: GuiWaylandKeyboardEventRequest,
+        ) -> Result<String, String> {
+            self.keyboard_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            Ok("recorded keyboard event".to_string())
+        }
+
+        async fn keyboard_text_plan(
+            &self,
+            request: GuiKeyboardTextPlanRequest,
+        ) -> Result<GuiKeyboardTextPlan, String> {
+            let strokes = match request.text.as_str() {
+                "Az 0!?" => vec![
+                    GuiKeyboardTextStroke {
+                        key: 30,
+                        modifiers: 1,
+                    },
+                    GuiKeyboardTextStroke {
+                        key: 21,
+                        modifiers: 0,
+                    },
+                    GuiKeyboardTextStroke {
+                        key: 57,
+                        modifiers: 0,
+                    },
+                    GuiKeyboardTextStroke {
+                        key: 11,
+                        modifiers: 0,
+                    },
+                    GuiKeyboardTextStroke {
+                        key: 2,
+                        modifiers: 1,
+                    },
+                    GuiKeyboardTextStroke {
+                        key: 12,
+                        modifiers: 1,
+                    },
+                ],
+                "z" => vec![GuiKeyboardTextStroke {
+                    key: 21,
+                    modifiers: 0,
+                }],
+                unexpected => return Err(format!("unexpected text fixture: {unexpected:?}")),
+            };
+            Ok(GuiKeyboardTextPlan {
+                layout_group: 0,
+                restore_mods_depressed: 0,
+                restore_mods_latched: 0,
+                restore_mods_locked: 0,
+                shift_modifier: Some(1),
+                control_modifier: Some(4),
+                alt_modifier: Some(8),
+                logo_modifier: Some(64),
+                // These are inverse mappings from a German XKB keymap,
+                // notably Z on evdev 21 and ? on evdev 12.
+                strokes,
+            })
+        }
+    }
 
     #[tokio::test]
     async fn javascript_definitions_persist_across_console_calls() {
@@ -453,6 +574,9 @@ mod tests {
             .await
             .unwrap();
         assert!(help.value.as_str().unwrap().contains("globalThis.click"));
+        assert!(help.value.as_str().unwrap().contains("pressShortcut"));
+        assert!(help.value.as_str().unwrap().contains("typeText"));
+        assert!(help.value.as_str().unwrap().contains("actAndCapture"));
 
         console
             .eval("globalThis.twice = async function(value) { await wayland.sleep(1); return value * 2; }; return 'defined';".to_string())
@@ -463,6 +587,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(called.value, json!(42));
+    }
+
+    #[tokio::test]
+    async fn type_text_emits_the_keymap_derived_keyboard_sequence() {
+        let recording = Arc::new(RecordingBackend::default());
+        let backend = GuiBackendHandle::Test(recording.clone());
+        let artifacts = Arc::new(ArtifactStore::new());
+        let console = JsConsole::new(backend, artifacts);
+
+        let output = console
+            .eval("return await wayland.typeText({windowId:'fixture', text:'Az 0!?'});".to_string())
+            .await
+            .expect("representative keymap-derived text should be emitted");
+
+        assert_eq!(output.value["delivered"], json!(true));
+        assert_eq!(output.value["keymapDriven"], json!(true));
+        let recorded = recording
+            .keyboard_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(
+            recorded
+                .iter()
+                .all(|request| request.window_id.as_deref() == Some("fixture"))
+        );
+        let actual = recorded
+            .into_iter()
+            .map(|request| request.event)
+            .collect::<Vec<_>>();
+        let key = |key, state| GuiWaylandKeyboardEvent::Key {
+            key,
+            state,
+            serial: None,
+            time: None,
+        };
+        let modifiers = |mods_depressed| GuiWaylandKeyboardEvent::Modifiers {
+            mods_depressed,
+            mods_latched: 0,
+            mods_locked: 0,
+            group: 0,
+            serial: None,
+        };
+        assert_eq!(
+            actual,
+            vec![
+                GuiWaylandKeyboardEvent::Enter {
+                    serial: None,
+                    keys: Vec::new(),
+                },
+                modifiers(1),
+                key(30, 1),
+                key(30, 0),
+                modifiers(0),
+                key(21, 1),
+                key(21, 0),
+                key(57, 1),
+                key(57, 0),
+                key(11, 1),
+                key(11, 0),
+                modifiers(1),
+                key(2, 1),
+                key(2, 0),
+                key(12, 1),
+                key(12, 0),
+                modifiers(0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn shortcut_character_and_modifier_are_keymap_derived() {
+        let recording = Arc::new(RecordingBackend::default());
+        let backend = GuiBackendHandle::Test(recording.clone());
+        let artifacts = Arc::new(ArtifactStore::new());
+        let console = JsConsole::new(backend, artifacts);
+
+        let output = console
+            .eval(
+                "return await wayland.pressShortcut({windowId:'fixture', keys:['CTRL','Z'], holdMs:0});"
+                    .to_string(),
+            )
+            .await
+            .expect("keymap-derived shortcut");
+
+        assert_eq!(output.value["keyCode"], json!(21));
+        assert_eq!(output.value["modifierMask"], json!(4));
+        let actual = recording
+            .keyboard_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                GuiWaylandKeyboardEvent::Enter {
+                    serial: None,
+                    keys: Vec::new(),
+                },
+                GuiWaylandKeyboardEvent::Modifiers {
+                    mods_depressed: 4,
+                    mods_latched: 0,
+                    mods_locked: 0,
+                    group: 0,
+                    serial: None,
+                },
+                GuiWaylandKeyboardEvent::Key {
+                    key: 21,
+                    state: 1,
+                    serial: None,
+                    time: None,
+                },
+                GuiWaylandKeyboardEvent::Key {
+                    key: 21,
+                    state: 0,
+                    serial: None,
+                    time: None,
+                },
+                GuiWaylandKeyboardEvent::Modifiers {
+                    mods_depressed: 0,
+                    mods_latched: 0,
+                    mods_locked: 0,
+                    group: 0,
+                    serial: None,
+                },
+            ]
+        );
     }
 
     #[tokio::test]

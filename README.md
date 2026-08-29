@@ -16,6 +16,7 @@ Build requirements:
 
 - Linux;
 - Rust 1.88 or newer, including Cargo and a native linker;
+- libxkbcommon development files providing the `xkbcommon` linker library;
 - Vulkan loader development files providing the `vulkan` linker library.
 
 Runtime requirements:
@@ -26,10 +27,11 @@ Runtime requirements:
 - permission to connect to the compositor socket and, for GPU clients, the
   applicable `/dev/dri/renderD*` device.
 
-Distribution package names vary. Common Vulkan loader packages are
-`libvulkan-dev` on Debian-family systems, `vulkan-loader-devel` on Fedora, and
-`vulkan-headers` plus `vulkan-loader` on Arch Linux. The project does not use
-absolute paths to compilers, runtimes, or locally installed dependencies.
+Distribution package names vary. Common packages are `libxkbcommon-dev` and
+`libvulkan-dev` on Debian-family systems, `libxkbcommon-devel` and
+`vulkan-loader-devel` on Fedora, and `libxkbcommon`, `vulkan-headers`, and
+`vulkan-loader` on Arch Linux. The project does not use absolute paths to
+compilers, runtimes, or locally installed dependencies.
 
 ## Build and validation
 
@@ -86,10 +88,15 @@ The main observation calls are:
 - `wayland.captureNextFrame({windowId, afterCommitSerial, timeoutMs})` — wait
   for and capture a later committed frame.
 
-High-level input and synchronization helpers include `waitForWindow`, `click`,
-`doubleClick`, `move`, `drag`, `scroll`, `pressKey`, `waitForCommit`, and
+High-level input and synchronization helpers include `waitForWindow`,
+`waitForWindowGone`, `click`, `doubleClick`, `move`, `drag`, `scroll`,
+`pressKey`, `pressShortcut`, `typeText`, `waitForCommit`, `actAndCapture`, and
 `resetInputState`. `pointerEvent` and `keyboardEvent` provide direct access to
-individual protocol events.
+individual protocol events. `pressKey` accepts either an evdev code or a common
+name such as `"Escape"`. `typeText` and character keys in `pressShortcut`
+derive their key codes and serialized modifier masks from the exact XKB keymap
+forwarded to the target client and honor its active layout group. Raw events
+remain available for protocol-level keyboard testing.
 
 JavaScript state survives calls. Define reusable functions on `globalThis` when
 an interaction needs custom timing or event sequencing:
@@ -116,6 +123,23 @@ Input delivery and application behavior are separate observations. A successful
 input call means that the protocol event was emitted; capture a later commit to
 verify the application's response.
 
+For the common action/wait/capture sequence, `actAndCapture` reports delivery
+and observation separately:
+
+```js
+return await wayland.actAndCapture({
+  windowId,
+  afterCommitSerial: baseline.commit_serial,
+  action: () => wayland.click({windowId, x: 320, y: 48}),
+  timeoutMs: 2000
+});
+```
+
+Its result includes `actionResult`, both commit serials, `frameObserved`,
+`surfaceDisappeared`, elapsed time, capture metadata, and any capture error. It
+does not claim that the resulting pixels satisfy an application-level
+assertion.
+
 ## Client launch workflow
 
 1. Start the MCP server in the host Wayland session.
@@ -125,6 +149,11 @@ verify the application's response.
 4. Use `waitForWindow` or `windows` to identify the mapped surface.
 5. Capture a baseline, perform input, then wait for a later commit.
 6. Terminate the client and confirm that its window disappears.
+
+`environment()` validates the listener and socket before returning. If an
+earlier proxy endpoint stopped or its private runtime directory disappeared,
+the call creates a fresh endpoint; callers must therefore use the values from
+the latest call rather than caching them across MCP instances.
 
 The proxy does not launch applications or grant filesystem, socket, or graphics
 device permissions. Those remain the responsibility of the invoking process.
@@ -154,8 +183,9 @@ the environment in which the server runs.
 - The compositor boundary does not provide a semantic widget or accessibility
   tree; assertions are based on frames, surface metadata, and application
   commits.
-- Keyboard input uses Linux evdev key codes. Text input and input-method
-  composition are not synthesized automatically.
+- `typeText` supports characters directly represented in the target client's
+  active XKB layout. Compose sequences and input-method-mediated text still
+  require an input-method companion.
 
 ## License
 

@@ -2,6 +2,7 @@ mod gui_backend;
 mod gui_backend_wayland;
 mod gui_vulkan_dmabuf;
 mod gui_wayland_generated;
+mod gui_xkb;
 mod js_console;
 mod wayland_protocol_registry;
 
@@ -306,7 +307,7 @@ fn sanitize_filename(value: &str) -> String {
 impl ServerHandler for WaylandMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "This server intentionally advertises one persistent graphics tool: gui_console. Evaluate JavaScript with the required code field; variables and globalThis function definitions survive calls. Begin with `return wayland.help`, which documents supported click/drag/scroll/key/wait helpers and the raw wl_pointer/wl_keyboard event shapes. Use wayland.environment/diagnostics/windows/screenshot/captureNextFrame for observation. Complete PNGs and JSONL traces are retained at returned paths. A delivered event is not proof the application accepted it. Launch the GUI as a live foreground process session when the caller reaps detached `&`/nohup jobs. This MCP cannot configure the caller sandbox; native-GPU applications may require caller-granted access to the returned Unix socket and /dev/dri/renderD*. Request the caller's supported permission if launch diagnostics show those resources are blocked; do not silently switch to software rendering. This MCP is for graphics/input diagnostics, not DOM automation."
+            "This server intentionally advertises one persistent graphics tool: gui_console. Evaluate JavaScript with the required code field; variables and globalThis function definitions survive calls. Begin with `return wayland.help`, which documents supported click/drag/scroll/key/shortcut/text/wait helpers and the raw wl_pointer/wl_keyboard event shapes. Use wayland.environment/diagnostics/windows/screenshot/captureNextFrame for observation. Complete PNGs and JSONL traces are retained at returned paths. A delivered event is not proof the application accepted it. Launch the GUI as a live foreground process session when the caller reaps detached `&`/nohup jobs. This MCP cannot configure the caller sandbox; native-GPU applications may require caller-granted access to the returned Unix socket and /dev/dri/renderD*. Request the caller's supported permission if launch diagnostics show those resources are blocked; do not silently switch to software rendering. This MCP is for graphics/input diagnostics, not DOM automation."
         )
     }
 
@@ -381,7 +382,7 @@ fn tool_error(message: String) -> CallToolResult {
 fn tool_inventory() -> Vec<Tool> {
     vec![tool(
         "gui_console",
-        "Persistent JavaScript Wayland graphics console. Pass code; state and globalThis function definitions survive calls. First evaluate `return wayland.help` for the exact API. Supported helpers cover click, drag, scroll, key press, window discovery, and commit waits; raw pointerEvent and keyboardEvent calls remain available. Coordinates come from returned screenshots and are never silently clamped. Native GPU apps need caller-granted access to the returned Unix socket and /dev/dri/renderD*; request caller-supported permission if blocked, never silently substitute software rendering.",
+        "Persistent JavaScript Wayland graphics console. Pass code; state and globalThis function definitions survive calls. First evaluate `return wayland.help` for the exact API. Supported helpers cover click, drag, scroll, named keys, keymap-aware shortcuts and text, window discovery, and action/commit waits; raw pointerEvent and keyboardEvent calls remain available. Coordinates come from returned screenshots and are never silently clamped. Native GPU apps need caller-granted access to the returned Unix socket and /dev/dri/renderD*; request caller-supported permission if blocked, never silently substitute software rendering.",
         json!({
             "type": "object",
             "properties": {

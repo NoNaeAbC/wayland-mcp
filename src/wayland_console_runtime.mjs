@@ -54,6 +54,31 @@ function native(method, args = {}) {
 const pointerFocus = { windowId: null };
 const keyboardFocus = { windowId: null };
 
+// Linux evdev key codes. Named keys make common automation readable while the
+// raw numeric form remains available for unusual layouts and hardware keys.
+const namedKeys = Object.freeze({
+  ESC: 1, ESCAPE: 1,
+  BACKSPACE: 14, TAB: 15, ENTER: 28, RETURN: 28,
+  CTRL: 29, CONTROL: 29, LEFTCTRL: 29,
+  SHIFT: 42, LEFTSHIFT: 42,
+  RIGHTSHIFT: 54, ALT: 56, LEFTALT: 56, SPACE: 57, RIGHTCTRL: 97, RIGHTALT: 100,
+  F1: 59, F2: 60, F3: 61, F4: 62, F5: 63, F6: 64,
+  F7: 65, F8: 66, F9: 67, F10: 68, F11: 87, F12: 88,
+  HOME: 102, UP: 103, PAGEUP: 104, LEFT: 105, RIGHT: 106,
+  END: 107, DOWN: 108, PAGEDOWN: 109, INSERT: 110, DELETE: 111,
+  ARROWUP: 103, ARROWLEFT: 105, ARROWRIGHT: 106, ARROWDOWN: 108,
+  META: 125, SUPER: 125, LOGO: 125, LEFTMETA: 125,
+});
+
+function resolveKey(key) {
+  if (Number.isInteger(key) && key >= 0 && key <= 0xffffffff) return key;
+  if (typeof key === "string") {
+    const resolved = namedKeys[key.replaceAll(/[-_ ]/g, "").toUpperCase()];
+    if (resolved !== undefined) return resolved;
+  }
+  throw new TypeError("key must be a non-negative 32-bit evdev code or a supported key name");
+}
+
 function finiteNumber(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be a finite number`);
   return value;
@@ -162,21 +187,109 @@ async function scroll({ windowId, deltaY, ...coordinates }) {
   return { delivered: true, point: { x, y }, deltaY, rawFixedValue: value, events };
 }
 
-async function pressKey({ windowId, key, holdMs = 40 }) {
-  if (!Number.isInteger(key) || key < 0 || key > 0xffffffff) {
-    throw new TypeError("key must be a non-negative 32-bit evdev key code");
-  }
-  finiteNumber(holdMs, "holdMs");
-  if (holdMs < 0 || holdMs > 60_000) throw new RangeError("holdMs must be from 0 through 60000");
-  const events = [];
+async function ensureKeyboardFocus(windowId, events) {
   if (keyboardFocus.windowId !== windowId) {
     events.push(await native("keyboard_event", { windowId, event: { type: "enter", keys: [] } }));
     keyboardFocus.windowId = windowId;
   }
-  events.push(await native("keyboard_event", { windowId, event: { type: "key", key, state: 1 } }));
+}
+
+async function pressKey({ windowId, key, holdMs = 40 }) {
+  const keyCode = resolveKey(key);
+  finiteNumber(holdMs, "holdMs");
+  if (holdMs < 0 || holdMs > 60_000) throw new RangeError("holdMs must be from 0 through 60000");
+  const events = [];
+  await ensureKeyboardFocus(windowId, events);
+  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
   if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
-  events.push(await native("keyboard_event", { windowId, event: { type: "key", key, state: 0 } }));
-  return { delivered: true, key, holdMs, events };
+  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
+  return { delivered: true, key, keyCode, holdMs, events };
+}
+
+async function pressShortcut({ windowId, keys, holdMs = 40 }) {
+  if (!Array.isArray(keys) || keys.length < 2 || keys.length > 8) {
+    throw new TypeError("keys must contain from 2 through 8 key names or evdev codes");
+  }
+  finiteNumber(holdMs, "holdMs");
+  if (holdMs < 0 || holdMs > 60_000) throw new RangeError("holdMs must be from 0 through 60000");
+  const primary = keys.at(-1);
+  const primaryText = typeof primary === "string" && [...primary].length === 1
+    ? primary.toLocaleLowerCase("en-US") : "";
+  const plan = await native("keyboard_text_plan", { windowId, text: primaryText });
+  const primaryStroke = primaryText === "" ? null : plan.strokes[0];
+  if (primaryText !== "" && primaryStroke === undefined) {
+    throw new Error(`shortcut key ${JSON.stringify(primary)} is absent from the target keymap`);
+  }
+  const keyCode = primaryStroke?.key ?? resolveKey(primary);
+  let depressed = primaryStroke?.modifiers ?? 0;
+  for (const modifier of keys.slice(0, -1)) {
+    if (typeof modifier !== "string") {
+      throw new TypeError("shortcut modifiers must be named CTRL, SHIFT, ALT, or META");
+    }
+    const name = modifier.replaceAll(/[-_ ]/g, "").toUpperCase();
+    const mask = name === "CTRL" || name === "CONTROL" ? plan.control_modifier
+      : name === "SHIFT" ? plan.shift_modifier
+      : name === "ALT" ? plan.alt_modifier
+      : name === "META" || name === "SUPER" || name === "LOGO" ? plan.logo_modifier
+      : undefined;
+    if (mask === undefined || mask === null) {
+      throw new Error(`shortcut modifier ${JSON.stringify(modifier)} is absent from the target keymap`);
+    }
+    depressed |= mask;
+  }
+  const events = [];
+  await ensureKeyboardFocus(windowId, events);
+  events.push(await native("keyboard_event", { windowId, event: {
+    type: "modifiers", mods_depressed: depressed, mods_latched: 0, mods_locked: 0,
+    group: plan.layout_group,
+  } }));
+  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
+  if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
+  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
+  events.push(await native("keyboard_event", { windowId, event: {
+    type: "modifiers",
+    mods_depressed: plan.restore_mods_depressed,
+    mods_latched: plan.restore_mods_latched,
+    mods_locked: plan.restore_mods_locked,
+    group: plan.layout_group,
+  } }));
+  return { delivered: true, keys, keyCode, modifierMask: depressed, holdMs, events };
+}
+
+async function typeText({ windowId, text, intervalMs = 0 }) {
+  if (typeof text !== "string") throw new TypeError("text must be a string");
+  if ([...text].length > 512) throw new RangeError("text is limited to 512 characters per call");
+  finiteNumber(intervalMs, "intervalMs");
+  if (intervalMs < 0 || intervalMs > 60_000) throw new RangeError("intervalMs must be from 0 through 60000");
+  const plan = await native("keyboard_text_plan", { windowId, text });
+  const events = [];
+  await ensureKeyboardFocus(windowId, events);
+  let depressed = null;
+  for (const stroke of plan.strokes) {
+    if (stroke.modifiers !== depressed) {
+      depressed = stroke.modifiers;
+      events.push(await native("keyboard_event", { windowId, event: {
+        type: "modifiers", mods_depressed: depressed, mods_latched: 0, mods_locked: 0,
+        group: plan.layout_group,
+      } }));
+    }
+    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 1 } }));
+    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 0 } }));
+    if (intervalMs > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  if (depressed !== null) {
+    events.push(await native("keyboard_event", { windowId, event: {
+      type: "modifiers",
+      mods_depressed: plan.restore_mods_depressed,
+      mods_latched: plan.restore_mods_latched,
+      mods_locked: plan.restore_mods_locked,
+      group: plan.layout_group,
+    } }));
+  }
+  return {
+    delivered: true, text, keymapDriven: true, layoutGroup: plan.layout_group,
+    intervalMs, strokes: plan.strokes, events,
+  };
 }
 
 async function waitForWindow({ windowId, title, appId, timeoutMs = 5000, pollMs = 50 } = {}) {
@@ -205,8 +318,55 @@ async function waitForWindow({ windowId, title, appId, timeoutMs = 5000, pollMs 
   throw new Error(`no mapped window matched before the ${timeoutMs} ms timeout`);
 }
 
+async function waitForWindowGone({ windowId, title, appId, timeoutMs = 5000, pollMs = 50 } = {}) {
+  finiteNumber(timeoutMs, "timeoutMs");
+  finiteNumber(pollMs, "pollMs");
+  if (timeoutMs < 1 || timeoutMs > 900_000) throw new RangeError("timeoutMs must be from 1 through 900000");
+  if (pollMs < 10 || pollMs > 10_000) throw new RangeError("pollMs must be from 10 through 10000");
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const windows = await native("windows");
+    const matches = windows.filter((window) => window.mapped !== false)
+      .filter((window) => windowId === undefined || window.window_id === windowId)
+      .filter((window) => title === undefined || window.title === title)
+      .filter((window) => appId === undefined || window.app_id === appId);
+    if (matches.length === 0) return { gone: true, selector: { windowId, title, appId } };
+    if (Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, pollMs));
+  } while (Date.now() < deadline);
+  throw new Error(`a mapped window still matched after the ${timeoutMs} ms timeout`);
+}
+
 async function waitForCommit({ windowId, afterCommitSerial, timeoutMs = 5000 }) {
   return native("capture_next_frame", { windowId, afterCommitSerial, timeoutMs });
+}
+
+async function actAndCapture({ windowId, action, afterCommitSerial, timeoutMs = 5000 }) {
+  if (typeof action !== "function") throw new TypeError("action must be a function returning an input-operation promise");
+  const beforeWindows = await native("windows");
+  const before = beforeWindows.find((window) => window.window_id === windowId && window.mapped !== false);
+  if (!before) throw new Error(`window ${JSON.stringify(windowId)} is not mapped`);
+  const baselineCommitSerial = afterCommitSerial ?? before.commit_serial;
+  const startedAt = Date.now();
+  const actionResult = await action();
+  let capture = null;
+  let captureError = null;
+  try {
+    capture = await native("capture_next_frame", { windowId, afterCommitSerial: baselineCommitSerial, timeoutMs });
+  } catch (error) {
+    captureError = error instanceof Error ? error.message : String(error);
+  }
+  const afterWindows = await native("windows");
+  const after = afterWindows.find((window) => window.window_id === windowId && window.mapped !== false);
+  return {
+    actionResult,
+    baselineCommitSerial,
+    resultingCommitSerial: after?.commit_serial ?? null,
+    elapsedMs: Date.now() - startedAt,
+    frameObserved: capture !== null,
+    surfaceDisappeared: after === undefined,
+    capture,
+    captureError,
+  };
 }
 
 function resetInputState() {
@@ -232,15 +392,19 @@ Define helpers with globalThis, then call them in later or the same evaluation:
     await wayland.pointerEvent({windowId, event:{type:"frame"}});
   };
   return await click("window-id", 100, 100);
-Routine helpers: wayland.waitForWindow(selector), wayland.click(args),
+Routine helpers: wayland.waitForWindow(selector), wayland.waitForWindowGone(selector), wayland.click(args),
 wayland.doubleClick(args), wayland.move(args),
 wayland.drag({windowId,from,to,durationMs,steps}),
 wayland.scroll({windowId,x,y,deltaY}), wayland.pressKey({windowId,key,holdMs}),
-wayland.waitForCommit(args), wayland.resetInputState(). Reset helper focus state
+wayland.pressShortcut({windowId,keys}), wayland.typeText({windowId,text}),
+wayland.waitForCommit(args), wayland.actAndCapture(args), wayland.resetInputState(). Reset helper focus state
 after emitting raw enter/leave events or replacing a client. Coordinates default to
 full screenshot pixels; pass coordinateSpace:"preview" and the returned
 previewToFullScale object (or the response's preview_to_full_scale object) to
 convert preview coordinates safely.
+typeText and character keys in pressShortcut use the exact XKB keymap sent to
+the target client and its active layout group; characters absent from that
+layout fail explicitly instead of falling back to hardcoded physical keys.
 Raw calls: environment(), diagnostics(), windows(), screenshot({windowId}),
 captureNextFrame({windowId, afterCommitSerial, timeoutMs}),
 pointerEvent({windowId,event}), keyboardEvent({windowId,event}), sleep(ms).
@@ -271,13 +435,17 @@ const wayland = Object.freeze({
   pointerEvent: (args) => native("pointer_event", args),
   keyboardEvent: (args) => native("keyboard_event", args),
   waitForWindow,
+  waitForWindowGone,
   waitForCommit,
+  actAndCapture,
   click,
   doubleClick,
   move,
   drag,
   scroll,
   pressKey,
+  pressShortcut,
+  typeText,
   resetInputState,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 });

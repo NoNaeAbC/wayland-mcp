@@ -15,10 +15,12 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -38,6 +40,9 @@ use tokio_util::sync::CancellationToken;
 use crate::gui_backend::GuiBackend;
 use crate::gui_backend::GuiCaptureNextFrameRequest;
 use crate::gui_backend::GuiClickRequest;
+use crate::gui_backend::GuiKeyboardTextPlan;
+use crate::gui_backend::GuiKeyboardTextPlanRequest;
+use crate::gui_backend::GuiKeyboardTextStroke;
 use crate::gui_backend::GuiPointerMoveRequest;
 use crate::gui_backend::GuiScreenshotRequest;
 use crate::gui_backend::GuiWaylandKeyboardEvent;
@@ -102,8 +107,8 @@ const MANUALLY_SUPPORTED_BACKEND_GLOBALS: &[&str] = &["wl_shm"];
 #[derive(Clone)]
 pub(crate) struct WaylandGuiBackend {
     state: Arc<WaylandProxyState>,
-    transport: Option<Arc<WaylandProxyTransport>>,
-    transport_error: Option<String>,
+    transport: Arc<StdMutex<Option<Arc<WaylandProxyTransport>>>>,
+    transport_error: Arc<StdMutex<Option<String>>>,
 }
 
 impl WaylandGuiBackend {
@@ -116,13 +121,13 @@ impl WaylandGuiBackend {
         });
         let (transport, transport_error) =
             match WaylandProxyTransport::try_spawn(Arc::clone(&state)) {
-                Ok(transport) => (Some(transport), None),
+                Ok(transport) => (Some(Arc::new(transport)), None),
                 Err(err) => (None, Some(err)),
             };
         Self {
             state: Arc::clone(&state),
-            transport,
-            transport_error,
+            transport: Arc::new(StdMutex::new(transport)),
+            transport_error: Arc::new(StdMutex::new(transport_error)),
         }
     }
 
@@ -131,30 +136,100 @@ impl WaylandGuiBackend {
         // `running` describes the proxy service, not whether a GUI client is
         // mapped right now.  Conflating the two made a clean last-window exit
         // look like a compositor crash to autonomous QA clients.
-        snapshot.running = self
-            .transport
-            .as_ref()
-            .is_some_and(|transport| transport.is_running());
+        let transport = self.current_transport();
+        let transport_error = match transport.as_ref() {
+            Some(transport) => transport.availability_error(),
+            None => self
+                .current_transport_error()
+                .or_else(|| Some("Wayland proxy transport is not initialized".to_string())),
+        };
+        snapshot.running = transport_error.is_none();
+        if !snapshot.running && snapshot.last_runtime_error.is_none() {
+            snapshot.last_runtime_error = transport_error;
+        }
         snapshot
     }
 
-    pub(crate) fn sandbox_env(&self) -> HashMap<String, String> {
-        self.transport
-            .as_ref()
+    /// Return a launch environment only after proving that its listener and
+    /// socket path are live. A prior implementation returned the transport's
+    /// cached strings even after its accept task or TempDir had disappeared.
+    pub(crate) fn sandbox_env(&self) -> Result<HashMap<String, String>, String> {
+        self.ensure_proxy_transport()
             .map(|transport| transport.sandbox_env())
-            .unwrap_or_default()
     }
 
     pub(crate) fn has_proxy_transport(&self) -> bool {
-        self.transport.is_some()
+        self.current_transport().is_some()
     }
 
-    pub(crate) fn transport_startup_error(&self) -> Option<&str> {
-        self.transport_error.as_deref()
+    pub(crate) fn transport_startup_error(&self) -> Option<String> {
+        self.current_transport_error()
     }
 
     pub(crate) fn transport_available(&self) -> bool {
-        self.transport.is_some()
+        self.current_transport()
+            .is_some_and(|transport| transport.availability_error().is_none())
+    }
+
+    fn current_transport(&self) -> Option<Arc<WaylandProxyTransport>> {
+        self.transport
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn current_transport_error(&self) -> Option<String> {
+        self.transport_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn ensure_proxy_transport(&self) -> Result<Arc<WaylandProxyTransport>, String> {
+        let mut slot = self
+            .transport
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(transport) = slot.as_ref()
+            && transport.availability_error().is_none()
+        {
+            return Ok(Arc::clone(transport));
+        }
+
+        let previous_error = slot
+            .as_ref()
+            .and_then(|transport| transport.availability_error());
+        match WaylandProxyTransport::try_spawn(Arc::clone(&self.state)) {
+            Ok(transport) => {
+                let transport = Arc::new(transport);
+                if let Some(error) = transport.availability_error() {
+                    *self
+                        .transport_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+                    return Err(error);
+                }
+                *slot = Some(Arc::clone(&transport));
+                *self
+                    .transport_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                Ok(transport)
+            }
+            Err(error) => {
+                let error = match previous_error {
+                    Some(previous) => format!(
+                        "Wayland proxy endpoint became unavailable ({previous}) and could not be restarted: {error}"
+                    ),
+                    None => error,
+                };
+                *self
+                    .transport_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 }
 
@@ -194,13 +269,27 @@ impl GuiBackend for WaylandGuiBackend {
     ) -> Result<String, String> {
         self.state.emit_wayland_keyboard_event(request).await
     }
+
+    async fn keyboard_text_plan(
+        &self,
+        request: GuiKeyboardTextPlanRequest,
+    ) -> Result<GuiKeyboardTextPlan, String> {
+        self.state.keyboard_text_plan(request).await
+    }
 }
 
 impl WaylandGuiBackend {
     fn screenshot_unavailable_message(&self) -> String {
-        if self.transport.is_some() {
+        if self.transport_available() {
             "wayland.screenshot has no proxied Wayland window to capture yet; call wayland.windows first. This path only captures windows connected through the proxy and does not fall back to whole-desktop capture".to_string()
-        } else if let Some(err) = self.transport_error.as_ref() {
+        } else if let Some(err) = self
+            .current_transport()
+            .and_then(|transport| transport.availability_error())
+        {
+            format!(
+                "wayland.screenshot is unavailable because the in-process Wayland proxy endpoint is not live: {err}"
+            )
+        } else if let Some(err) = self.current_transport_error() {
             format!(
                 "wayland.screenshot is unavailable because the in-process Wayland proxy failed to start: {err}"
             )
@@ -406,6 +495,14 @@ impl WaylandProxyState {
         inner.emit_wayland_keyboard_event(request)
     }
 
+    async fn keyboard_text_plan(
+        &self,
+        request: GuiKeyboardTextPlanRequest,
+    ) -> Result<GuiKeyboardTextPlan, String> {
+        let inner = self.inner.lock().await;
+        inner.keyboard_text_plan(request)
+    }
+
     async fn register_live_client_session(&self) -> WaylandClientId {
         let mut inner = self.inner.lock().await;
         let globals = inner.synthetic_backend_globals();
@@ -510,7 +607,7 @@ struct WaylandProxyTransport {
 }
 
 impl WaylandProxyTransport {
-    fn try_spawn(state: Arc<WaylandProxyState>) -> Result<Arc<Self>, String> {
+    fn try_spawn(state: Arc<WaylandProxyState>) -> Result<Self, String> {
         let runtime_dir = create_proxy_runtime_dir()?;
         let socket_name = env::var(SOCKET_ENV)
             .ok()
@@ -533,13 +630,13 @@ impl WaylandProxyTransport {
         let accept_task = tokio::spawn(async move {
             run_proxy_accept_loop(listener, state, accept_shutdown).await;
         });
-        Ok(Arc::new(Self {
+        Ok(Self {
             _runtime_dir: runtime_dir,
             socket_path,
             env,
             shutdown,
             accept_task,
-        }))
+        })
     }
 
     fn sandbox_env(&self) -> HashMap<String, String> {
@@ -550,8 +647,24 @@ impl WaylandProxyTransport {
         self.socket_path.clone()
     }
 
-    fn is_running(&self) -> bool {
-        !self.shutdown.is_cancelled() && !self.accept_task.is_finished()
+    fn availability_error(&self) -> Option<String> {
+        if self.shutdown.is_cancelled() {
+            return Some("Wayland proxy transport has been shut down".to_string());
+        }
+        if self.accept_task.is_finished() {
+            return Some("Wayland proxy accept loop has stopped".to_string());
+        }
+        match std::fs::metadata(&self.socket_path) {
+            Ok(metadata) if metadata.file_type().is_socket() => None,
+            Ok(_) => Some(format!(
+                "Wayland proxy endpoint {} is not a Unix socket",
+                self.socket_path.display()
+            )),
+            Err(error) => Some(format!(
+                "Wayland proxy endpoint {} is unavailable: {error}",
+                self.socket_path.display()
+            )),
+        }
     }
 }
 
@@ -911,6 +1024,66 @@ impl WaylandProxyServer {
         ))
     }
 
+    fn keyboard_text_plan(
+        &self,
+        request: GuiKeyboardTextPlanRequest,
+    ) -> Result<GuiKeyboardTextPlan, String> {
+        let windows = self
+            .sessions
+            .values()
+            .flat_map(|session| session.frame_tracker.list_windows())
+            .filter(|window| window.mapped)
+            .collect::<Vec<_>>();
+        let selected = select_window_for_screenshot(&windows, request.window_id.as_deref())?
+            .ok_or_else(|| "typeText has no mapped target window".to_string())?;
+
+        for session in self.sessions.values() {
+            if !session
+                .frame_tracker
+                .list_windows()
+                .iter()
+                .any(|window| window.window_id == selected.window_id)
+            {
+                continue;
+            }
+            let keymap_text = session.keyboard_keymap_text.as_deref().ok_or_else(|| {
+                format!(
+                    "typeText cannot target window `{}` because its client has not received an XKB keymap",
+                    selected.window_id
+                )
+            })?;
+            let keymap_plan = crate::gui_xkb::plan_text(
+                keymap_text,
+                session.keyboard_layout_group,
+                &request.text,
+            )?;
+            let strokes = keymap_plan
+                .strokes
+                .into_iter()
+                .map(|stroke| GuiKeyboardTextStroke {
+                    key: stroke.key,
+                    modifiers: stroke.modifiers,
+                })
+                .collect();
+            return Ok(GuiKeyboardTextPlan {
+                layout_group: session.keyboard_layout_group,
+                restore_mods_depressed: session.keyboard_mods_depressed,
+                restore_mods_latched: session.keyboard_mods_latched,
+                restore_mods_locked: session.keyboard_mods_locked,
+                shift_modifier: keymap_plan.shift_modifier,
+                control_modifier: keymap_plan.control_modifier,
+                alt_modifier: keymap_plan.alt_modifier,
+                logo_modifier: keymap_plan.logo_modifier,
+                strokes,
+            });
+        }
+
+        Err(format!(
+            "window `{}` disappeared before its keyboard map could be inspected",
+            selected.window_id
+        ))
+    }
+
     fn invoke_intercepts(
         &mut self,
         client_id: WaylandClientId,
@@ -1168,6 +1341,7 @@ impl WaylandProxyServer {
             .get_mut(&client_id)
             .ok_or_else(|| format!("missing Wayland client session {}", client_id.0))?;
         if let Some(decoded) = decoded.as_ref() {
+            track_keyboard_keymap(session, decoded, &message.fds)?;
             rewrite_dmabuf_feedback_event(session, decoded, &mut message)?;
             apply_client_event_tracking(session, decoded)?;
         }
@@ -1251,6 +1425,55 @@ fn apply_client_event_tracking(
         session.remove_object(*id);
     }
     apply_backend_event_tracking(session, event)
+}
+
+fn track_keyboard_keymap(
+    session: &mut WaylandClientSession,
+    event: &DecodedWaylandEvent,
+    fds: &[OwnedFd],
+) -> Result<(), String> {
+    let GeneratedEvent::WlKeyboardKeymap { format, size, .. } = &event.generated_event else {
+        return Ok(());
+    };
+    if *format != 1 {
+        return Err(format!(
+            "wl_keyboard.keymap used unsupported format {format}; expected XKB V1"
+        ));
+    }
+    let size = usize::try_from(*size)
+        .map_err(|_| "wl_keyboard.keymap size does not fit memory".to_string())?;
+    const MAX_KEYMAP_SIZE: usize = 16 * 1024 * 1024;
+    if size == 0 || size > MAX_KEYMAP_SIZE {
+        return Err(format!(
+            "wl_keyboard.keymap size {size} is outside the supported 1..={MAX_KEYMAP_SIZE} range"
+        ));
+    }
+    let fd = fds
+        .first()
+        .ok_or_else(|| "wl_keyboard.keymap was missing its file descriptor".to_string())?;
+    let file = std::fs::File::from(duplicate_fd(fd)?);
+    let mut bytes = vec![0u8; size];
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let read = file
+            .read_at(&mut bytes[offset..], offset as u64)
+            .map_err(|err| format!("failed to read wl_keyboard.keymap: {err}"))?;
+        if read == 0 {
+            return Err(format!(
+                "short wl_keyboard.keymap read: {offset} of {} bytes",
+                bytes.len()
+            ));
+        }
+        offset += read;
+    }
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    session.keyboard_keymap_text = Some(
+        String::from_utf8(bytes)
+            .map_err(|err| format!("wl_keyboard.keymap was not valid UTF-8: {err}"))?,
+    );
+    Ok(())
 }
 
 fn reassociate_client_fds(
@@ -1572,6 +1795,11 @@ struct WaylandClientSession {
     frame_tracker: WaylandFrameTracker,
     raw_forward_only: Arc<AtomicBool>,
     next_synthetic_serial: u32,
+    keyboard_keymap_text: Option<String>,
+    keyboard_layout_group: u32,
+    keyboard_mods_depressed: u32,
+    keyboard_mods_latched: u32,
+    keyboard_mods_locked: u32,
 }
 
 impl WaylandClientSession {
@@ -1595,6 +1823,11 @@ impl WaylandClientSession {
             frame_tracker: WaylandFrameTracker::new(format!("wayland-client-{}", client_id.0)),
             raw_forward_only: Arc::new(AtomicBool::new(false)),
             next_synthetic_serial: 1,
+            keyboard_keymap_text: None,
+            keyboard_layout_group: 0,
+            keyboard_mods_depressed: 0,
+            keyboard_mods_latched: 0,
+            keyboard_mods_locked: 0,
         }
     }
 
@@ -3823,8 +4056,14 @@ async fn run_proxy_accept_loop(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             result = listener.accept() => {
-                let Ok((stream, _addr)) = result else {
-                    break;
+                let (stream, _addr) = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        state.note_runtime_error(format!(
+                            "Wayland proxy accept loop stopped: {error}"
+                        )).await;
+                        break;
+                    }
                 };
                 let state = Arc::clone(&state);
                 tokio::task::spawn_blocking(move || {
@@ -5208,6 +5447,18 @@ fn apply_backend_event_tracking(
         GeneratedEvent::ZwpLinuxBufferParamsV1Failed => {
             session.frame_tracker.destroy_dmabuf_params(event.object_id);
         }
+        GeneratedEvent::WlKeyboardModifiers {
+            mods_depressed,
+            mods_latched,
+            mods_locked,
+            group,
+            ..
+        } => {
+            session.keyboard_mods_depressed = *mods_depressed;
+            session.keyboard_mods_latched = *mods_latched;
+            session.keyboard_mods_locked = *mods_locked;
+            session.keyboard_layout_group = *group;
+        }
         _ => {}
     }
     Ok(())
@@ -5933,5 +6184,73 @@ mod tests {
 
         assert!(snapshot.running);
         assert_eq!(snapshot.session_count, 0);
+    }
+
+    #[tokio::test]
+    async fn environment_returns_an_existing_connectable_socket() {
+        let backend = WaylandGuiBackend::new();
+
+        let environment = backend.sandbox_env().expect("live launch environment");
+        let socket_path =
+            PathBuf::from(&environment["XDG_RUNTIME_DIR"]).join(&environment["WAYLAND_DISPLAY"]);
+
+        assert!(
+            std::fs::metadata(&socket_path)
+                .expect("proxy socket metadata")
+                .file_type()
+                .is_socket()
+        );
+        assert!(backend.snapshot().await.running);
+        backend.list_windows().await.expect("window inventory");
+        StdUnixStream::connect(&socket_path).expect("connect after intervening console operations");
+        StdUnixStream::connect(&socket_path).expect("reconnect to returned proxy endpoint");
+    }
+
+    #[tokio::test]
+    async fn environment_replaces_a_missing_proxy_endpoint() {
+        let backend = WaylandGuiBackend::new();
+        let first_environment = backend.sandbox_env().expect("initial environment");
+        let first_socket = PathBuf::from(&first_environment["XDG_RUNTIME_DIR"])
+            .join(&first_environment["WAYLAND_DISPLAY"]);
+        std::fs::remove_file(&first_socket).expect("remove fixture proxy socket");
+
+        let stopped = backend.snapshot().await;
+        assert!(!stopped.running);
+        assert!(
+            stopped
+                .last_runtime_error
+                .as_deref()
+                .is_some_and(|error| error.contains("endpoint") && error.contains("unavailable"))
+        );
+
+        let replacement_environment = backend.sandbox_env().expect("replacement environment");
+        let replacement_socket = PathBuf::from(&replacement_environment["XDG_RUNTIME_DIR"])
+            .join(&replacement_environment["WAYLAND_DISPLAY"]);
+        assert_ne!(replacement_socket, first_socket);
+        assert!(
+            std::fs::metadata(&replacement_socket)
+                .expect("replacement socket metadata")
+                .file_type()
+                .is_socket()
+        );
+        StdUnixStream::connect(&replacement_socket).expect("connect to replacement endpoint");
+        assert!(backend.snapshot().await.running);
+    }
+
+    #[tokio::test]
+    async fn environment_restarts_a_stopped_accept_loop() {
+        let backend = WaylandGuiBackend::new();
+        let first_transport = backend.current_transport().expect("initial transport");
+        let first_socket = first_transport.socket_path();
+        first_transport.accept_task.abort();
+        tokio::task::yield_now().await;
+
+        let replacement_environment = backend.sandbox_env().expect("replacement environment");
+        let replacement_socket = PathBuf::from(&replacement_environment["XDG_RUNTIME_DIR"])
+            .join(&replacement_environment["WAYLAND_DISPLAY"]);
+
+        assert_ne!(replacement_socket, first_socket);
+        StdUnixStream::connect(&replacement_socket).expect("connect to replacement endpoint");
+        assert!(backend.snapshot().await.running);
     }
 }
