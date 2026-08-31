@@ -25,8 +25,11 @@ pub(crate) fn read_dmabuf_rgba(image: DmabufImage<'_>) -> Result<Vec<u8>, String
     if image.planes.is_empty() {
         return Err("dmabuf image has no planes".to_string());
     }
+    if let Some(error) = screenshot_support_error(image.format) {
+        return Err(error);
+    }
     let vk_format = vk_format_for_drm_format(image.format)
-        .ok_or_else(|| format!("unsupported DRM format {}", image.format))?;
+        .expect("screenshot support and Vulkan format mapping must agree");
     dma_buf_sync(image.planes[0].fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)?;
     let app_name = CString::new("wayland-mcp-capture").map_err(|err| err.to_string())?;
     let app_info = VkApplicationInfo {
@@ -537,12 +540,24 @@ fn record_submit_copy_and_map(
         "vkMapMemory",
     )?;
     let raw = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), byte_len as usize) };
-    let rgba = copied_pixels_to_rgba(raw, image.width as usize, image.height as usize, vk_format);
+    let rgba = copied_pixels_to_rgba(
+        raw,
+        image.width as usize,
+        image.height as usize,
+        vk_format,
+        drm_format_has_alpha(image.format),
+    );
     unsafe { vkUnmapMemory(device, buffer_memory) };
     Ok(rgba)
 }
 
-fn copied_pixels_to_rgba(raw: &[u8], width: usize, height: usize, vk_format: VkFormat) -> Vec<u8> {
+fn copied_pixels_to_rgba(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    vk_format: VkFormat,
+    preserve_alpha: bool,
+) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     let Ok(bytes_per_pixel) = bytes_per_pixel(vk_format) else {
         return rgba;
@@ -555,10 +570,13 @@ fn copied_pixels_to_rgba(raw: &[u8], width: usize, height: usize, vk_format: VkF
                 rgba[dst] = raw[src + 2];
                 rgba[dst + 1] = raw[src + 1];
                 rgba[dst + 2] = raw[src];
-                rgba[dst + 3] = raw[src + 3];
+                rgba[dst + 3] = if preserve_alpha { raw[src + 3] } else { 255 };
             }
             VK_FORMAT_R8G8B8A8_UNORM => {
                 rgba[dst..dst + 4].copy_from_slice(&raw[src..src + 4]);
+                if !preserve_alpha {
+                    rgba[dst + 3] = 255;
+                }
             }
             VK_FORMAT_A2R10G10B10_UNORM_PACK32 => {
                 let pixel =
@@ -566,7 +584,11 @@ fn copied_pixels_to_rgba(raw: &[u8], width: usize, height: usize, vk_format: VkF
                 rgba[dst] = unorm10_to_u8((pixel >> 20) & 0x3ff);
                 rgba[dst + 1] = unorm10_to_u8((pixel >> 10) & 0x3ff);
                 rgba[dst + 2] = unorm10_to_u8(pixel & 0x3ff);
-                rgba[dst + 3] = 255;
+                rgba[dst + 3] = if preserve_alpha {
+                    unorm2_to_u8(pixel >> 30)
+                } else {
+                    255
+                };
             }
             VK_FORMAT_A2B10G10R10_UNORM_PACK32 => {
                 let pixel =
@@ -574,13 +596,21 @@ fn copied_pixels_to_rgba(raw: &[u8], width: usize, height: usize, vk_format: VkF
                 rgba[dst] = unorm10_to_u8(pixel & 0x3ff);
                 rgba[dst + 1] = unorm10_to_u8((pixel >> 10) & 0x3ff);
                 rgba[dst + 2] = unorm10_to_u8((pixel >> 20) & 0x3ff);
-                rgba[dst + 3] = 255;
+                rgba[dst + 3] = if preserve_alpha {
+                    unorm2_to_u8(pixel >> 30)
+                } else {
+                    255
+                };
             }
             VK_FORMAT_R16G16B16A16_SFLOAT => {
                 rgba[dst] = f16_channel_to_u8(u16::from_le_bytes([raw[src], raw[src + 1]]));
                 rgba[dst + 1] = f16_channel_to_u8(u16::from_le_bytes([raw[src + 2], raw[src + 3]]));
                 rgba[dst + 2] = f16_channel_to_u8(u16::from_le_bytes([raw[src + 4], raw[src + 5]]));
-                rgba[dst + 3] = 255;
+                rgba[dst + 3] = if preserve_alpha {
+                    f16_channel_to_u8(u16::from_le_bytes([raw[src + 6], raw[src + 7]]))
+                } else {
+                    255
+                };
             }
             _ => {}
         }
@@ -601,6 +631,10 @@ fn bytes_per_pixel(vk_format: VkFormat) -> Result<usize, String> {
 
 fn unorm10_to_u8(value: u32) -> u8 {
     ((value * 255 + 511) / 1023) as u8
+}
+
+fn unorm2_to_u8(value: u32) -> u8 {
+    ((value & 0x3) * 255 / 3) as u8
 }
 
 fn f16_channel_to_u8(bits: u16) -> u8 {
@@ -685,8 +719,37 @@ fn duplicate_fd(fd: RawFd) -> Result<RawFd, String> {
     }
 }
 
-pub(crate) fn supports_drm_format(format: u32) -> bool {
+/// End-to-end screenshot support and the DMA-BUF advertisement allowlist.
+///
+/// A format must not be added here until Vulkan import, readback, and RGBA8
+/// conversion all support it. The Wayland proxy uses this exact predicate to
+/// decide which formats clients are allowed to see.
+pub(crate) fn supports_screenshot_drm_format(format: u32) -> bool {
     vk_format_for_drm_format(format).is_some()
+}
+
+pub(crate) fn screenshot_support_error(format: u32) -> Option<String> {
+    (!supports_screenshot_drm_format(format)).then(|| {
+        format!(
+            "DMA-BUF DRM format {} is not supported for screenshots and is not advertised by this MCP",
+            describe_drm_format(format)
+        )
+    })
+}
+
+fn describe_drm_format(format: u32) -> String {
+    let fourcc = format
+        .to_le_bytes()
+        .into_iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                char::from(byte)
+            } else {
+                '.'
+            }
+        })
+        .collect::<String>();
+    format!("0x{format:08X} ({fourcc})")
 }
 
 fn vk_format_for_drm_format(format: u32) -> Option<VkFormat> {
@@ -695,9 +758,20 @@ fn vk_format_for_drm_format(format: u32) -> Option<VkFormat> {
         DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => Some(VK_FORMAT_R8G8B8A8_UNORM),
         DRM_FORMAT_XRGB2101010 | DRM_FORMAT_ARGB2101010 => Some(VK_FORMAT_A2R10G10B10_UNORM_PACK32),
         DRM_FORMAT_XBGR2101010 | DRM_FORMAT_ABGR2101010 => Some(VK_FORMAT_A2B10G10R10_UNORM_PACK32),
-        DRM_FORMAT_XBGR16161616F => Some(VK_FORMAT_R16G16B16A16_SFLOAT),
+        DRM_FORMAT_XBGR16161616F | DRM_FORMAT_ABGR16161616F => Some(VK_FORMAT_R16G16B16A16_SFLOAT),
         _ => None,
     }
+}
+
+fn drm_format_has_alpha(format: u32) -> bool {
+    matches!(
+        format,
+        DRM_FORMAT_ARGB8888
+            | DRM_FORMAT_ABGR8888
+            | DRM_FORMAT_ARGB2101010
+            | DRM_FORMAT_ABGR2101010
+            | DRM_FORMAT_ABGR16161616F
+    )
 }
 
 fn check_vk(result: VkResult, operation: &str) -> Result<(), String> {
@@ -786,6 +860,7 @@ const DRM_FORMAT_XBGR2101010: u32 = fourcc_code(b'X', b'B', b'3', b'0');
 const DRM_FORMAT_ARGB2101010: u32 = fourcc_code(b'A', b'R', b'3', b'0');
 const DRM_FORMAT_ABGR2101010: u32 = fourcc_code(b'A', b'B', b'3', b'0');
 const DRM_FORMAT_XBGR16161616F: u32 = fourcc_code(b'X', b'B', b'4', b'H');
+const DRM_FORMAT_ABGR16161616F: u32 = fourcc_code(b'A', b'B', b'4', b'H');
 
 const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
     u32::from_le_bytes([a, b, c, d])
@@ -797,11 +872,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn maps_xbgr16161616f_to_vulkan_float_rgba() {
+    fn maps_xbgr_and_abgr_16161616f_to_vulkan_float_rgba() {
         assert_eq!(
-            vk_format_for_drm_format(DRM_FORMAT_XBGR16161616F),
-            Some(VK_FORMAT_R16G16B16A16_SFLOAT)
+            [
+                vk_format_for_drm_format(DRM_FORMAT_XBGR16161616F),
+                vk_format_for_drm_format(DRM_FORMAT_ABGR16161616F),
+            ],
+            [
+                Some(VK_FORMAT_R16G16B16A16_SFLOAT),
+                Some(VK_FORMAT_R16G16B16A16_SFLOAT),
+            ]
         );
+        assert!(supports_screenshot_drm_format(DRM_FORMAT_ABGR16161616F));
+        assert_eq!(screenshot_support_error(DRM_FORMAT_ABGR16161616F), None);
     }
 
     #[test]
@@ -814,8 +897,23 @@ mod tests {
         ];
 
         assert_eq!(
-            copied_pixels_to_rgba(&raw, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT),
+            copied_pixels_to_rgba(&raw, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, false),
             vec![255, 128, 0, 255]
+        );
+    }
+
+    #[test]
+    fn converts_abgr16161616f_pixels_and_preserves_alpha() {
+        let raw = [
+            0x00, 0x3c, // R = 1.0
+            0x00, 0x38, // G = 0.5
+            0x00, 0x00, // B = 0.0
+            0x00, 0x34, // A = 0.25
+        ];
+
+        assert_eq!(
+            copied_pixels_to_rgba(&raw, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, true),
+            vec![255, 128, 0, 64]
         );
     }
 
@@ -843,11 +941,11 @@ mod tests {
         let xbgr = ((1023u32 << 20) | (512 << 10)).to_le_bytes();
 
         assert_eq!(
-            copied_pixels_to_rgba(&xrgb, 1, 1, VK_FORMAT_A2R10G10B10_UNORM_PACK32),
+            copied_pixels_to_rgba(&xrgb, 1, 1, VK_FORMAT_A2R10G10B10_UNORM_PACK32, false,),
             vec![255, 128, 0, 255]
         );
         assert_eq!(
-            copied_pixels_to_rgba(&xbgr, 1, 1, VK_FORMAT_A2B10G10R10_UNORM_PACK32),
+            copied_pixels_to_rgba(&xbgr, 1, 1, VK_FORMAT_A2B10G10R10_UNORM_PACK32, false,),
             vec![0, 128, 255, 255]
         );
     }

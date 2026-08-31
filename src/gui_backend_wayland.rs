@@ -2268,7 +2268,7 @@ fn is_unsupported_dmabuf_advertisement(event: &DecodedWaylandEvent) -> bool {
     match &event.generated_event {
         GeneratedEvent::ZwpLinuxDmabufV1Format { format }
         | GeneratedEvent::ZwpLinuxDmabufV1Modifier { format, .. } => {
-            !crate::gui_vulkan_dmabuf::supports_drm_format(*format)
+            !crate::gui_vulkan_dmabuf::supports_screenshot_drm_format(*format)
         }
         _ => false,
     }
@@ -2306,7 +2306,7 @@ fn rewrite_dmabuf_feedback_event(
             debug_assert!(remainder.is_empty());
             for entry in entries {
                 let format = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                if crate::gui_vulkan_dmabuf::supports_drm_format(format) {
+                if crate::gui_vulkan_dmabuf::supports_screenshot_drm_format(format) {
                     let new_index = u16::try_from(filtered.len() / 16).map_err(|_| {
                         "filtered DMA-BUF format table exceeds u16 indices".to_string()
                     })?;
@@ -3887,7 +3887,7 @@ struct TrackedDmabufBuffer {
 
 impl TrackedDmabufBuffer {
     fn capture_error(&self) -> Option<String> {
-        None
+        crate::gui_vulkan_dmabuf::screenshot_support_error(self.format)
     }
 }
 
@@ -5757,6 +5757,80 @@ mod tests {
     }
 
     #[test]
+    fn ab4h_is_advertised_only_after_screenshot_support_is_enabled() {
+        const DRM_FORMAT_ABGR16161616F: u32 = 0x4834_4241;
+        for generated_event in [
+            GeneratedEvent::ZwpLinuxDmabufV1Format {
+                format: DRM_FORMAT_ABGR16161616F,
+            },
+            GeneratedEvent::ZwpLinuxDmabufV1Modifier {
+                format: DRM_FORMAT_ABGR16161616F,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            },
+        ] {
+            let event = DecodedWaylandEvent {
+                object_id: 7,
+                size: 12,
+                opcode: 0,
+                interface: "zwp_linux_dmabuf_v1".to_string(),
+                event_name: "fixture".to_string(),
+                arg_specs: &[],
+                generated_event,
+                args: Vec::new(),
+            };
+            assert!(!is_unsupported_dmabuf_advertisement(&event));
+        }
+    }
+
+    #[test]
+    fn unsupported_dmabuf_format_is_filtered_and_not_capturable() -> Result<(), String> {
+        const DRM_FORMAT_NV12: u32 = 0x3231_564e;
+        let event = DecodedWaylandEvent {
+            object_id: 7,
+            size: 12,
+            opcode: 0,
+            interface: "zwp_linux_dmabuf_v1".to_string(),
+            event_name: "format".to_string(),
+            arg_specs: &[],
+            generated_event: GeneratedEvent::ZwpLinuxDmabufV1Format {
+                format: DRM_FORMAT_NV12,
+            },
+            args: Vec::new(),
+        };
+        assert!(is_unsupported_dmabuf_advertisement(&event));
+
+        let dmabuf_file =
+            tempfile::tempfile().map_err(|err| format!("failed to create dmabuf fd: {err}"))?;
+        let buffer = TrackedBuffer {
+            width: 8,
+            height: 4,
+            rgba: None,
+            source: TrackedBufferSource::Dmabuf(TrackedDmabufBuffer {
+                width: 8,
+                height: 4,
+                format: DRM_FORMAT_NV12,
+                flags: 0,
+                planes: vec![TrackedDmabufPlane {
+                    fd: duplicate_file_fd(&dmabuf_file)?,
+                    plane_idx: 0,
+                    offset: 0,
+                    stride: 8,
+                    modifier: 0,
+                }],
+            }),
+        };
+        assert!(!buffer.has_readback());
+        assert_eq!(
+            buffer.capture_error().as_deref(),
+            Some(
+                "DMA-BUF DRM format 0x3231564E (NV12) is not supported for screenshots and is not advertised by this MCP"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn backend_globals_without_generated_protocol_metadata_are_not_advertised() {
         let globals = filtered_backend_globals(&[
             WaylandGlobalInfo {
@@ -5809,7 +5883,11 @@ mod tests {
     #[test]
     fn dmabuf_feedback_table_and_tranche_indices_are_filtered_together() -> Result<(), String> {
         let mut source = tempfile::tempfile().map_err(|err| err.to_string())?;
-        for (format, modifier) in [(0x3432_4241u32, 0x10u64), (0x3231_564eu32, 0u64)] {
+        for (format, modifier) in [
+            (0x3432_4241u32, 0x10u64),
+            (0x4834_4241u32, 0u64),
+            (0x3231_564eu32, 0u64),
+        ] {
             source
                 .write_all(&format.to_ne_bytes())
                 .map_err(|err| err.to_string())?;
@@ -5830,9 +5908,9 @@ mod tests {
             arg_specs: &[],
             generated_event: GeneratedEvent::ZwpLinuxDmabufFeedbackV1FormatTable {
                 fd: true,
-                size: 32,
+                size: 48,
             },
-            args: vec![DecodedWaylandArg::Fd, DecodedWaylandArg::Uint(32)],
+            args: vec![DecodedWaylandArg::Fd, DecodedWaylandArg::Uint(48)],
         };
         let mut table_message = WaylandWireMessage {
             bytes: encode_generated_event(50, &table_event.generated_event)?,
@@ -5841,9 +5919,12 @@ mod tests {
         rewrite_dmabuf_feedback_event(&mut session, &table_event, &mut table_message)?;
         assert_eq!(
             u32::from_ne_bytes(table_message.bytes[8..12].try_into().unwrap()),
-            16
+            32
         );
-        assert_eq!(session.dmabuf_feedback_index_maps[&50], vec![Some(0), None]);
+        assert_eq!(
+            session.dmabuf_feedback_index_maps[&50],
+            vec![Some(0), Some(1), None]
+        );
 
         let tranche_event = DecodedWaylandEvent {
             object_id: 50,
@@ -5853,7 +5934,7 @@ mod tests {
             event_name: "tranche_formats".to_string(),
             arg_specs: &[],
             generated_event: GeneratedEvent::ZwpLinuxDmabufFeedbackV1TrancheFormats {
-                indices: [0u16.to_ne_bytes(), 1u16.to_ne_bytes()].concat(),
+                indices: [0u16.to_ne_bytes(), 1u16.to_ne_bytes(), 2u16.to_ne_bytes()].concat(),
             },
             args: Vec::new(),
         };
@@ -5865,8 +5946,40 @@ mod tests {
         let mut offset = 8;
         assert_eq!(
             read_array_arg(&tranche_message.bytes, 16, &mut offset)?,
-            0u16.to_ne_bytes()
+            [0u16.to_ne_bytes(), 1u16.to_ne_bytes()].concat()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn supported_ab4h_buffer_is_reported_capturable() -> Result<(), String> {
+        const DRM_FORMAT_ABGR16161616F: u32 = 0x4834_4241;
+        let dmabuf_file =
+            tempfile::tempfile().map_err(|err| format!("failed to create dmabuf fd: {err}"))?;
+        let mut tracker = WaylandFrameTracker::new("test-client".to_string());
+
+        tracker.note_dmabuf_params_created(20);
+        tracker.note_dmabuf_plane(
+            20,
+            TrackedDmabufPlane {
+                fd: duplicate_file_fd(&dmabuf_file)?,
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier: 0,
+            },
+        )?;
+        tracker.note_dmabuf_create_immed(20, 21, 8, 4, DRM_FORMAT_ABGR16161616F, 0)?;
+        tracker.note_xdg_surface_created(30, 10);
+        let window_id = tracker.note_xdg_toplevel_created(30, 31)?;
+        tracker.set_surface_buffer(10, Some(21));
+        tracker.commit_surface(10);
+
+        let windows = tracker.list_windows();
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0].capturable);
+        assert_eq!(windows[0].capture_error, None);
+        assert_eq!(windows[0].window_id, window_id);
         Ok(())
     }
 
