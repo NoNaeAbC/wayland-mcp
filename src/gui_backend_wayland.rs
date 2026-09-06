@@ -25,10 +25,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use image::ColorType;
-use image::ImageEncoder;
-use image::codecs::png::PngEncoder;
 use serde::Serialize;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -80,6 +79,7 @@ const BACKEND_SOCKET_ENV: &str = "WAYLAND_MCP_BACKEND_SOCKET";
 const BACKEND_BOOTSTRAP_REGISTRY_ID: u32 = 2;
 const BACKEND_BOOTSTRAP_CALLBACK_ID: u32 = 3;
 const MAX_BACKEND_EVENTS_PER_DRAIN: usize = 1024;
+const MAX_CONNECTION_HISTORY: usize = 32;
 // These generated interfaces are understood by the proxy. A compositor global
 // which is not present in GENERATED_PROTOCOLS must not be advertised: raw
 // forwarding cannot correctly associate SCM_RIGHTS file descriptors without
@@ -94,7 +94,6 @@ const MAX_BACKEND_EVENTS_PER_DRAIN: usize = 1024;
 // metadata.
 const SUPPRESSED_BACKEND_GLOBALS: &[&str] = &[
     "org_kde_kwin_server_decoration_manager",
-    "wp_color_manager_v1",
     "wp_color_representation_manager_v1",
     "xdg_activation_v1",
 ];
@@ -144,6 +143,13 @@ impl WaylandGuiBackend {
                 .or_else(|| Some("Wayland proxy transport is not initialized".to_string())),
         };
         snapshot.running = transport_error.is_none();
+        snapshot.socket_path = transport
+            .as_ref()
+            .map(|transport| transport.socket_path.display().to_string());
+        snapshot.launch_preflight = transport
+            .as_ref()
+            .map(|transport| transport.launch_preflight())
+            .unwrap_or_else(|| WaylandLaunchPreflight::unavailable(transport_error.clone()));
         if !snapshot.running && snapshot.last_runtime_error.is_none() {
             snapshot.last_runtime_error = transport_error;
         }
@@ -156,6 +162,14 @@ impl WaylandGuiBackend {
     pub(crate) fn sandbox_env(&self) -> Result<HashMap<String, String>, String> {
         self.ensure_proxy_transport()
             .map(|transport| transport.sandbox_env())
+    }
+
+    /// Return the client-facing launch contract. Keep this separate from
+    /// `sandbox_env`: only the two real environment variables may be injected
+    /// into a child process, while the remaining fields are diagnostics.
+    pub(crate) fn launch_environment(&self) -> Result<WaylandLaunchEnvironment, String> {
+        self.ensure_proxy_transport()
+            .map(|transport| transport.launch_environment())
     }
 
     pub(crate) fn has_proxy_transport(&self) -> bool {
@@ -378,7 +392,14 @@ impl WaylandProxyState {
                 }
                 break maybe_frame
                     .transpose()?
-                    .map(|frame| encode_rgba_png(frame.width, frame.height, &frame.rgba))
+                    .map(|frame| {
+                        encode_rgba_png(
+                            frame.width,
+                            frame.height,
+                            &frame.rgba,
+                            frame.color.as_ref(),
+                        )
+                    })
                     .transpose();
             }
             tokio::time::sleep(Duration::from_millis(16)).await;
@@ -446,7 +467,13 @@ impl WaylandProxyState {
                     Ok(surface) => surface,
                     Err(err) => break Err(err),
                 };
-                break encode_rgba_png(surface.width, surface.height, &surface.rgba).map(Some);
+                break encode_rgba_png(
+                    surface.width,
+                    surface.height,
+                    &surface.rgba,
+                    surface.color.as_ref(),
+                )
+                .map(Some);
             }
 
             if tokio::time::Instant::now() >= deadline {
@@ -509,9 +536,14 @@ impl WaylandProxyState {
         inner.register_client_session(globals)
     }
 
-    async fn remove_client_session(&self, client_id: WaylandClientId) {
+    async fn finish_client_session(&self, client_id: WaylandClientId, detail: String) {
         let mut inner = self.inner.lock().await;
-        inner.remove_client_session(client_id);
+        inner.finish_client_session(client_id, detail);
+    }
+
+    async fn note_accept_error(&self, error: String) {
+        let mut inner = self.inner.lock().await;
+        inner.note_accept_error(error);
     }
 
     async fn ingest_request(
@@ -587,14 +619,63 @@ impl WaylandProxyState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WaylandLaunchEnvironment {
+    #[serde(rename = "WAYLAND_DISPLAY")]
+    pub(crate) wayland_display: String,
+    #[serde(rename = "XDG_RUNTIME_DIR")]
+    pub(crate) xdg_runtime_dir: String,
+    pub(crate) socket_path: String,
+    pub(crate) launch_preflight: WaylandLaunchPreflight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WaylandLaunchPreflight {
+    pub(crate) endpoint_state: String,
+    pub(crate) endpoint_exists: bool,
+    pub(crate) endpoint_is_unix_socket: bool,
+    pub(crate) accept_loop_running: bool,
+    /// The MCP cannot inspect the filesystem namespace or policy of a process
+    /// launched by its caller, so this is deliberately explicit.
+    pub(crate) caller_namespace_access: String,
+    pub(crate) render_node_access: String,
+    pub(crate) detail: Option<String>,
+}
+
+impl WaylandLaunchPreflight {
+    fn unavailable(detail: Option<String>) -> Self {
+        Self {
+            endpoint_state: "unavailable".to_string(),
+            endpoint_exists: false,
+            endpoint_is_unix_socket: false,
+            accept_loop_running: false,
+            caller_namespace_access: "not_tested".to_string(),
+            render_node_access: "not_tested".to_string(),
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WaylandConnectionHistoryEntry {
+    pub(crate) timestamp_unix_ms: u64,
+    pub(crate) event: String,
+    pub(crate) client_id: Option<u64>,
+    pub(crate) endpoint_state: String,
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct WaylandBackendSnapshot {
     pub(crate) socket_name: String,
+    pub(crate) socket_path: Option<String>,
     pub(crate) backend_socket: String,
     pub(crate) running: bool,
+    pub(crate) launch_preflight: WaylandLaunchPreflight,
     pub(crate) session_count: usize,
     pub(crate) registered_globals: Vec<String>,
     pub(crate) registered_intercepts: Vec<String>,
     pub(crate) last_runtime_error: Option<String>,
+    pub(crate) connection_history: Vec<WaylandConnectionHistoryEntry>,
     pub(crate) sessions: Vec<WaylandSessionSnapshot>,
 }
 
@@ -641,6 +722,39 @@ impl WaylandProxyTransport {
 
     fn sandbox_env(&self) -> HashMap<String, String> {
         self.env.clone()
+    }
+
+    fn launch_environment(&self) -> WaylandLaunchEnvironment {
+        WaylandLaunchEnvironment {
+            wayland_display: self.env["WAYLAND_DISPLAY"].clone(),
+            xdg_runtime_dir: self.env["XDG_RUNTIME_DIR"].clone(),
+            socket_path: self.socket_path.display().to_string(),
+            launch_preflight: self.launch_preflight(),
+        }
+    }
+
+    fn launch_preflight(&self) -> WaylandLaunchPreflight {
+        let metadata = std::fs::metadata(&self.socket_path);
+        let endpoint_exists = metadata.is_ok();
+        let endpoint_is_unix_socket = metadata
+            .as_ref()
+            .is_ok_and(|metadata| metadata.file_type().is_socket());
+        let accept_loop_running = !self.shutdown.is_cancelled() && !self.accept_task.is_finished();
+        let detail = self.availability_error();
+        WaylandLaunchPreflight {
+            endpoint_state: if detail.is_none() {
+                "ready"
+            } else {
+                "unavailable"
+            }
+            .to_string(),
+            endpoint_exists,
+            endpoint_is_unix_socket,
+            accept_loop_running,
+            caller_namespace_access: "not_tested".to_string(),
+            render_node_access: "not_tested".to_string(),
+            detail,
+        }
     }
 
     fn socket_path(&self) -> PathBuf {
@@ -710,6 +824,7 @@ struct WaylandProxyServer {
     running: bool,
     next_client_id: u64,
     last_runtime_error: Option<String>,
+    connection_history: VecDeque<WaylandConnectionHistoryEntry>,
     capture_tracking_deadline: Option<Instant>,
     sessions: HashMap<WaylandClientId, WaylandClientSession>,
     registry: WaylandProtocolRegistry,
@@ -722,6 +837,7 @@ impl WaylandProxyServer {
             running: false,
             next_client_id: 0,
             last_runtime_error: None,
+            connection_history: VecDeque::new(),
             capture_tracking_deadline: None,
             sessions: HashMap::new(),
             registry: WaylandProtocolRegistry::default(),
@@ -763,12 +879,15 @@ impl WaylandProxyServer {
 
         WaylandBackendSnapshot {
             socket_name: self.config.socket_name.clone(),
+            socket_path: None,
             backend_socket: self.config.backend_socket.clone(),
             running: self.running,
+            launch_preflight: WaylandLaunchPreflight::unavailable(None),
             session_count: self.sessions.len(),
             registered_globals,
             registered_intercepts: self.registry.intercept_names(),
             last_runtime_error: self.last_runtime_error.clone(),
+            connection_history: self.connection_history.iter().cloned().collect(),
             sessions,
         }
     }
@@ -780,11 +899,14 @@ impl WaylandProxyServer {
         self.next_client_id = self.next_client_id.saturating_add(1);
         self.running = true;
         let client_id = WaylandClientId(self.next_client_id);
-        let backend = match WaylandBackendSession::connect(&self.config) {
-            Ok(backend) => Some(backend),
+        let (backend, backend_error) = match WaylandBackendSession::connect(&self.config) {
+            Ok(backend) => (Some(backend), None),
             Err(err) => {
-                self.last_runtime_error = Some(err);
-                None
+                self.last_runtime_error = Some(err.clone());
+                (
+                    None,
+                    Some(format!("backend compositor connection failed: {err}")),
+                )
             }
         };
         let backend_globals = backend
@@ -796,6 +918,7 @@ impl WaylandProxyServer {
             client_id,
             WaylandClientSession::new(client_id, backend_globals, backend),
         );
+        self.record_connection_event("accepted", Some(client_id), "ready", backend_error);
         client_id
     }
 
@@ -804,6 +927,41 @@ impl WaylandProxyServer {
         if self.sessions.is_empty() {
             self.running = false;
         }
+    }
+
+    fn finish_client_session(&mut self, client_id: WaylandClientId, detail: String) {
+        self.remove_client_session(client_id);
+        self.record_connection_event("closed", Some(client_id), "ready", Some(detail));
+    }
+
+    fn note_accept_error(&mut self, error: String) {
+        self.record_connection_event(
+            "accept_failed",
+            None,
+            "accept_loop_failed",
+            Some(error.clone()),
+        );
+        self.note_runtime_error(error);
+    }
+
+    fn record_connection_event(
+        &mut self,
+        event: &str,
+        client_id: Option<WaylandClientId>,
+        endpoint_state: &str,
+        detail: Option<String>,
+    ) {
+        if self.connection_history.len() == MAX_CONNECTION_HISTORY {
+            self.connection_history.pop_front();
+        }
+        self.connection_history
+            .push_back(WaylandConnectionHistoryEntry {
+                timestamp_unix_ms: unix_time_ms(),
+                event: event.to_string(),
+                client_id: client_id.map(|client_id| client_id.0),
+                endpoint_state: endpoint_state.to_string(),
+                detail,
+            });
     }
 
     fn note_runtime_error(&mut self, error: impl Into<String>) {
@@ -1224,6 +1382,10 @@ impl WaylandProxyServer {
             apply_dmabuf_tracking(session, request, tracking_fds.as_slice())?;
             apply_syncobj_tracking(session, request, tracking_fds.as_slice())?;
             if let Some(hook_request) = request.hook_request.as_ref() {
+                session
+                    .frame_tracker
+                    .colors
+                    .request(request.object_id, hook_request);
                 for intercept in self.registry.intercepts_for(hook_request.id()) {
                     intercept.apply(session, request.object_id, hook_request);
                 }
@@ -2811,6 +2973,7 @@ struct ShmBufferSpec {
 }
 
 struct WaylandFrameTracker {
+    colors: crate::gui_color::SurfaceColors,
     window_id_prefix: String,
     next_commit_serial: u64,
     next_window_id: u64,
@@ -2833,6 +2996,7 @@ struct WaylandFrameTracker {
 impl WaylandFrameTracker {
     fn new(window_id_prefix: String) -> Self {
         Self {
+            colors: crate::gui_color::SurfaceColors::default(),
             window_id_prefix,
             next_commit_serial: 0,
             next_window_id: 0,
@@ -3150,49 +3314,41 @@ impl WaylandFrameTracker {
         let mut windows = self
             .windows
             .values()
-            .map(|window| GuiWindowInfo {
-                window_id: window.window_id.clone(),
-                title: window.title.clone(),
-                app_id: window.app_id.clone(),
-                width: window.width.max(1),
-                height: window.height.max(1),
-                mapped: window.mapped,
-                focused: window.focused,
-                commit_serial: window.commit_serial,
-                on_output: window.output_count > 0,
-                output_count: window.output_count,
-                buffer_kind: self
-                    .surfaces
-                    .get(&window.wl_surface_id)
-                    .and_then(|surface| surface.buffer_kind.map(str::to_string)),
-                sync_state: self
-                    .surfaces
-                    .get(&window.wl_surface_id)
-                    .and_then(TrackedSurface::sync_state),
-                capturable: self
-                    .surfaces
-                    .get(&window.wl_surface_id)
+            .map(|window| {
+                let surface = self.surfaces.get(&window.wl_surface_id);
+                let buffer = surface
+                    .and_then(|surface| surface.buffer_id)
+                    .and_then(|buffer_id| self.buffers.get(&buffer_id));
+                let capturable = surface
                     .map(|surface| {
                         !surface.rgba.is_empty()
-                            || surface
-                                .buffer_id
-                                .and_then(|buffer_id| self.buffers.get(&buffer_id))
-                                .map(TrackedBuffer::has_readback)
-                                .unwrap_or(false)
+                            || buffer.map(TrackedBuffer::has_readback).unwrap_or(false)
                     })
-                    .unwrap_or(false),
-                capture_error: self
-                    .surfaces
-                    .get(&window.wl_surface_id)
-                    .and_then(|surface| surface.capture_error.clone()),
-                render_surface_id: window.wl_surface_id,
-                input_surface_id: window.input_surface_id,
-                capture_details: self
-                    .surfaces
-                    .get(&window.wl_surface_id)
-                    .and_then(|surface| surface.buffer_id)
-                    .and_then(|buffer_id| self.buffers.get(&buffer_id))
-                    .map(TrackedBuffer::capture_details),
+                    .unwrap_or(false);
+                let capture_output_count =
+                    usize::from(window.mapped && window.commit_serial > 0 && capturable);
+                GuiWindowInfo {
+                    window_id: window.window_id.clone(),
+                    title: window.title.clone(),
+                    app_id: window.app_id.clone(),
+                    width: window.width.max(1),
+                    height: window.height.max(1),
+                    mapped: window.mapped,
+                    focused: window.focused,
+                    commit_serial: window.commit_serial,
+                    on_capture_output: capture_output_count > 0,
+                    capture_output_count,
+                    on_backend_output: window.output_count > 0,
+                    backend_output_count: window.output_count,
+                    buffer_kind: surface
+                        .and_then(|surface| surface.buffer_kind.map(str::to_string)),
+                    sync_state: surface.and_then(TrackedSurface::sync_state),
+                    capturable,
+                    capture_error: surface.and_then(|surface| surface.capture_error.clone()),
+                    render_surface_id: window.wl_surface_id,
+                    input_surface_id: window.input_surface_id,
+                    capture_details: buffer.map(TrackedBuffer::capture_details),
+                }
             })
             .collect::<Vec<_>>();
         windows.sort_by(|left, right| {
@@ -3544,11 +3700,20 @@ impl WaylandFrameTracker {
 
     fn capture_window_rgba(&self, window_id: &str) -> Option<Result<CapturedRgbaFrame, String>> {
         let surface = self.surface_for_window(window_id)?;
+        let color = self.colors.get(surface.id);
+        if let Some(color) = color
+            && let Err(error) = color.validate()
+        {
+            return Some(Err(error));
+        }
         if !surface.rgba.is_empty() {
+            let mut rgba = surface.rgba.clone();
+            convert_rgba8_colors(&mut rgba, color);
             return Some(Ok(CapturedRgbaFrame {
                 width: surface.width,
                 height: surface.height,
-                rgba: surface.rgba.clone(),
+                rgba,
+                color: color.map(crate::gui_color::ColorDescription::metadata),
             }));
         }
         let buffer_id = surface.buffer_id?;
@@ -3558,7 +3723,7 @@ impl WaylandFrameTracker {
         {
             return Some(Err(err));
         }
-        Some(buffer.read_rgba(surface))
+        Some(buffer.read_rgba(surface, color))
     }
 
     fn wait_sync_point(&self, point: TrackedSyncPoint) -> Result<(), String> {
@@ -3757,17 +3922,27 @@ impl TrackedBuffer {
         }
     }
 
-    fn read_rgba(&self, surface: &TrackedSurface) -> Result<CapturedRgbaFrame, String> {
+    fn read_rgba(
+        &self,
+        surface: &TrackedSurface,
+        color: Option<&crate::gui_color::ColorDescription>,
+    ) -> Result<CapturedRgbaFrame, String> {
         match &self.source {
             TrackedBufferSource::Dmabuf(buffer) => {
-                let rgba = read_vulkan_dmabuf_rgba(buffer)?;
+                let rgba = read_vulkan_dmabuf_rgba(buffer, color)?;
                 Ok(CapturedRgbaFrame {
                     width: surface.width,
                     height: surface.height,
                     rgba,
+                    color: color.map(crate::gui_color::ColorDescription::metadata),
                 })
             }
-            TrackedBufferSource::Shm(buffer) => buffer.read_rgba(),
+            TrackedBufferSource::Shm(buffer) => {
+                let mut frame = buffer.read_rgba()?;
+                convert_rgba8_colors(&mut frame.rgba, color);
+                frame.color = color.map(crate::gui_color::ColorDescription::metadata);
+                Ok(frame)
+            }
             TrackedBufferSource::Unknown => {
                 Err("window buffer has no readable pixel backing yet".to_string())
             }
@@ -3872,6 +4047,7 @@ impl TrackedShmBuffer {
             width: self.width,
             height: self.height,
             rgba,
+            color: None,
         })
     }
 }
@@ -3902,6 +4078,7 @@ struct TrackedDmabufPlane {
 
 #[derive(Debug)]
 struct CapturedRgbaFrame {
+    color: Option<serde_json::Value>,
     width: u32,
     height: u32,
     rgba: Vec<u8>,
@@ -4047,6 +4224,15 @@ fn create_proxy_runtime_dir() -> Result<TempDir, String> {
     Ok(runtime_dir)
 }
 
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 async fn run_proxy_accept_loop(
     listener: UnixListener,
     state: Arc<WaylandProxyState>,
@@ -4059,7 +4245,7 @@ async fn run_proxy_accept_loop(
                 let (stream, _addr) = match result {
                     Ok(accepted) => accepted,
                     Err(error) => {
-                        state.note_runtime_error(format!(
+                        state.note_accept_error(format!(
                             "Wayland proxy accept loop stopped: {error}"
                         )).await;
                         break;
@@ -4071,8 +4257,8 @@ async fn run_proxy_accept_loop(
                     let std_stream = match stream.into_std() {
                         Ok(stream) => stream,
                         Err(err) => {
-                            runtime.block_on(state.note_runtime_error(format!(
-                                "failed to convert proxy client stream into std stream: {err}"
+                            runtime.block_on(state.note_accept_error(format!(
+                                "accepted Wayland client could not be initialized: {err}"
                             )));
                             return;
                         }
@@ -4151,6 +4337,7 @@ fn handle_proxy_client_blocking(
         None
     };
 
+    let mut close_detail = "client closed its Wayland connection".to_string();
     let result = 'client_loop: loop {
         match read_wayland_wire_message_blocking(&stream, 16) {
             Ok(message) => {
@@ -4175,7 +4362,8 @@ fn handle_proxy_client_blocking(
             Err(err) if is_timeout_error(&err) => {
                 continue;
             }
-            Err(err) if err.contains("backend Wayland stream reached EOF") => {
+            Err(err) if is_normal_client_disconnect(&err) => {
+                close_detail = err;
                 break Ok(());
             }
             Err(err) => {
@@ -4200,7 +4388,10 @@ fn handle_proxy_client_blocking(
             client_id.0
         )));
     }
-    runtime.block_on(state.remove_client_session(client_id));
+    if let Err(err) = &result {
+        close_detail = format!("session error: {err}");
+    }
+    runtime.block_on(state.finish_client_session(client_id, close_detail));
     result
 }
 
@@ -4251,10 +4442,12 @@ fn relay_backend_events_blocking(
         if let Err(err) =
             send_wayland_wire_message(&client_writer, &event.encoded.bytes, &event.encoded.fds)
         {
-            runtime.block_on(state.note_runtime_error(format!(
-                "client {} backend event forward failed: {err}",
-                client_id.0
-            )));
+            if !is_normal_client_disconnect(&err) {
+                runtime.block_on(state.note_runtime_error(format!(
+                    "client {} backend event forward failed: {err}",
+                    client_id.0
+                )));
+            }
             break;
         }
         if raw_forward_only.load(Ordering::Relaxed) {
@@ -5700,7 +5893,19 @@ fn monotonic_timeout_nsec(timeout: Duration) -> Result<i64, String> {
     i64::try_from(now_nsec + timeout_nsec).map_err(|_| "syncobj timeout overflowed i64".to_string())
 }
 
-fn read_vulkan_dmabuf_rgba(buffer: &TrackedDmabufBuffer) -> Result<Vec<u8>, String> {
+fn convert_rgba8_colors(rgba: &mut [u8], color: Option<&crate::gui_color::ColorDescription>) {
+    if let Some(color) = color {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            let input = [pixel[0], pixel[1], pixel[2], pixel[3]].map(|v| v as f32 / 255.0);
+            pixel.copy_from_slice(&color.rgba8(input));
+        }
+    }
+}
+
+fn read_vulkan_dmabuf_rgba(
+    buffer: &TrackedDmabufBuffer,
+    color: Option<&crate::gui_color::ColorDescription>,
+) -> Result<Vec<u8>, String> {
     let planes = buffer
         .planes
         .iter()
@@ -5716,14 +5921,32 @@ fn read_vulkan_dmabuf_rgba(buffer: &TrackedDmabufBuffer) -> Result<Vec<u8>, Stri
         height: buffer.height,
         format: buffer.format,
         planes: &planes,
+        color,
     })
 }
 
-fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_rgba_png(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    color: Option<&serde_json::Value>,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    PngEncoder::new(&mut bytes)
-        .write_image(rgba, width, height, ColorType::Rgba8.into())
-        .map_err(|err| format!("failed to encode tracked Wayland frame as PNG: {err}"))?;
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        if let Some(color) = color {
+            encoder
+                .add_text_chunk("wayland-mcp-color".to_string(), color.to_string())
+                .map_err(|err| err.to_string())?;
+        }
+        let mut writer = encoder.write_header().map_err(|err| err.to_string())?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|err| err.to_string())?;
+    }
     Ok(bytes)
 }
 
@@ -5858,13 +6081,25 @@ mod tests {
                 interface: "wl_data_device_manager".to_string(),
                 version: 3,
             },
+            WaylandGlobalInfo {
+                name: 12,
+                interface: "wp_color_manager_v1".to_string(),
+                version: 2,
+            },
+            WaylandGlobalInfo {
+                name: 13,
+                interface: "wp_color_representation_manager_v1".to_string(),
+                version: 1,
+            },
         ]);
 
-        assert_eq!(globals.len(), 4);
+        assert_eq!(globals.len(), 5);
         assert_eq!(globals[0].interface, "wl_compositor");
         assert_eq!(globals[1].interface, "wl_shm");
         assert_eq!(globals[2].interface, "wl_subcompositor");
         assert_eq!(globals[3].interface, "wl_data_device_manager");
+        assert_eq!(globals[4].interface, "wp_color_manager_v1");
+        assert_eq!(globals[4].version, 2);
     }
 
     #[test]
@@ -6024,8 +6259,10 @@ mod tests {
                 mapped: true,
                 focused: false,
                 commit_serial: 1,
-                on_output: false,
-                output_count: 0,
+                on_capture_output: true,
+                capture_output_count: 1,
+                on_backend_output: false,
+                backend_output_count: 0,
                 buffer_kind: Some("dmabuf".to_string()),
                 sync_state: Some(
                     "acquire:timeline=41:point=7, release:timeline=41:point=9".to_string(),
@@ -6040,6 +6277,13 @@ mod tests {
                 ),
             }]
         );
+
+        tracker.note_surface_enter(10, 55);
+        let window = tracker.list_windows().remove(0);
+        assert!(window.on_capture_output);
+        assert_eq!(window.capture_output_count, 1);
+        assert!(window.on_backend_output);
+        assert_eq!(window.backend_output_count, 1);
         Ok(())
     }
 
@@ -6303,15 +6547,29 @@ mod tests {
     async fn environment_returns_an_existing_connectable_socket() {
         let backend = WaylandGuiBackend::new();
 
-        let environment = backend.sandbox_env().expect("live launch environment");
-        let socket_path =
-            PathBuf::from(&environment["XDG_RUNTIME_DIR"]).join(&environment["WAYLAND_DISPLAY"]);
+        let environment = backend
+            .launch_environment()
+            .expect("live launch environment");
+        let socket_path = PathBuf::from(&environment.socket_path);
 
         assert!(
             std::fs::metadata(&socket_path)
                 .expect("proxy socket metadata")
                 .file_type()
                 .is_socket()
+        );
+        assert_eq!(environment.wayland_display, DEFAULT_PROXY_SOCKET);
+        assert_eq!(environment.launch_preflight.endpoint_state, "ready");
+        assert!(environment.launch_preflight.endpoint_exists);
+        assert!(environment.launch_preflight.endpoint_is_unix_socket);
+        assert!(environment.launch_preflight.accept_loop_running);
+        assert_eq!(
+            environment.launch_preflight.caller_namespace_access,
+            "not_tested"
+        );
+        assert_eq!(
+            environment.launch_preflight.render_node_access,
+            "not_tested"
         );
         assert!(backend.snapshot().await.running);
         backend.list_windows().await.expect("window inventory");

@@ -37,6 +37,7 @@ pub(crate) struct JsEvalOutput {
 
 #[derive(Debug)]
 pub(crate) struct JsConsoleImage {
+    pub(crate) color: Option<Value>,
     pub(crate) bytes: Vec<u8>,
     pub(crate) path: String,
 }
@@ -305,15 +306,15 @@ async fn handle_native_call(
     match method {
         "environment" => {
             let environment = match backend {
-                GuiBackendHandle::Wayland(backend) => backend.sandbox_env()?,
-                GuiBackendHandle::Command(_) => HashMap::new(),
+                GuiBackendHandle::Wayland(backend) => {
+                    serde_json::to_value(backend.launch_environment()?)
+                        .map_err(|err| err.to_string())?
+                }
+                GuiBackendHandle::Command(_) => json!({}),
                 #[cfg(test)]
-                GuiBackendHandle::Test(_) => HashMap::new(),
+                GuiBackendHandle::Test(_) => json!({}),
             };
-            Ok((
-                serde_json::to_value(environment).map_err(|err| err.to_string())?,
-                None,
-            ))
+            Ok((environment, None))
         }
         "diagnostics" => {
             let diagnostics = match backend {
@@ -428,9 +429,20 @@ fn retained_image(
         .map(|image| (image.width(), image.height()))
         .map_err(|err| format!("captured invalid PNG: {err}"))?;
     let path = path.display().to_string();
+    let reader = png::Decoder::new(std::io::Cursor::new(&bytes))
+        .read_info()
+        .map_err(|err| err.to_string())?;
+    let color = reader
+        .info()
+        .uncompressed_latin1_text
+        .iter()
+        .find(|chunk| chunk.keyword == "wayland-mcp-color")
+        .map(|chunk| serde_json::from_str::<Value>(&chunk.text))
+        .transpose()
+        .map_err(|err| err.to_string())?;
     Ok((
-        json!({"path":path, "width":dimensions.0, "height":dimensions.1}),
-        Some(JsConsoleImage { bytes, path }),
+        json!({"path":path, "width":dimensions.0, "height":dimensions.1, "color": color}),
+        Some(JsConsoleImage { bytes, path, color }),
     ))
 }
 
@@ -469,10 +481,16 @@ mod tests {
     use crate::gui_backend::GuiKeyboardTextStroke;
     use crate::gui_backend::GuiWindowInfo;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Default)]
     struct RecordingBackend {
+        pointer_events: StdMutex<Vec<GuiWaylandPointerEventRequest>>,
         keyboard_events: StdMutex<Vec<GuiWaylandKeyboardEventRequest>>,
+        fail_pointer_event_once_at: StdMutex<Option<usize>>,
+        fail_keyboard_event_once_at: StdMutex<Option<usize>>,
+        pointer_event_attempts: AtomicUsize,
+        keyboard_event_attempts: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -494,15 +512,39 @@ mod tests {
 
         async fn emit_wayland_pointer_event(
             &self,
-            _request: GuiWaylandPointerEventRequest,
+            request: GuiWaylandPointerEventRequest,
         ) -> Result<String, String> {
-            Err("pointer input is not used by this test backend".to_string())
+            let attempt = self.pointer_event_attempts.fetch_add(1, Ordering::Relaxed);
+            let mut fail_once = self
+                .fail_pointer_event_once_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *fail_once == Some(attempt) {
+                *fail_once = None;
+                return Err("injected pointer event failure".to_string());
+            }
+            drop(fail_once);
+            self.pointer_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            Ok("recorded pointer event".to_string())
         }
 
         async fn emit_wayland_keyboard_event(
             &self,
             request: GuiWaylandKeyboardEventRequest,
         ) -> Result<String, String> {
+            let attempt = self.keyboard_event_attempts.fetch_add(1, Ordering::Relaxed);
+            let mut fail_once = self
+                .fail_keyboard_event_once_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *fail_once == Some(attempt) {
+                *fail_once = None;
+                return Err("injected keyboard event failure".to_string());
+            }
+            drop(fail_once);
             self.keyboard_events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -545,6 +587,10 @@ mod tests {
                     key: 21,
                     modifiers: 0,
                 }],
+                "w" => vec![GuiKeyboardTextStroke {
+                    key: 17,
+                    modifiers: 0,
+                }],
                 unexpected => return Err(format!("unexpected text fixture: {unexpected:?}")),
             };
             Ok(GuiKeyboardTextPlan {
@@ -577,6 +623,7 @@ mod tests {
         assert!(help.value.as_str().unwrap().contains("pressShortcut"));
         assert!(help.value.as_str().unwrap().contains("typeText"));
         assert!(help.value.as_str().unwrap().contains("actAndCapture"));
+        assert!(help.value.as_str().unwrap().contains("wayland.keyNames"));
 
         console
             .eval("globalThis.twice = async function(value) { await wayland.sleep(1); return value * 2; }; return 'defined';".to_string())
@@ -587,6 +634,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(called.value, json!(42));
+    }
+
+    #[test]
+    fn captured_color_notice_survives_png_and_retention() {
+        let color =
+            json!({"tone_mapped":true, "notice":"SDR sRGB preview, not the original HDR window"});
+        let png =
+            crate::gui_backend_wayland::encode_rgba_png(1, 1, &[128, 128, 128, 255], Some(&color))
+                .unwrap();
+        let reader = png::Decoder::new(std::io::Cursor::new(&png))
+            .read_info()
+            .unwrap();
+        assert_eq!(
+            reader.info().srgb,
+            Some(png::SrgbRenderingIntent::Perceptual)
+        );
+        let (value, image) =
+            retained_image("color-test", None, png, &ArtifactStore::new()).unwrap();
+        assert_eq!(value["color"], color);
+        assert_eq!(image.unwrap().color, Some(color));
     }
 
     #[tokio::test]
@@ -716,6 +783,147 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn shortcut_releases_key_and_restores_modifiers_after_event_failure() {
+        let recording = Arc::new(RecordingBackend::default());
+        *recording
+            .fail_keyboard_event_once_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(3);
+        let backend = GuiBackendHandle::Test(recording.clone());
+        let artifacts = Arc::new(ArtifactStore::new());
+        let console = JsConsole::new(backend, artifacts);
+
+        let error = console
+            .eval(
+                "return await wayland.pressShortcut({windowId:'fixture', keys:['CTRL','Z'], holdMs:0});"
+                    .to_string(),
+            )
+            .await
+            .expect_err("the injected key-up failure should reject the shortcut");
+        assert!(error.contains("injected keyboard event failure"));
+
+        let actual = recording
+            .keyboard_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            actual.as_slice(),
+            [
+                GuiWaylandKeyboardEvent::Enter { .. },
+                GuiWaylandKeyboardEvent::Modifiers {
+                    mods_depressed: 4,
+                    ..
+                },
+                GuiWaylandKeyboardEvent::Key {
+                    key: 21,
+                    state: 1,
+                    ..
+                },
+                GuiWaylandKeyboardEvent::Key {
+                    key: 21,
+                    state: 0,
+                    ..
+                },
+                GuiWaylandKeyboardEvent::Modifiers {
+                    mods_depressed: 0,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn click_releases_button_after_event_failure() {
+        let recording = Arc::new(RecordingBackend::default());
+        *recording
+            .fail_pointer_event_once_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(5);
+        let backend = GuiBackendHandle::Test(recording.clone());
+        let artifacts = Arc::new(ArtifactStore::new());
+        let console = JsConsole::new(backend, artifacts);
+
+        let error = console
+            .eval("return await wayland.click({windowId:'fixture', x:10, y:20});".to_string())
+            .await
+            .expect_err("the injected button-up failure should reject the click");
+        assert!(error.contains("injected pointer event failure"));
+
+        let actual = recording
+            .pointer_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            actual.as_slice(),
+            [
+                GuiWaylandPointerEvent::Enter { .. },
+                GuiWaylandPointerEvent::Motion { .. },
+                GuiWaylandPointerEvent::Frame,
+                GuiWaylandPointerEvent::Button { state: 1, .. },
+                GuiWaylandPointerEvent::Frame,
+                GuiWaylandPointerEvent::Button { state: 0, .. },
+                GuiWaylandPointerEvent::Frame,
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn press_key_accepts_uppercase_single_character_names() {
+        let recording = Arc::new(RecordingBackend::default());
+        let backend = GuiBackendHandle::Test(recording.clone());
+        let artifacts = Arc::new(ArtifactStore::new());
+        let console = JsConsole::new(backend, artifacts);
+
+        let output = console
+            .eval(
+                "return await wayland.pressKey({windowId:'fixture', key:'W', holdMs:0});"
+                    .to_string(),
+            )
+            .await
+            .expect("uppercase character key");
+
+        assert_eq!(output.value["keyCode"], json!(17));
+        assert_eq!(output.value["keymapDriven"], json!(true));
+        let actual = recording
+            .keyboard_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            actual.as_slice(),
+            [
+                GuiWaylandKeyboardEvent::Enter { .. },
+                GuiWaylandKeyboardEvent::Modifiers {
+                    mods_depressed: 0,
+                    ..
+                },
+                GuiWaylandKeyboardEvent::Key {
+                    key: 17,
+                    state: 1,
+                    ..
+                },
+                GuiWaylandKeyboardEvent::Key {
+                    key: 17,
+                    state: 0,
+                    ..
+                },
+                GuiWaylandKeyboardEvent::Modifiers {
+                    mods_depressed: 0,
+                    ..
+                },
+            ]
+        ));
     }
 
     #[tokio::test]

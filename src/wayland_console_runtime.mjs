@@ -69,6 +69,7 @@ const namedKeys = Object.freeze({
   ARROWUP: 103, ARROWLEFT: 105, ARROWRIGHT: 106, ARROWDOWN: 108,
   META: 125, SUPER: 125, LOGO: 125, LEFTMETA: 125,
 });
+const namedKeyNames = Object.freeze(Object.keys(namedKeys).sort());
 
 function resolveKey(key) {
   if (Number.isInteger(key) && key >= 0 && key <= 0xffffffff) return key;
@@ -76,7 +77,7 @@ function resolveKey(key) {
     const resolved = namedKeys[key.replaceAll(/[-_ ]/g, "").toUpperCase()];
     if (resolved !== undefined) return resolved;
   }
-  throw new TypeError("key must be a non-negative 32-bit evdev code or a supported key name");
+  throw new TypeError(`key must be a non-negative 32-bit evdev code, one character, or one of: ${namedKeyNames.join(", ")}`);
 }
 
 function finiteNumber(value, name) {
@@ -123,11 +124,24 @@ async function move({ windowId, ...coordinates }) {
 async function click({ windowId, button = 0x110, ...coordinates }) {
   const moved = await move({ windowId, ...coordinates });
   const events = [...moved.events];
-  events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 1 } }));
-  events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
-  events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 0 } }));
-  events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
-  return { delivered: true, point: moved.point, button, events };
+  let buttonDown = false;
+  try {
+    buttonDown = true;
+    events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 1 } }));
+    events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
+    events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 0 } }));
+    buttonDown = false;
+    events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
+    return { delivered: true, point: moved.point, button, events };
+  } finally {
+    if (buttonDown) {
+      try {
+        await native("pointer_event", { windowId, event: { type: "button", button, state: 0 } });
+      } finally {
+        await native("pointer_event", { windowId, event: { type: "frame" } });
+      }
+    }
+  }
 }
 
 async function doubleClick(args) {
@@ -155,20 +169,33 @@ async function drag({ windowId, from, to, button = 0x110, durationMs = 400, step
   const events = [];
   await ensurePointerFocus(windowId, start.x, start.y, events);
   events.push(await native("pointer_event", { windowId, event: { type: "motion", ...start } }));
-  events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 1 } }));
-  events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
-  for (let step = 1; step <= steps; step += 1) {
-    if (durationMs > 0) await new Promise((resolve) => setTimeout(resolve, durationMs / steps));
-    const point = {
-      x: Math.round(start.x + ((end.x - start.x) * step) / steps),
-      y: Math.round(start.y + ((end.y - start.y) * step) / steps),
-    };
-    events.push(await native("pointer_event", { windowId, event: { type: "motion", ...point } }));
+  let buttonDown = false;
+  try {
+    buttonDown = true;
+    events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 1 } }));
     events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
+    for (let step = 1; step <= steps; step += 1) {
+      if (durationMs > 0) await new Promise((resolve) => setTimeout(resolve, durationMs / steps));
+      const point = {
+        x: Math.round(start.x + ((end.x - start.x) * step) / steps),
+        y: Math.round(start.y + ((end.y - start.y) * step) / steps),
+      };
+      events.push(await native("pointer_event", { windowId, event: { type: "motion", ...point } }));
+      events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
+    }
+    events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 0 } }));
+    buttonDown = false;
+    events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
+    return { delivered: true, from: start, to: end, button, durationMs, steps, events };
+  } finally {
+    if (buttonDown) {
+      try {
+        await native("pointer_event", { windowId, event: { type: "button", button, state: 0 } });
+      } finally {
+        await native("pointer_event", { windowId, event: { type: "frame" } });
+      }
+    }
   }
-  events.push(await native("pointer_event", { windowId, event: { type: "button", button, state: 0 } }));
-  events.push(await native("pointer_event", { windowId, event: { type: "frame" } }));
-  return { delivered: true, from: start, to: end, button, durationMs, steps, events };
 }
 
 async function scroll({ windowId, deltaY, ...coordinates }) {
@@ -195,15 +222,54 @@ async function ensureKeyboardFocus(windowId, events) {
 }
 
 async function pressKey({ windowId, key, holdMs = 40 }) {
-  const keyCode = resolveKey(key);
+  const isCharacter = typeof key === "string" && [...key].length === 1;
+  const character = isCharacter ? key.toLocaleLowerCase("en-US") : null;
+  const plan = character === null ? null : await native("keyboard_text_plan", { windowId, text: character });
+  const stroke = plan?.strokes[0];
+  if (character !== null && stroke === undefined) {
+    throw new Error(`character key ${JSON.stringify(key)} is absent from the target keymap`);
+  }
+  const keyCode = stroke?.key ?? resolveKey(key);
   finiteNumber(holdMs, "holdMs");
   if (holdMs < 0 || holdMs > 60_000) throw new RangeError("holdMs must be from 0 through 60000");
   const events = [];
   await ensureKeyboardFocus(windowId, events);
-  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
-  if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
-  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
-  return { delivered: true, key, keyCode, holdMs, events };
+  let keyDown = false;
+  let modifiersChanged = false;
+  try {
+    if (plan !== null) {
+      modifiersChanged = true;
+      events.push(await native("keyboard_event", { windowId, event: {
+        type: "modifiers", mods_depressed: stroke.modifiers, mods_latched: 0, mods_locked: 0,
+        group: plan.layout_group,
+      } }));
+    }
+    keyDown = true;
+    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
+    if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
+    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
+    keyDown = false;
+  } finally {
+    try {
+      if (keyDown) {
+        await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } });
+      }
+    } finally {
+      if (modifiersChanged) {
+        events.push(await native("keyboard_event", { windowId, event: {
+          type: "modifiers",
+          mods_depressed: plan.restore_mods_depressed,
+          mods_latched: plan.restore_mods_latched,
+          mods_locked: plan.restore_mods_locked,
+          group: plan.layout_group,
+        } }));
+      }
+    }
+  }
+  return {
+    delivered: true, key, keyCode, holdMs, keymapDriven: plan !== null,
+    modifierMask: stroke?.modifiers ?? null, events,
+  };
 }
 
 async function pressShortcut({ windowId, keys, holdMs = 40 }) {
@@ -239,20 +305,36 @@ async function pressShortcut({ windowId, keys, holdMs = 40 }) {
   }
   const events = [];
   await ensureKeyboardFocus(windowId, events);
-  events.push(await native("keyboard_event", { windowId, event: {
-    type: "modifiers", mods_depressed: depressed, mods_latched: 0, mods_locked: 0,
-    group: plan.layout_group,
-  } }));
-  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
-  if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
-  events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
-  events.push(await native("keyboard_event", { windowId, event: {
-    type: "modifiers",
-    mods_depressed: plan.restore_mods_depressed,
-    mods_latched: plan.restore_mods_latched,
-    mods_locked: plan.restore_mods_locked,
-    group: plan.layout_group,
-  } }));
+  let keyDown = false;
+  let modifiersChanged = false;
+  try {
+    modifiersChanged = true;
+    events.push(await native("keyboard_event", { windowId, event: {
+      type: "modifiers", mods_depressed: depressed, mods_latched: 0, mods_locked: 0,
+      group: plan.layout_group,
+    } }));
+    keyDown = true;
+    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
+    if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
+    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
+    keyDown = false;
+  } finally {
+    try {
+      if (keyDown) {
+        await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } });
+      }
+    } finally {
+      if (modifiersChanged) {
+        events.push(await native("keyboard_event", { windowId, event: {
+          type: "modifiers",
+          mods_depressed: plan.restore_mods_depressed,
+          mods_latched: plan.restore_mods_latched,
+          mods_locked: plan.restore_mods_locked,
+          group: plan.layout_group,
+        } }));
+      }
+    }
+  }
   return { delivered: true, keys, keyCode, modifierMask: depressed, holdMs, events };
 }
 
@@ -265,26 +347,38 @@ async function typeText({ windowId, text, intervalMs = 0 }) {
   const events = [];
   await ensureKeyboardFocus(windowId, events);
   let depressed = null;
-  for (const stroke of plan.strokes) {
-    if (stroke.modifiers !== depressed) {
-      depressed = stroke.modifiers;
-      events.push(await native("keyboard_event", { windowId, event: {
-        type: "modifiers", mods_depressed: depressed, mods_latched: 0, mods_locked: 0,
-        group: plan.layout_group,
-      } }));
+  let keyDown = null;
+  try {
+    for (const stroke of plan.strokes) {
+      if (stroke.modifiers !== depressed) {
+        depressed = stroke.modifiers;
+        events.push(await native("keyboard_event", { windowId, event: {
+          type: "modifiers", mods_depressed: depressed, mods_latched: 0, mods_locked: 0,
+          group: plan.layout_group,
+        } }));
+      }
+      keyDown = stroke.key;
+      events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 1 } }));
+      events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 0 } }));
+      keyDown = null;
+      if (intervalMs > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
-    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 1 } }));
-    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 0 } }));
-    if (intervalMs > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  if (depressed !== null) {
-    events.push(await native("keyboard_event", { windowId, event: {
-      type: "modifiers",
-      mods_depressed: plan.restore_mods_depressed,
-      mods_latched: plan.restore_mods_latched,
-      mods_locked: plan.restore_mods_locked,
-      group: plan.layout_group,
-    } }));
+  } finally {
+    try {
+      if (keyDown !== null) {
+        await native("keyboard_event", { windowId, event: { type: "key", key: keyDown, state: 0 } });
+      }
+    } finally {
+      if (depressed !== null) {
+        events.push(await native("keyboard_event", { windowId, event: {
+          type: "modifiers",
+          mods_depressed: plan.restore_mods_depressed,
+          mods_latched: plan.restore_mods_latched,
+          mods_locked: plan.restore_mods_locked,
+          group: plan.layout_group,
+        } }));
+      }
+    }
   }
   return {
     delivered: true, text, keymapDriven: true, layoutGroup: plan.layout_group,
@@ -405,9 +499,15 @@ convert preview coordinates safely.
 typeText and character keys in pressShortcut use the exact XKB keymap sent to
 the target client and its active layout group; characters absent from that
 layout fail explicitly instead of falling back to hardcoded physical keys.
+pressKey accepts evdev codes, the names in wayland.keyNames, and one-character
+keys case-insensitively; character keys also use the target client's XKB map.
 Raw calls: environment(), diagnostics(), windows(), screenshot({windowId}),
 captureNextFrame({windowId, afterCommitSerial, timeoutMs}),
 pointerEvent({windowId,event}), keyboardEvent({windowId,event}), sleep(ms).
+environment() returns WAYLAND_DISPLAY, XDG_RUNTIME_DIR, an absolute socket_path,
+and launch_preflight; caller namespace and render-node access remain not_tested.
+diagnostics() includes the same endpoint state and a bounded connection_history.
+windows() reports capture-output and backend-output membership separately.
 Each input call emits exactly one compositor-side protocol event; author
 sequences yourself. wl_pointer event types and fields:
   enter{x,y,serial?}, motion{x,y,time?}, button{button,state,serial?,time?},
@@ -427,6 +527,7 @@ transition, not a prefix for every action.`;
 
 const wayland = Object.freeze({
   help: apiHelp,
+  keyNames: namedKeyNames,
   environment: () => native("environment"),
   diagnostics: () => native("diagnostics"),
   windows: () => native("windows"),

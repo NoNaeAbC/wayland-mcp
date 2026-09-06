@@ -1006,6 +1006,7 @@ dependencies = [
  "base64",
  "image",
  "libc",
+ "png",
  "pretty_assertions",
  "rmcp",
  "serde",

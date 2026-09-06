@@ -13,6 +13,7 @@ exclude = ["/.private/**"]
 async-trait = "0.1.89"
 base64 = "0.22.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+png = "0.18"
 libc = "0.2"
 rmcp = { version = "1.8.0", default-features = false, features = ["base64", "server", "transport-async-rw"] }
 serde = { version = "1", features = ["derive"] }

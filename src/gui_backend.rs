@@ -176,8 +176,13 @@ pub(crate) struct GuiWindowInfo {
     pub(crate) mapped: bool,
     pub(crate) focused: bool,
     pub(crate) commit_serial: u64,
-    pub(crate) on_output: bool,
-    pub(crate) output_count: usize,
+    /// Membership on the MCP's virtual capture output. A mapped window with a
+    /// readable committed buffer belongs to exactly one capture output.
+    pub(crate) on_capture_output: bool,
+    pub(crate) capture_output_count: usize,
+    /// Membership reported by wl_surface.enter/leave from the host compositor.
+    pub(crate) on_backend_output: bool,
+    pub(crate) backend_output_count: usize,
     pub(crate) buffer_kind: Option<String>,
     pub(crate) sync_state: Option<String>,
     pub(crate) capturable: bool,

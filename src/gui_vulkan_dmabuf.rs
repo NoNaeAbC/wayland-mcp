@@ -15,6 +15,7 @@ pub(crate) struct DmabufPlane {
 }
 
 pub(crate) struct DmabufImage<'a> {
+    pub(crate) color: Option<&'a crate::gui_color::ColorDescription>,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) format: u32,
@@ -540,12 +541,13 @@ fn record_submit_copy_and_map(
         "vkMapMemory",
     )?;
     let raw = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), byte_len as usize) };
-    let rgba = copied_pixels_to_rgba(
+    let rgba = copied_pixels_to_rgba_with_color(
         raw,
         image.width as usize,
         image.height as usize,
         vk_format,
         drm_format_has_alpha(image.format),
+        image.color,
     );
     unsafe { vkUnmapMemory(device, buffer_memory) };
     Ok(rgba)
@@ -558,6 +560,17 @@ fn copied_pixels_to_rgba(
     vk_format: VkFormat,
     preserve_alpha: bool,
 ) -> Vec<u8> {
+    copied_pixels_to_rgba_with_color(raw, width, height, vk_format, preserve_alpha, None)
+}
+
+fn copied_pixels_to_rgba_with_color(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    vk_format: VkFormat,
+    preserve_alpha: bool,
+    color: Option<&crate::gui_color::ColorDescription>,
+) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     let Ok(bytes_per_pixel) = bytes_per_pixel(vk_format) else {
         return rgba;
@@ -565,6 +578,38 @@ fn copied_pixels_to_rgba(
     for index in 0..(width * height) {
         let src = index * bytes_per_pixel;
         let dst = index * 4;
+        if let Some(color) = color {
+            let mut pixel = match vk_format {
+                VK_FORMAT_R16G16B16A16_SFLOAT => std::array::from_fn(|i| {
+                    f16_channel_to_f32(u16::from_le_bytes([raw[src + i * 2], raw[src + i * 2 + 1]]))
+                }),
+                VK_FORMAT_B8G8R8A8_UNORM => {
+                    [raw[src + 2], raw[src + 1], raw[src], raw[src + 3]].map(|v| v as f32 / 255.0)
+                }
+                VK_FORMAT_R8G8B8A8_UNORM => {
+                    [raw[src], raw[src + 1], raw[src + 2], raw[src + 3]].map(|v| v as f32 / 255.0)
+                }
+                _ => {
+                    let p = u32::from_le_bytes(raw[src..src + 4].try_into().unwrap());
+                    let channels = if vk_format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 {
+                        [(p >> 20) & 1023, (p >> 10) & 1023, p & 1023]
+                    } else {
+                        [p & 1023, (p >> 10) & 1023, (p >> 20) & 1023]
+                    };
+                    [
+                        channels[0] as f32 / 1023.0,
+                        channels[1] as f32 / 1023.0,
+                        channels[2] as f32 / 1023.0,
+                        (p >> 30) as f32 / 3.0,
+                    ]
+                }
+            };
+            if !preserve_alpha {
+                pixel[3] = 1.0;
+            }
+            rgba[dst..dst + 4].copy_from_slice(&color.rgba8(pixel));
+            continue;
+        }
         match vk_format {
             VK_FORMAT_B8G8R8A8_UNORM => {
                 rgba[dst] = raw[src + 2];
@@ -638,10 +683,11 @@ fn unorm2_to_u8(value: u32) -> u8 {
 }
 
 fn f16_channel_to_u8(bits: u16) -> u8 {
+    crate::gui_color::quantize(f16_channel_to_f32(bits))
+}
+
+fn f16_channel_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) & 0x1;
-    if sign != 0 {
-        return 0;
-    }
     let exponent = ((bits >> 10) & 0x1f) as i32;
     let mantissa = (bits & 0x03ff) as u32;
     let value = match exponent {
@@ -655,7 +701,7 @@ fn f16_channel_to_u8(bits: u16) -> u8 {
         }
         _ => (1.0 + (mantissa as f32 / 1024.0)) * 2f32.powi(exponent - 15),
     };
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    if sign != 0 { -value } else { value }
 }
 
 fn enumerate_physical_devices(instance: VkInstance) -> Result<Vec<VkPhysicalDevice>, String> {
@@ -870,6 +916,49 @@ const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn scrgb_float_highlights_survive_until_tone_mapping() {
+        use crate::gui_wayland_generated::GeneratedHookRequest as R;
+        let mut colors = crate::gui_color::SurfaceColors::default();
+        colors.request(
+            1,
+            &R::WpColorManagerV1CreateWindowsScrgb {
+                image_description: 2,
+            },
+        );
+        colors.request(
+            1,
+            &R::WpColorManagerV1GetSurface {
+                id: 3,
+                surface: Some(4),
+            },
+        );
+        colors.request(
+            3,
+            &R::WpColorManagementSurfaceV1SetImageDescription {
+                image_description: Some(2),
+                render_intent: 0,
+            },
+        );
+        colors.request(4, &R::WlSurfaceCommit);
+        let raw = [
+            0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
+            0x00, 0x3c,
+        ];
+        let rgba = copied_pixels_to_rgba_with_color(
+            &raw,
+            2,
+            1,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            true,
+            colors.get(4),
+        );
+        assert!(rgba[0] < rgba[4] && rgba[4] < 255);
+        assert_eq!(rgba[3], 255);
+        assert_eq!(rgba[7], 255);
+        assert_eq!(f16_channel_to_f32(0xb800), -0.5);
+    }
 
     #[test]
     fn maps_xbgr_and_abgr_16161616f_to_vulkan_float_rgba() {

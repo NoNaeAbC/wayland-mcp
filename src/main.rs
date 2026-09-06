@@ -1,5 +1,6 @@
 mod gui_backend;
 mod gui_backend_wayland;
+mod gui_color;
 mod gui_vulkan_dmabuf;
 mod gui_wayland_generated;
 mod gui_xkb;
@@ -97,7 +98,7 @@ impl WaylandMcp {
                 let mut image_content = Vec::new();
                 let mut image_metadata = Vec::new();
                 for image in output.images {
-                    let (returned, metadata) = match bounded_png_preview(&image.bytes) {
+                    let (returned, mut metadata) = match bounded_png_preview(&image.bytes) {
                         Some((bytes, full_width, full_height, preview_width, preview_height)) => (
                             bytes,
                             json!({
@@ -127,6 +128,7 @@ impl WaylandMcp {
                             )
                         }
                     };
+                    metadata["color"] = image.color.unwrap_or(serde_json::Value::Null);
                     image_metadata.push(metadata);
                     image_content.push(Content::image(
                         BASE64_STANDARD.encode(returned),
@@ -362,12 +364,15 @@ fn bounded_png_preview(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
     }
     let preview = image.thumbnail(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT);
     let (preview_width, preview_height) = preview.dimensions();
-    let mut encoded = std::io::Cursor::new(Vec::new());
-    preview
-        .write_to(&mut encoded, image::ImageFormat::Png)
-        .ok()?;
+    let encoded = gui_backend_wayland::encode_rgba_png(
+        preview_width,
+        preview_height,
+        preview.to_rgba8().as_raw(),
+        None,
+    )
+    .ok()?;
     Some((
-        encoded.into_inner(),
+        encoded,
         full_width,
         full_height,
         preview_width,

@@ -80,8 +80,8 @@ return wayland.help;
 
 The main observation calls are:
 
-- `wayland.environment()` — environment variables for clients that should
-  connect through the proxy;
+- `wayland.environment()` — environment variables, absolute socket path, and
+  launch preflight state for clients that should connect through the proxy;
 - `wayland.diagnostics()` — proxy, compositor, session, and error state;
 - `wayland.windows()` — mapped surface inventory and capture metadata;
 - `wayland.screenshot({windowId})` — capture the current frame;
@@ -92,11 +92,20 @@ High-level input and synchronization helpers include `waitForWindow`,
 `waitForWindowGone`, `click`, `doubleClick`, `move`, `drag`, `scroll`,
 `pressKey`, `pressShortcut`, `typeText`, `waitForCommit`, `actAndCapture`, and
 `resetInputState`. `pointerEvent` and `keyboardEvent` provide direct access to
-individual protocol events. `pressKey` accepts either an evdev code or a common
-name such as `"Escape"`. `typeText` and character keys in `pressShortcut`
+individual protocol events. `pressKey` accepts an evdev code, a common name
+such as `"Escape"`, or a one-character key such as `"W"` (case-insensitive).
+The complete named-key vocabulary is available as `wayland.keyNames`.
+`pressKey`, `typeText`, and character keys in `pressShortcut`
 derive their key codes and serialized modifier masks from the exact XKB keymap
 forwarded to the target client and honor its active layout group. Raw events
 remain available for protocol-level keyboard testing.
+
+Window inventory separates the two output domains. `on_capture_output` and
+`capture_output_count` describe membership on the MCP's single virtual capture
+output; a mapped, capturable window reports `true` and `1`.
+`on_backend_output` and `backend_output_count` report only host-compositor
+`wl_surface.enter`/`leave` membership and may remain false/zero while capture
+works.
 
 JavaScript state survives calls. Define reusable functions on `globalThis` when
 an interaction needs custom timing or event sequencing:
@@ -118,6 +127,34 @@ full and embedded-preview dimensions plus the conversion scale. A helper call
 may instead specify `coordinateSpace: "preview"` together with the returned
 `preview_to_full_scale` value; the helpers accept that response spelling as
 well as `previewToFullScale`.
+
+Screenshots convert committed Wayland color descriptions to 8-bit SDR sRGB
+PNG pixels. FP16 and 10-bit values are converted before quantization; the
+pipeline decodes the transfer function, applies the declared luminance scale,
+converts primaries, maps HDR luminance with Reinhard `Y/(1+Y)` relative to
+source reference white, compresses the gamut toward neutral, and encodes sRGB.
+This is a deterministic SDR preview policy, not a reproduction of the host
+display's HDR appearance or its tone mapper. HDR reference white maps to
+linear sRGB 0.5. The player's own HDR10+ scene processing remains in its pixels.
+
+Each converted capture reports a `color` object in both the screenshot result
+and the tool's `images` metadata, including a model-facing notice when the
+image is tone mapped. This notice remains present even if JavaScript discards
+the screenshot return value. It states that original HDR brightness, gamut,
+and highlight appearance cannot be judged from the SDR preview. The metadata
+is also retained in the full PNG alongside an sRGB declaration.
+
+Supported named primaries are sRGB/BT.709, BT.2020, and Display P3; supported
+transfer functions are extended linear, BT.1886, gamma 2.2/2.8, sRGB piecewise,
+and ST 2084 PQ. Windows-scRGB is supported. Untracked descriptions, ICC profiles,
+custom primaries/power functions, and HLG currently fail capture explicitly.
+Untagged surfaces retain the existing assumed-sRGB path. Color state follows
+surface commit and image-description copy semantics.
+
+OpenAI's [image-input documentation](https://developers.openai.com/api/docs/guides/images-vision)
+does not specify an HDR tone mapper or an ICC/HDR processing contract. The SDR
+output policy above is this tool's compatibility choice, not a documented
+OpenAI tone-mapping requirement.
 
 Input delivery and application behavior are separate observations. A successful
 input call means that the protocol event was emitted; capture a later commit to
@@ -150,10 +187,22 @@ assertion.
 5. Capture a baseline, perform input, then wait for a later commit.
 6. Terminate the client and confirm that its window disappears.
 
-`environment()` validates the listener and socket before returning. If an
-earlier proxy endpoint stopped or its private runtime directory disappeared,
-the call creates a fresh endpoint; callers must therefore use the values from
-the latest call rather than caching them across MCP instances.
+`environment()` validates the listener and socket before returning. Alongside
+`WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`, it returns `socket_path` and a
+`launch_preflight` object. `endpoint_state: "ready"` proves that the endpoint is
+a Unix socket and the MCP accept loop is running. Because the MCP cannot inspect
+the namespace or device policy of a process launched by its caller,
+`caller_namespace_access` and `render_node_access` explicitly remain
+`"not_tested"`; the caller should test or grant those narrow paths before
+classifying `wl_display_connect` as an application failure. If an earlier proxy
+endpoint stopped or its private runtime directory disappeared, the call creates
+a fresh endpoint; callers must therefore use the values from the latest call
+rather than caching them across MCP instances.
+
+`diagnostics()` repeats the socket/preflight state and retains the 32 most
+recent connection events with timestamps, client IDs, endpoint state, and close
+details. Normal EOF, connection reset, and broken-pipe client teardown are kept
+in that history without replacing the service-wide `last_runtime_error`.
 
 The proxy does not launch applications or grant filesystem, socket, or graphics
 device permissions. Those remain the responsibility of the invoking process.
