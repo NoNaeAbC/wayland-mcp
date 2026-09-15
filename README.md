@@ -98,7 +98,15 @@ The complete named-key vocabulary is available as `wayland.keyNames`.
 `pressKey`, `typeText`, and character keys in `pressShortcut`
 derive their key codes and serialized modifier masks from the exact XKB keymap
 forwarded to the target client and honor its active layout group. Raw events
-remain available for protocol-level keyboard testing.
+remain available for protocol-level keyboard testing. Raw input calls invalidate
+cached helper focus automatically. `resetInputState()` clears cached focus after
+external focus changes; it does not release pressed keys.
+
+For applications supporting Ctrl+Shift+U Unicode entry, use
+`wayland.typeText({windowId, text:"🌘", inputMethod:"unicode-hex"})`.
+This opt-in method enters each Unicode code point through the application's hex
+input convention, without using the clipboard. It was exercised in Chromium;
+applications without that convention must use their own input method.
 
 Window inventory separates the two output domains. `on_capture_output` and
 `capture_output_count` describe membership on the MCP's single virtual capture
@@ -233,8 +241,9 @@ the environment in which the server runs.
   tree; assertions are based on frames, surface metadata, and application
   commits.
 - `typeText` supports characters directly represented in the target client's
-  active XKB layout. Compose sequences and input-method-mediated text still
-  require an input-method companion.
+  active XKB layout by default. The opt-in `unicode-hex` method requires
+  application support for Ctrl+Shift+U; other compose or input-method-mediated
+  text requires an input-method companion.
 
 ## License
 
