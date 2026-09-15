@@ -591,6 +591,24 @@ mod tests {
                     key: 17,
                     modifiers: 0,
                 }],
+                text if text.chars().all(|c| "u0123456789abcdef".contains(c)) => text
+                    .chars()
+                    .map(|c| GuiKeyboardTextStroke {
+                        key: match c {
+                            'u' => 22,
+                            '0' => 11,
+                            '1'..='9' => 2 + c as u32 - '1' as u32,
+                            'a' => 30,
+                            'b' => 48,
+                            'c' => 46,
+                            'd' => 32,
+                            'e' => 18,
+                            'f' => 33,
+                            _ => unreachable!(),
+                        },
+                        modifiers: 0,
+                    })
+                    .collect(),
                 unexpected => return Err(format!("unexpected text fixture: {unexpected:?}")),
             };
             Ok(GuiKeyboardTextPlan {
@@ -619,7 +637,7 @@ mod tests {
             .eval("return wayland.help".to_string())
             .await
             .unwrap();
-        assert!(help.value.as_str().unwrap().contains("globalThis.click"));
+        assert!(help.value.as_str().unwrap().contains("wayland.click"));
         assert!(help.value.as_str().unwrap().contains("pressShortcut"));
         assert!(help.value.as_str().unwrap().contains("typeText"));
         assert!(help.value.as_str().unwrap().contains("actAndCapture"));
@@ -721,6 +739,52 @@ mod tests {
                 key(12, 0),
                 modifiers(0),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unicode_hex_emits_a_full_supplementary_codepoint() {
+        let recording = Arc::new(RecordingBackend::default());
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(recording.clone()),
+            Arc::new(ArtifactStore::new()),
+        );
+        let output = console.eval("return await wayland.typeText({windowId:'fixture',text:'🌘',inputMethod:'unicode-hex'});".to_string()).await.unwrap();
+        assert_eq!(output.value["delivered"], true);
+        let events = recording.keyboard_events.lock().unwrap();
+        let down = events
+            .iter()
+            .filter_map(|request| match request.event {
+                GuiWaylandKeyboardEvent::Key { key, state: 1, .. } => Some(key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Ctrl+Shift+U, 1f318, Enter; the surrogate pair is one codepoint.
+        assert_eq!(down, [22, 2, 33, 4, 2, 9, 28]);
+        assert!(events.iter().any(|request| matches!(
+            request.event,
+            GuiWaylandKeyboardEvent::Modifiers {
+                mods_depressed: 5,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn raw_keyboard_event_invalidates_helper_focus() {
+        let recording = Arc::new(RecordingBackend::default());
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(recording.clone()),
+            Arc::new(ArtifactStore::new()),
+        );
+        console.eval("await wayland.pressKey({windowId:'fixture',key:'ENTER'}); await wayland.keyboardEvent({windowId:'fixture',event:{type:'leave'}}); return await wayland.pressKey({windowId:'fixture',key:'ENTER'});".to_string()).await.unwrap();
+        let events = recording.keyboard_events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|request| matches!(request.event, GuiWaylandKeyboardEvent::Enter { .. }))
+                .count(),
+            2
         );
     }
 

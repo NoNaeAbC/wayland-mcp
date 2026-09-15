@@ -2,6 +2,35 @@
 use crate::gui_wayland_generated::GeneratedHookRequest as Request;
 use std::collections::HashMap;
 
+// Protocol coordinates use millionths. Accept one unit of rounding when
+// clients express an already supported gamut through the parametric API.
+// Unknown gamuts must still fail validation rather than be rendered as sRGB.
+fn named_primaries(xy: [i32; 8]) -> u32 {
+    [
+        (
+            1,
+            [
+                640000, 330000, 300000, 600000, 150000, 60000, 312700, 329000,
+            ],
+        ),
+        (
+            6,
+            [
+                708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000,
+            ],
+        ),
+        (
+            9,
+            [
+                680000, 320000, 265000, 690000, 150000, 60000, 312700, 329000,
+            ],
+        ),
+    ]
+    .into_iter()
+    .find(|(_, known)| xy.iter().zip(known).all(|(a, b)| a.abs_diff(*b) <= 1))
+    .map_or(0, |(name, _)| name)
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ColorDescription {
     tf: u32,
@@ -168,6 +197,57 @@ mod tests {
         }
     }
     #[test]
+    fn parametric_standard_gamuts_and_unknown_whitepoint() {
+        for (expected, xy) in [
+            (
+                1,
+                [
+                    640000, 330000, 300000, 600000, 150000, 60000, 312700, 329000,
+                ],
+            ),
+            (
+                6,
+                [
+                    708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000,
+                ],
+            ),
+            (
+                9,
+                [
+                    680000, 320000, 265000, 690000, 150000, 60000, 312700, 329000,
+                ],
+            ),
+        ] {
+            let mut colors = SurfaceColors::default();
+            colors.request(
+                10,
+                &Request::WpImageDescriptionCreatorParamsV1SetPrimaries {
+                    r_x: xy[0],
+                    r_y: xy[1],
+                    g_x: xy[2],
+                    g_y: xy[3],
+                    b_x: xy[4],
+                    b_y: xy[5],
+                    w_x: xy[6],
+                    w_y: xy[7],
+                },
+            );
+            colors.request(
+                10,
+                &Request::WpImageDescriptionCreatorParamsV1SetTfNamed { tf: 2 },
+            );
+            let color = &colors.creators[&10];
+            assert_eq!(color.primaries, expected);
+            assert!(color.validate().is_ok());
+            assert_eq!(named_primaries(xy.map(|v| v - 1)), expected);
+            let mut different_white = xy;
+            different_white[6] = 345700;
+            assert_eq!(named_primaries(different_white), 0);
+        }
+        assert_eq!(named_primaries([i32::MIN; 8]), 0);
+    }
+
+    #[test]
     fn linear_midgrey_and_premultiplied_alpha() {
         let color = linear(1, 100.0, 100.0);
         assert_eq!(color.rgba8([0.18, 0.18, 0.18, 1.0]), [118, 118, 118, 255]);
@@ -300,8 +380,18 @@ impl SurfaceColors {
             Request::WpImageDescriptionCreatorParamsV1SetTfPower { .. } => {
                 self.creators.entry(object).or_default().tf = 0;
             }
-            Request::WpImageDescriptionCreatorParamsV1SetPrimaries { .. } => {
-                self.creators.entry(object).or_default().primaries = 0;
+            Request::WpImageDescriptionCreatorParamsV1SetPrimaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
+            } => {
+                self.creators.entry(object).or_default().primaries =
+                    named_primaries([*r_x, *r_y, *g_x, *g_y, *b_x, *b_y, *w_x, *w_y]);
             }
             Request::WpImageDescriptionCreatorParamsV1SetLuminances {
                 min_lum,

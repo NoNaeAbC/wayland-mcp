@@ -338,11 +338,26 @@ async function pressShortcut({ windowId, keys, holdMs = 40 }) {
   return { delivered: true, keys, keyCode, modifierMask: depressed, holdMs, events };
 }
 
-async function typeText({ windowId, text, intervalMs = 0 }) {
+async function typeText({ windowId, text, intervalMs = 0, inputMethod = "keymap" }) {
   if (typeof text !== "string") throw new TypeError("text must be a string");
   if ([...text].length > 512) throw new RangeError("text is limited to 512 characters per call");
   finiteNumber(intervalMs, "intervalMs");
   if (intervalMs < 0 || intervalMs > 60_000) throw new RangeError("intervalMs must be from 0 through 60000");
+  if (!["keymap", "unicode-hex"].includes(inputMethod)) {
+    throw new RangeError('inputMethod must be "keymap" or "unicode-hex"');
+  }
+  if (inputMethod === "unicode-hex") {
+    // Opt-in: this is an application input convention, not a Wayland feature.
+    // Preflight the complete alphabet before changing the application's text.
+    await native("keyboard_text_plan", { windowId, text: "u0123456789abcdef" });
+    for (const character of text) {
+      await pressShortcut({ windowId, keys: ["CTRL", "SHIFT", "u"] });
+      await typeText({ windowId, text: character.codePointAt(0).toString(16) });
+      await pressKey({ windowId, key: "ENTER" });
+      if (intervalMs > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    return { delivered: true, text, inputMethod };
+  }
   const plan = await native("keyboard_text_plan", { windowId, text });
   const events = [];
   await ensureKeyboardFocus(windowId, events);
@@ -470,35 +485,26 @@ function resetInputState() {
 }
 
 const apiHelp = `Persistent JavaScript console. State survives calls.
-Define helpers with globalThis, then call them in later or the same evaluation:
-  globalThis.pointerWindowId = null;
-  globalThis.click = async function(windowId, x, y) {
-    const button = 0x110; // BTN_LEFT
-    if (pointerWindowId !== windowId) {
-      await wayland.pointerEvent({windowId, event:{type:"enter", x, y}});
-      pointerWindowId = windowId;
-    }
-    await wayland.pointerEvent({windowId, event:{type:"motion", x, y}});
-    await wayland.pointerEvent({windowId, event:{type:"frame"}});
-    await wayland.pointerEvent({windowId, event:{type:"button", button, state:1}});
-    await wayland.pointerEvent({windowId, event:{type:"frame"}});
-    await wayland.pointerEvent({windowId, event:{type:"button", button, state:0}});
-    await wayland.pointerEvent({windowId, event:{type:"frame"}});
-  };
-  return await click("window-id", 100, 100);
+Start with the built-in helpers:
+  return await wayland.click({windowId:"window-id", x:100, y:100});
 Routine helpers: wayland.waitForWindow(selector), wayland.waitForWindowGone(selector), wayland.click(args),
 wayland.doubleClick(args), wayland.move(args),
 wayland.drag({windowId,from,to,durationMs,steps}),
 wayland.scroll({windowId,x,y,deltaY}), wayland.pressKey({windowId,key,holdMs}),
 wayland.pressShortcut({windowId,keys}), wayland.typeText({windowId,text}),
-wayland.waitForCommit(args), wayland.actAndCapture(args), wayland.resetInputState(). Reset helper focus state
-after emitting raw enter/leave events or replacing a client. Coordinates default to
+wayland.waitForCommit(args), wayland.actAndCapture(args), wayland.resetInputState(). Raw focus events automatically invalidate helper focus state. Use resetInputState
+after external focus changes; it clears cached focus only, not pressed keys. Coordinates default to
 full screenshot pixels; pass coordinateSpace:"preview" and the returned
 previewToFullScale object (or the response's preview_to_full_scale object) to
 convert preview coordinates safely.
 typeText and character keys in pressShortcut use the exact XKB keymap sent to
 the target client and its active layout group; characters absent from that
 layout fail explicitly instead of falling back to hardcoded physical keys.
+For applications supporting Ctrl+Shift+U hexadecimal Unicode entry (including
+Chromium in the tested environment), explicitly use
+wayland.typeText({windowId,text:"🌘",inputMethod:"unicode-hex"}). This types every
+code point through that application convention; it is not universal and does
+not use the clipboard.
 pressKey accepts evdev codes, the names in wayland.keyNames, and one-character
 keys case-insensitively; character keys also use the target client's XKB map.
 Raw calls: environment(), diagnostics(), windows(), screenshot({windowId}),
@@ -533,8 +539,14 @@ const wayland = Object.freeze({
   windows: () => native("windows"),
   screenshot: (args = {}) => native("screenshot", args),
   captureNextFrame: (args = {}) => native("capture_next_frame", args),
-  pointerEvent: (args) => native("pointer_event", args),
-  keyboardEvent: (args) => native("keyboard_event", args),
+  pointerEvent: async (args) => {
+    pointerFocus.windowId = null;
+    return await native("pointer_event", args);
+  },
+  keyboardEvent: async (args) => {
+    keyboardFocus.windowId = null;
+    return await native("keyboard_event", args);
+  },
   waitForWindow,
   waitForWindowGone,
   waitForCommit,
