@@ -3502,6 +3502,8 @@ impl WaylandFrameTracker {
                 xdg_configure_seen: false,
                 xdg_configure_acked: false,
                 viewport_destination: None,
+                window_geometry: None,
+                buffer_scale: 1,
             })
     }
 
@@ -3697,6 +3699,7 @@ impl WaylandFrameTracker {
                 "missing wl_surface for xdg_surface {xdg_surface_id}"
             ));
         };
+        self.surface_mut(wl_surface_id).window_geometry = Some((width.max(1), height.max(1)));
         if let Some(window_id) = self.surface_to_window.get(&wl_surface_id).cloned()
             && let Some(window) = self.windows.get_mut(&window_id)
         {
@@ -3704,6 +3707,10 @@ impl WaylandFrameTracker {
             window.height = height.max(1);
         }
         Ok(())
+    }
+
+    fn note_surface_buffer_scale(&mut self, surface_id: u32, scale: i32) {
+        self.surface_mut(surface_id).buffer_scale = scale.max(1) as u32;
     }
 
     fn note_xdg_surface_configure(&mut self, xdg_surface_id: u32) {
@@ -3750,7 +3757,11 @@ impl WaylandFrameTracker {
         let screenshot_y = y;
         let (logical_width, logical_height) = surface
             .viewport_destination
-            .unwrap_or((surface.width.max(1), surface.height.max(1)));
+            .or(surface.window_geometry)
+            .unwrap_or((
+                (surface.width / surface.buffer_scale).max(1),
+                (surface.height / surface.buffer_scale).max(1),
+            ));
         let mut surface_x = screenshot_x.saturating_mul(i64::from(logical_width.max(1)))
             / i64::from(surface.width.max(1));
         let mut surface_y = screenshot_y.saturating_mul(i64::from(logical_height.max(1)))
@@ -4217,6 +4228,8 @@ struct TrackedSurface {
     xdg_configure_seen: bool,
     xdg_configure_acked: bool,
     viewport_destination: Option<(u32, u32)>,
+    window_geometry: Option<(u32, u32)>,
+    buffer_scale: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5616,6 +5629,11 @@ fn apply_window_tracking(
     request: &DecodedWaylandRequest,
 ) -> Result<(), String> {
     match request.tracked_request.as_ref() {
+        Some(GeneratedTrackedRequest::WlSurfaceSetBufferScale { scale }) => {
+            session
+                .frame_tracker
+                .note_surface_buffer_scale(request.object_id, *scale);
+        }
         Some(GeneratedTrackedRequest::WlSubcompositorGetSubsurface {
             id,
             surface: Some(surface_id),
@@ -6449,6 +6467,32 @@ mod tests {
                 surface_y: 64,
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn click_target_maps_scaled_screenshot_to_logical_surface() -> Result<(), String> {
+        let mut tracker = WaylandFrameTracker::new("test-client".to_string());
+        tracker.note_xdg_surface_created(30, 10);
+        let window_id = tracker.note_xdg_toplevel_created(30, 31)?;
+        let surface = tracker.surface_mut(10);
+        surface.width = 2304;
+        surface.height = 1440;
+
+        // Fractional scaling can be expressed by the xdg window geometry.
+        tracker.note_window_geometry(30, 1440, 900)?;
+        let target = tracker
+            .click_target_for_window(&window_id, 985, 1042)?
+            .unwrap();
+        assert_eq!((target.surface_x, target.surface_y), (615, 651));
+
+        // Without geometry or a viewport, wl_surface buffer scale still applies.
+        tracker.surface_mut(10).window_geometry = None;
+        tracker.note_surface_buffer_scale(10, 2);
+        let target = tracker
+            .click_target_for_window(&window_id, 1000, 800)?
+            .unwrap();
+        assert_eq!((target.surface_x, target.surface_y), (500, 400));
         Ok(())
     }
 
