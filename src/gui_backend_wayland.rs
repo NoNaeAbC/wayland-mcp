@@ -43,6 +43,7 @@ use crate::gui_backend::GuiKeyboardTextPlan;
 use crate::gui_backend::GuiKeyboardTextPlanRequest;
 use crate::gui_backend::GuiKeyboardTextStroke;
 use crate::gui_backend::GuiPointerMoveRequest;
+use crate::gui_backend::GuiResizeWindowRequest;
 use crate::gui_backend::GuiScreenshotRequest;
 use crate::gui_backend::GuiWaylandKeyboardEvent;
 use crate::gui_backend::GuiWaylandKeyboardEventRequest;
@@ -111,6 +112,12 @@ pub(crate) struct WaylandGuiBackend {
 }
 
 impl WaylandGuiBackend {
+    pub(crate) async fn resize_window(
+        &self,
+        request: GuiResizeWindowRequest,
+    ) -> Result<String, String> {
+        self.state.resize_window(request).await
+    }
     pub(crate) fn new() -> Self {
         let mut server = WaylandProxyServer::new(WaylandProxyConfig::from_env());
         register_core_protocols(&mut server.registry);
@@ -318,6 +325,10 @@ struct WaylandProxyState {
 }
 
 impl WaylandProxyState {
+    async fn resize_window(&self, request: GuiResizeWindowRequest) -> Result<String, String> {
+        let mut inner = self.inner.lock().await;
+        inner.resize_window(request)
+    }
     async fn snapshot(&self) -> WaylandBackendSnapshot {
         let inner = self.inner.lock().await;
         inner.snapshot()
@@ -831,6 +842,24 @@ struct WaylandProxyServer {
 }
 
 impl WaylandProxyServer {
+    fn resize_window(&mut self, request: GuiResizeWindowRequest) -> Result<String, String> {
+        if !(1..=8192).contains(&request.width) || !(1..=8192).contains(&request.height) {
+            return Err("resizeWindow dimensions must be between 1 and 8192".to_string());
+        }
+        for session in self.sessions.values_mut() {
+            if session
+                .frame_tracker
+                .windows
+                .contains_key(&request.window_id)
+            {
+                return session.resize_window(&request.window_id, request.width, request.height);
+            }
+        }
+        Err(format!(
+            "window `{}` is no longer available",
+            request.window_id
+        ))
+    }
     fn new(config: WaylandProxyConfig) -> Self {
         Self {
             config,
@@ -1326,6 +1355,19 @@ impl WaylandProxyServer {
         } else {
             apply_undecoded_client_tracking(session, &mut message)?;
         }
+        // The proxy may suggest a test size without the host compositor having
+        // issued that configure serial. Consume its acknowledgement locally.
+        let synthetic_ack = request.as_ref().is_some_and(|request| {
+            if let Some(GeneratedTrackedRequest::XdgSurfaceAckConfigure { serial }) =
+                request.tracked_request.as_ref()
+            {
+                session
+                    .synthetic_configures
+                    .remove(&(request.object_id, *serial))
+            } else {
+                false
+            }
+        });
         let tracking_fds = duplicate_fds(message.fds.as_slice())?;
         let backend_events = if raw_forward_only {
             Vec::new()
@@ -1336,6 +1378,7 @@ impl WaylandProxyServer {
         };
         let mut backend_globals = session.backend_globals.clone();
         if backend_events.is_empty()
+            && !synthetic_ack
             && let Some(backend) = session.backend.as_mut()
         {
             if let Some(request) = request.as_ref() {
@@ -1957,6 +2000,7 @@ struct WaylandClientSession {
     frame_tracker: WaylandFrameTracker,
     raw_forward_only: Arc<AtomicBool>,
     next_synthetic_serial: u32,
+    synthetic_configures: HashSet<(u32, u32)>,
     keyboard_keymap_text: Option<String>,
     keyboard_layout_group: u32,
     keyboard_mods_depressed: u32,
@@ -1985,12 +2029,56 @@ impl WaylandClientSession {
             frame_tracker: WaylandFrameTracker::new(format!("wayland-client-{}", client_id.0)),
             raw_forward_only: Arc::new(AtomicBool::new(false)),
             next_synthetic_serial: 1,
+            synthetic_configures: HashSet::new(),
             keyboard_keymap_text: None,
             keyboard_layout_group: 0,
             keyboard_mods_depressed: 0,
             keyboard_mods_latched: 0,
             keyboard_mods_locked: 0,
         }
+    }
+
+    fn resize_window(
+        &mut self,
+        window_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<String, String> {
+        let window = self
+            .frame_tracker
+            .windows
+            .get(window_id)
+            .ok_or_else(|| format!("window `{window_id}` disappeared"))?;
+        if !window.mapped {
+            return Err(format!("window `{window_id}` is not mapped"));
+        }
+        let toplevel_id = window
+            .xdg_toplevel_id
+            .ok_or_else(|| format!("window `{window_id}` is not an xdg_toplevel"))?;
+        let surface_id = window
+            .xdg_surface_id
+            .ok_or_else(|| format!("window `{window_id}` has no xdg_surface"))?;
+        let serial = self.next_synthetic_serial() | 0x8000_0000;
+        let writer = self
+            .client_event_writer
+            .as_ref()
+            .ok_or_else(|| "client event stream is unavailable".to_string())?;
+        let toplevel = encode_generated_event(
+            toplevel_id,
+            &GeneratedEvent::XdgToplevelConfigure {
+                width: width as i32,
+                height: height as i32,
+                states: Vec::new(),
+            },
+        )?;
+        let surface =
+            encode_generated_event(surface_id, &GeneratedEvent::XdgSurfaceConfigure { serial })?;
+        send_wayland_wire_message(writer, &toplevel, &[])?;
+        send_wayland_wire_message(writer, &surface, &[])?;
+        self.synthetic_configures.insert((surface_id, serial));
+        Ok(format!(
+            "sent xdg configure {width} x {height} to window `{window_id}`; inspect a later frame to verify the client applied it"
+        ))
     }
 
     #[allow(dead_code)]
@@ -5957,6 +6045,44 @@ mod tests {
     use std::fs::File;
     use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn resize_sends_an_xdg_configure_and_tracks_its_local_ack() -> Result<(), String> {
+        let (writer, mut reader) = StdUnixStream::pair().map_err(|e| e.to_string())?;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|e| e.to_string())?;
+        let mut session = WaylandClientSession::new(WaylandClientId(1), Vec::new(), None);
+        session.client_event_writer = Some(writer);
+        session.frame_tracker.note_xdg_surface_created(30, 10);
+        let window_id = session.frame_tracker.note_xdg_toplevel_created(30, 31)?;
+        session
+            .frame_tracker
+            .windows
+            .get_mut(&window_id)
+            .unwrap()
+            .mapped = true;
+
+        session.resize_window(&window_id, 1000, 650)?;
+        let serial = 0x8000_0001;
+        assert!(session.synthetic_configures.contains(&(30, serial)));
+        let expected = [
+            encode_generated_event(
+                31,
+                &GeneratedEvent::XdgToplevelConfigure {
+                    width: 1000,
+                    height: 650,
+                    states: Vec::new(),
+                },
+            )?,
+            encode_generated_event(30, &GeneratedEvent::XdgSurfaceConfigure { serial })?,
+        ]
+        .concat();
+        let mut actual = vec![0; expected.len()];
+        reader.read_exact(&mut actual).map_err(|e| e.to_string())?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 
     fn duplicate_file_fd(file: &File) -> Result<OwnedFd, String> {
         let duplicated = unsafe { libc::dup(file.as_raw_fd()) };

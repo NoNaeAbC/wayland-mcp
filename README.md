@@ -92,7 +92,13 @@ High-level input and synchronization helpers include `waitForWindow`,
 `waitForWindowGone`, `click`, `doubleClick`, `move`, `drag`, `scroll`,
 `pressKey`, `pressShortcut`, `typeText`, `waitForCommit`, `actAndCapture`, and
 `resetInputState`. `pointerEvent` and `keyboardEvent` provide direct access to
-individual protocol events. `pressKey` accepts an evdev code, a common name
+individual protocol events.
+
+`resizeWindow({windowId,width,height})` sends an `xdg_toplevel.configure`
+size suggestion to a mapped window. Check `windows()` or a later screenshot
+to confirm the client applied it; Wayland clients may choose a different size.
+
+`pressKey` accepts an evdev code, a common name
 such as `"Escape"`, or a one-character key such as `"W"` (case-insensitive).
 The complete named-key vocabulary is available as `wayland.keyNames`.
 `pressKey`, `typeText`, and character keys in `pressShortcut`
