@@ -1548,6 +1548,7 @@ impl WaylandProxyServer {
         if let Some(decoded) = decoded.as_ref() {
             track_keyboard_keymap(session, decoded, &message.fds)?;
             rewrite_dmabuf_feedback_event(session, decoded, &mut message)?;
+            rewrite_pointer_seat_capabilities(decoded, &mut message)?;
             apply_client_event_tracking(session, decoded)?;
         }
         session.backend_globals = backend_globals;
@@ -4860,6 +4861,23 @@ struct WaylandWireMessage {
     fds: Vec<OwnedFd>,
 }
 
+// The proxy can inject pointer input even when the host seat has no physical
+// pointer. Advertise that capability so new clients request wl_pointer.
+fn rewrite_pointer_seat_capabilities(
+    event: &DecodedWaylandEvent,
+    message: &mut WaylandWireMessage,
+) -> Result<(), String> {
+    let GeneratedEvent::WlSeatCapabilities { capabilities } = &event.generated_event else {
+        return Ok(());
+    };
+    if message.bytes.len() != 12 {
+        return Err("wl_seat.capabilities event has an invalid wire length".to_string());
+    }
+    let advertised = *capabilities | 1; // WL_SEAT_CAPABILITY_POINTER
+    message.bytes[8..12].copy_from_slice(&advertised.to_ne_bytes());
+    Ok(())
+}
+
 fn send_wayland_wire_message(
     stream: &StdUnixStream,
     bytes: &[u8],
@@ -6063,6 +6081,28 @@ mod tests {
     use std::fs::File;
     use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn keyboard_only_seat_still_advertises_synthetic_pointer() -> Result<(), String> {
+        let event = DecodedWaylandEvent {
+            object_id: 6,
+            size: 12,
+            opcode: 0,
+            interface: "wl_seat".to_string(),
+            event_name: "capabilities".to_string(),
+            arg_specs: &[],
+            generated_event: GeneratedEvent::WlSeatCapabilities { capabilities: 2 },
+            args: vec![DecodedWaylandArg::Uint(2)],
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&6u32.to_ne_bytes());
+        bytes.extend_from_slice(&(12u32 << 16).to_ne_bytes());
+        bytes.extend_from_slice(&2u32.to_ne_bytes());
+        let mut message = WaylandWireMessage { bytes, fds: Vec::new() };
+        rewrite_pointer_seat_capabilities(&event, &mut message)?;
+        assert_eq!(u32::from_ne_bytes(message.bytes[8..12].try_into().unwrap()), 3);
+        Ok(())
+    }
 
     #[test]
     fn resize_sends_an_xdg_configure_and_tracks_its_local_ack() -> Result<(), String> {
