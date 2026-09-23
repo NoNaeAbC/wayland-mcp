@@ -11,9 +11,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::ArtifactStore;
 use crate::gui_backend::{
-    GuiBackendHandle, GuiCaptureNextFrameRequest, GuiKeyboardTextPlanRequest, GuiScreenshotRequest,
-    GuiWaylandKeyboardEvent, GuiWaylandKeyboardEventRequest, GuiWaylandPointerEvent,
-    GuiWaylandPointerEventRequest,
+    GuiBackendHandle, GuiCaptureNextFrameRequest, GuiKeyboardTextPlanRequest,
+    GuiResizeWindowRequest, GuiScreenshotRequest, GuiWaylandKeyboardEvent,
+    GuiWaylandKeyboardEventRequest, GuiWaylandPointerEvent, GuiWaylandPointerEventRequest,
 };
 
 const NODE_RUNTIME: &str = include_str!("wayland_console_runtime.mjs");
@@ -337,6 +337,35 @@ async fn handle_native_call(
             serde_json::to_value(backend.list_windows().await?).map_err(|err| err.to_string())?,
             None,
         )),
+        "resize_window" => {
+            let window_id = args
+                .get("windowId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "resizeWindow requires windowId".to_string())?
+                .to_string();
+            let width = args
+                .get("width")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| "resizeWindow requires a positive integer width".to_string())?;
+            let height = args
+                .get("height")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| "resizeWindow requires a positive integer height".to_string())?;
+            let detail = backend
+                .resize_window(GuiResizeWindowRequest {
+                    window_id: window_id.clone(),
+                    width,
+                    height,
+                })
+                .await?;
+            artifacts.record(
+                "console_window_resize_requested",
+                json!({"window_id":window_id,"width":width,"height":height,"detail":detail}),
+            );
+            Ok((json!({"delivered":true,"detail":detail}), None))
+        }
         "screenshot" => {
             let window_id = optional_string(&args, "windowId");
             let bytes = backend

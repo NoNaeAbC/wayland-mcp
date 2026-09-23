@@ -490,6 +490,7 @@ Start with the built-in helpers:
 Routine helpers: wayland.waitForWindow(selector), wayland.waitForWindowGone(selector), wayland.click(args),
 wayland.doubleClick(args), wayland.move(args),
 wayland.drag({windowId,from,to,durationMs,steps}),
+wayland.resizeWindow({windowId,width,height}),
 wayland.scroll({windowId,x,y,deltaY}), wayland.pressKey({windowId,key,holdMs}),
 wayland.pressShortcut({windowId,keys}), wayland.typeText({windowId,text}),
 wayland.waitForCommit(args), wayland.actAndCapture(args), wayland.resetInputState(). Raw focus events automatically invalidate helper focus state. Use resetInputState
@@ -509,6 +510,7 @@ pressKey accepts evdev codes, the names in wayland.keyNames, and one-character
 keys case-insensitively; character keys also use the target client's XKB map.
 Raw calls: environment(), diagnostics(), windows(), screenshot({windowId}),
 captureNextFrame({windowId, afterCommitSerial, timeoutMs}),
+resizeWindow({windowId,width,height}),
 pointerEvent({windowId,event}), keyboardEvent({windowId,event}), sleep(ms).
 environment() returns WAYLAND_DISPLAY, XDG_RUNTIME_DIR, an absolute socket_path,
 and launch_preflight; caller namespace and render-node access remain not_tested.
@@ -537,6 +539,7 @@ const wayland = Object.freeze({
   environment: () => native("environment"),
   diagnostics: () => native("diagnostics"),
   windows: () => native("windows"),
+  resizeWindow: (args) => native("resize_window", args),
   screenshot: (args = {}) => native("screenshot", args),
   captureNextFrame: (args = {}) => native("capture_next_frame", args),
   pointerEvent: async (args) => {

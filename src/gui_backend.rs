@@ -166,6 +166,13 @@ pub(crate) struct GuiCaptureNextFrameRequest {
     pub(crate) timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuiResizeWindowRequest {
+    pub(crate) window_id: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GuiWindowInfo {
     pub(crate) window_id: String,
@@ -232,6 +239,16 @@ pub(crate) enum GuiBackendHandle {
 }
 
 impl GuiBackendHandle {
+    pub(crate) async fn resize_window(
+        &self,
+        request: GuiResizeWindowRequest,
+    ) -> Result<String, String> {
+        match self {
+            #[cfg(unix)]
+            Self::Wayland(backend) => backend.resize_window(request).await,
+            _ => Err("window resizing requires the Wayland proxy backend".to_string()),
+        }
+    }
     pub(crate) async fn list_windows(&self) -> Result<Vec<GuiWindowInfo>, String> {
         match self {
             Self::Command(backend) => backend.list_windows().await,
