@@ -107,6 +107,22 @@ function fullPoint({
 
 async function ensurePointerFocus(windowId, x, y, events) {
   if (pointerFocus.windowId !== windowId) {
+    if (pointerFocus.windowId !== null) {
+      const previousWindowId = pointerFocus.windowId;
+      pointerFocus.windowId = null;
+      try {
+        events.push(await native("pointer_event", {
+          windowId: previousWindowId,
+          event: { type: "leave" },
+        }));
+        events.push(await native("pointer_event", {
+          windowId: previousWindowId,
+          event: { type: "frame" },
+        }));
+      } catch (error) {
+        if (!/no mapped target window|disappeared|unknown windowId/.test(String(error))) throw error;
+      }
+    }
     events.push(await native("pointer_event", { windowId, event: { type: "enter", x, y } }));
     pointerFocus.windowId = windowId;
   }
@@ -508,17 +524,20 @@ code point through that application convention; it is not universal and does
 not use the clipboard.
 pressKey accepts evdev codes, the names in wayland.keyNames, and one-character
 keys case-insensitively; character keys also use the target client's XKB map.
-Raw calls: environment(), diagnostics(), windows(), screenshot({windowId}),
+Raw calls: environment(), diagnostics(), selectBackend({display}), windows(), screenshot({windowId}),
 captureNextFrame({windowId, afterCommitSerial, timeoutMs}),
 resizeWindow({windowId,width,height}),
 pointerEvent({windowId,event}), keyboardEvent({windowId,event}), sleep(ms).
 environment() returns WAYLAND_DISPLAY, XDG_RUNTIME_DIR, an absolute socket_path,
 and launch_preflight; caller namespace and render-node access remain not_tested.
 diagnostics() includes the same endpoint state and a bounded connection_history.
+selectBackend({display:"wayland-1"}) selects a compositor for new proxied clients;
+use an absolute socket path when selecting outside XDG_RUNTIME_DIR. Close existing
+proxied windows first. The default backend comes from WAYLAND_DISPLAY.
 windows() reports capture-output and backend-output membership separately.
 Each input call emits exactly one compositor-side protocol event; author
 sequences yourself. wl_pointer event types and fields:
-  enter{x,y,serial?}, motion{x,y,time?}, button{button,state,serial?,time?},
+  enter{x,y,serial?}, leave{serial?}, motion{x,y,time?}, button{button,state,serial?,time?},
   axis{axis,value,time?}, axis_source{axis_source}, axis_stop{axis,time?},
   axis_discrete{axis,discrete}, axis_value120{axis,value120},
   axis_relative_direction{axis,direction}, frame{}.
@@ -538,6 +557,7 @@ const wayland = Object.freeze({
   keyNames: namedKeyNames,
   environment: () => native("environment"),
   diagnostics: () => native("diagnostics"),
+  selectBackend: (args) => native("select_backend", args),
   windows: () => native("windows"),
   resizeWindow: (args) => native("resize_window", args),
   screenshot: (args = {}) => native("screenshot", args),

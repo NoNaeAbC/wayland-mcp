@@ -74,7 +74,6 @@ use crate::wayland_protocol_registry::WaylandGeneratedProtocolRegistry;
 use crate::wayland_protocol_registry::WaylandHookRegistry;
 
 const DEFAULT_PROXY_SOCKET: &str = "wayland-mcp-0";
-const DEFAULT_BACKEND_SOCKET: &str = "wayland-0";
 const SOCKET_ENV: &str = "WAYLAND_MCP_SOCKET";
 const BACKEND_SOCKET_ENV: &str = "WAYLAND_MCP_BACKEND_SOCKET";
 const BACKEND_BOOTSTRAP_REGISTRY_ID: u32 = 2;
@@ -112,6 +111,24 @@ pub(crate) struct WaylandGuiBackend {
 }
 
 impl WaylandGuiBackend {
+    /// Select the compositor for subsequent proxied clients. Existing client
+    /// connections cannot migrate between Wayland displays.
+    pub(crate) async fn select_backend(&self, display: String) -> Result<String, String> {
+        let mut server = self.state.inner.lock().await;
+        if !server.sessions.is_empty() {
+            return Err(
+                "Close proxied windows before switching the Wayland compositor".to_string(),
+            );
+        }
+        let socket_path = resolve_backend_choice(&display, &server.config.backend_socket)?
+            .to_string_lossy()
+            .into_owned();
+        let mut candidate = server.config.clone();
+        candidate.backend_socket = socket_path.clone();
+        WaylandBackendSession::connect(&candidate)?;
+        server.config.backend_socket = socket_path.clone();
+        Ok(socket_path)
+    }
     pub(crate) async fn resize_window(
         &self,
         request: GuiResizeWindowRequest,
@@ -252,6 +269,32 @@ impl WaylandGuiBackend {
             }
         }
     }
+}
+
+fn resolve_backend_choice(display: &str, current_backend: &str) -> Result<PathBuf, String> {
+    if display.is_empty() {
+        return Err(
+            "selectBackend requires a Wayland display name or absolute socket path".to_string(),
+        );
+    }
+    let path = PathBuf::from(display);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    if display.contains('/') || display == "." || display == ".." {
+        return Err("selectBackend display name must be a single socket name".to_string());
+    }
+    // The MCP proxy replaces XDG_RUNTIME_DIR in its own process with its
+    // client-facing socket directory. Resolve sibling compositors beside the
+    // currently selected backend instead.
+    let backend = PathBuf::from(current_backend);
+    let runtime = if backend.is_absolute() {
+        backend.parent().map(PathBuf::from)
+    } else {
+        env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+    }
+    .ok_or_else(|| "Cannot resolve the Wayland backend runtime directory".to_string())?;
+    Ok(runtime.join(display))
 }
 
 #[async_trait::async_trait]
@@ -825,7 +868,12 @@ impl WaylandProxyConfig {
             backend_socket: env::var(BACKEND_SOCKET_ENV)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_BACKEND_SOCKET.to_string()),
+                .or_else(|| {
+                    env::var("WAYLAND_DISPLAY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -1146,7 +1194,8 @@ impl WaylandProxyServer {
                 | GuiWaylandPointerEvent::Motion { x, y, .. } => session
                     .frame_tracker
                     .click_target_for_window(&selected_window_id, *x, *y)?,
-                GuiWaylandPointerEvent::Button { .. }
+                GuiWaylandPointerEvent::Leave { .. }
+                | GuiWaylandPointerEvent::Button { .. }
                 | GuiWaylandPointerEvent::Axis { .. }
                 | GuiWaylandPointerEvent::AxisSource { .. }
                 | GuiWaylandPointerEvent::AxisStop { .. }
@@ -1369,6 +1418,11 @@ impl WaylandProxyServer {
             }
         });
         let tracking_fds = duplicate_fds(message.fds.as_slice())?;
+        let clipboard_consumed = if let Some(request) = request.as_ref() {
+            local_clipboard_request(session, request)
+        } else {
+            false
+        };
         let backend_events = if raw_forward_only {
             Vec::new()
         } else if let Some(request) = request.as_ref() {
@@ -1379,6 +1433,7 @@ impl WaylandProxyServer {
         let mut backend_globals = session.backend_globals.clone();
         if backend_events.is_empty()
             && !synthetic_ack
+            && !clipboard_consumed
             && let Some(backend) = session.backend.as_mut()
         {
             if let Some(request) = request.as_ref() {
@@ -1469,8 +1524,10 @@ impl WaylandProxyServer {
             .sessions
             .get_mut(&client_id)
             .ok_or_else(|| format!("missing Wayland client session {}", client_id.0))?;
-        for event in &backend_events {
+        let mut backend_events = backend_events;
+        for event in &mut backend_events {
             if let Some(decoded) = event.decoded.as_ref() {
+                rewrite_pointer_seat_capabilities(decoded, &mut event.encoded)?;
                 apply_client_event_tracking(session, decoded)?;
             }
         }
@@ -1617,6 +1674,23 @@ fn local_protocol_response_events(
     }
 }
 
+// The host compositor cannot validate serials from injected keyboard/pointer
+// events. Consume selection claims made with those serials. Clients that retain
+// their own source can still paste it, and the host selection remains intact.
+// Do not synthesize data offers: libwayland requires contiguous server object
+// ids, which the proxy cannot reserve from the host compositor.
+fn local_clipboard_request(
+    session: &mut WaylandClientSession,
+    request: &DecodedWaylandRequest,
+) -> bool {
+    if let Some(GeneratedImplementedRequest::WlDataDeviceSetSelection { serial, .. }) =
+        request.implemented_request.as_ref()
+    {
+        return session.synthetic_serials.remove(serial);
+    }
+    false
+}
+
 fn apply_client_event_tracking(
     session: &mut WaylandClientSession,
     event: &DecodedWaylandEvent,
@@ -1700,13 +1774,22 @@ fn apply_undecoded_client_tracking(
     message: &mut WaylandWireMessage,
 ) -> Result<(), String> {
     let header = decode_wayland_header(&message.bytes)?;
-    let Some(interface) = session.interface_for_object(header.object_id) else {
+    let Some(interface) = session
+        .interface_for_object(header.object_id)
+        .map(str::to_owned)
+    else {
         // The recvmsg chunk can attach an FD needed by a later message even
         // when this first message's object/interface is unknown to us.
         reassociate_undecoded_client_fds(session, &mut message.fds, 0);
         return Ok(());
     };
-    match (interface, header.opcode) {
+    if !(interface == "wl_shm" && header.opcode == 0) {
+        // Ancillary FDs can be attached to the first byte of a batch whose
+        // FD-bearing request comes later. None of the other manual requests
+        // below takes an FD, including wl_shm_pool.resize.
+        reassociate_undecoded_client_fds(session, &mut message.fds, 0);
+    }
+    match (interface.as_str(), header.opcode) {
         ("wl_shm", 0) => {
             let mut offset = 8;
             let pool_id = read_u32_arg(&message.bytes, header.size, &mut offset)?;
@@ -1764,11 +1847,7 @@ fn apply_undecoded_client_tracking(
                 .note_shm_pool_resized(header.object_id, size as usize)?;
         }
         _ => {
-            // SCM_RIGHTS belongs to the byte stream, not necessarily the first
-            // Wayland message decoded from the recvmsg chunk. Preserve FDs seen
-            // on an undecoded request so the next request with a known FD
-            // signature (for example wl_shm.create_pool) can claim them.
-            reassociate_undecoded_client_fds(session, &mut message.fds, 0);
+            // Unknown manual requests have already reserved any batched FDs.
         }
     }
     Ok(())
@@ -2001,6 +2080,7 @@ struct WaylandClientSession {
     frame_tracker: WaylandFrameTracker,
     raw_forward_only: Arc<AtomicBool>,
     next_synthetic_serial: u32,
+    synthetic_serials: HashSet<u32>,
     synthetic_configures: HashSet<(u32, u32)>,
     keyboard_keymap_text: Option<String>,
     keyboard_layout_group: u32,
@@ -2030,6 +2110,7 @@ impl WaylandClientSession {
             frame_tracker: WaylandFrameTracker::new(format!("wayland-client-{}", client_id.0)),
             raw_forward_only: Arc::new(AtomicBool::new(false)),
             next_synthetic_serial: 1,
+            synthetic_serials: HashSet::new(),
             synthetic_configures: HashSet::new(),
             keyboard_keymap_text: None,
             keyboard_layout_group: 0,
@@ -2256,8 +2337,21 @@ impl WaylandClientSession {
         target: PointerClickTarget,
         event: GuiWaylandPointerEvent,
     ) -> Result<String, String> {
+        if matches!(event, GuiWaylandPointerEvent::Leave { .. })
+            && self
+                .object_interfaces
+                .get(&target.surface_id)
+                .map(String::as_str)
+                != Some("wl_surface")
+        {
+            return Ok(format!(
+                "skipped wl_pointer.leave for destroyed wl_surface {}",
+                target.surface_id
+            ));
+        }
         let required_version = match &event {
             GuiWaylandPointerEvent::Enter { .. }
+            | GuiWaylandPointerEvent::Leave { .. }
             | GuiWaylandPointerEvent::Motion { .. }
             | GuiWaylandPointerEvent::Button { .. }
             | GuiWaylandPointerEvent::Axis { .. } => 1,
@@ -2286,6 +2380,7 @@ impl WaylandClientSession {
         }
         let event_name = match &event {
             GuiWaylandPointerEvent::Enter { .. } => "wl_pointer.enter",
+            GuiWaylandPointerEvent::Leave { .. } => "wl_pointer.leave",
             GuiWaylandPointerEvent::Motion { .. } => "wl_pointer.motion",
             GuiWaylandPointerEvent::Button { .. } => "wl_pointer.button",
             GuiWaylandPointerEvent::Axis { .. } => "wl_pointer.axis",
@@ -2304,6 +2399,10 @@ impl WaylandClientSession {
                 surface: Some(target.surface_id),
                 surface_x: fixed_from_i64(target.surface_x),
                 surface_y: fixed_from_i64(target.surface_y),
+            },
+            GuiWaylandPointerEvent::Leave { serial } => GeneratedEvent::WlPointerLeave {
+                serial: serial.unwrap_or_else(|| self.next_synthetic_serial()),
+                surface: Some(target.surface_id),
             },
             GuiWaylandPointerEvent::Motion { time, .. } => GeneratedEvent::WlPointerMotion {
                 time: time.unwrap_or_else(wayland_timestamp_ms_u32),
@@ -2453,6 +2552,10 @@ impl WaylandClientSession {
     fn next_synthetic_serial(&mut self) -> u32 {
         let serial = self.next_synthetic_serial;
         self.next_synthetic_serial = self.next_synthetic_serial.wrapping_add(1).max(1);
+        if self.synthetic_serials.len() > 4096 {
+            self.synthetic_serials.clear();
+        }
+        self.synthetic_serials.insert(serial);
         serial
     }
 }
@@ -3513,6 +3616,22 @@ impl WaylandFrameTracker {
             .insert(xdg_surface_id, wl_surface_id);
     }
 
+    fn note_surface_destroyed(&mut self, surface_id: u32) {
+        self.surfaces.remove(&surface_id);
+        if let Some(window_id) = self.surface_to_window.remove(&surface_id) {
+            self.windows.remove(&window_id);
+            self.xdg_toplevel_to_window.retain(|_, id| id != &window_id);
+        }
+        self.xdg_surface_to_surface
+            .retain(|_, id| *id != surface_id);
+        self.subsurface_to_surface.retain(|_, id| *id != surface_id);
+        self.surface_parent.remove(&surface_id);
+        self.surface_position.remove(&surface_id);
+        self.viewport_to_surface.retain(|_, id| *id != surface_id);
+        self.syncobj_surface_to_surface
+            .retain(|_, id| *id != surface_id);
+    }
+
     fn note_subsurface_created(
         &mut self,
         subsurface_id: u32,
@@ -4556,6 +4675,9 @@ fn relay_backend_events_blocking(
             continue;
         }
     }
+    // A stopped event relay cannot leave an apparently live client hanging.
+    // Wake the request reader so normal session cleanup removes stale windows.
+    let _ = client_writer.shutdown(Shutdown::Both);
 }
 
 fn apply_object_tracking(
@@ -4924,13 +5046,40 @@ fn send_wayland_wire_message_to_fd(
         }
     }
 
-    let sent = unsafe { libc::sendmsg(fd, &hdr, libc::MSG_NOSIGNAL) };
-    if sent < 0 {
-        return Err(format!(
-            "failed to send Wayland wire message with fds: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    // Socket backpressure is temporary, not a protocol failure. No bytes or
+    // SCM_RIGHTS have been delivered on EAGAIN/EINTR, so retry the same message.
+    // Bound the wait so an unresponsive client cannot stall this worker forever.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let sent = loop {
+        let sent = unsafe { libc::sendmsg(fd, &hdr, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
+        if sent >= 0 {
+            break sent;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock
+            && error.kind() != std::io::ErrorKind::Interrupted
+        {
+            return Err(format!(
+                "failed to send Wayland wire message with fds: {error}"
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out sending Wayland wire message after 5 seconds".to_string());
+        }
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut ready, 1, remaining.as_millis().max(1) as i32) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!(
+                "failed to wait for Wayland socket: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    };
     if sent as usize != bytes.len() {
         return Err(format!(
             "short send when writing Wayland wire message: sent {} of {} bytes",
@@ -5187,12 +5336,16 @@ async fn read_wayland_wire_message_async(
             .await
             .map_err(|err| format!("Wayland proxy stream not readable: {err}"))?;
         let remaining = size - message.bytes.len();
-        let mut payload = vec![0u8; remaining];
-        match stream.try_read(&mut payload) {
-            Ok(0) => return Err("backend Wayland stream reached EOF".to_string()),
-            Ok(read) => {
-                payload.truncate(read);
-                message.bytes.extend_from_slice(&payload);
+        match stream.try_io(tokio::io::Interest::READABLE, || {
+            recv_wayland_wire_message_from_fd(stream.as_raw_fd(), remaining, max_fds)
+                .map_err(string_error_to_io)
+        }) {
+            Ok(payload) if payload.bytes.is_empty() => {
+                return Err("backend Wayland stream reached EOF".to_string());
+            }
+            Ok(mut payload) => {
+                message.bytes.append(&mut payload.bytes);
+                message.fds.append(&mut payload.fds);
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(err) => return Err(format!("failed to read Wayland payload: {err}")),
@@ -5313,6 +5466,9 @@ fn encode_u32_message(object_id: u32, opcode: u16, args: &[u32]) -> Vec<u8> {
 }
 
 fn backend_socket_path(config: &WaylandProxyConfig) -> Result<PathBuf, String> {
+    if config.backend_socket.is_empty() {
+        return Err("WAYLAND_DISPLAY is not set for Wayland backend connection".to_string());
+    }
     let backend = PathBuf::from(&config.backend_socket);
     if backend.is_absolute() {
         return Ok(backend);
@@ -5647,6 +5803,15 @@ fn apply_window_tracking(
     request: &DecodedWaylandRequest,
 ) -> Result<(), String> {
     match request.tracked_request.as_ref() {
+        Some(GeneratedTrackedRequest::WlSurfaceDestroy) => {
+            session
+                .frame_tracker
+                .note_surface_destroyed(request.object_id);
+            session.remove_object(request.object_id);
+            if let Some(backend) = session.backend.as_mut() {
+                backend.object_interfaces.remove(&request.object_id);
+            }
+        }
         Some(GeneratedTrackedRequest::WlSurfaceSetBufferScale { scale }) => {
             session
                 .frame_tracker
@@ -6098,9 +6263,130 @@ mod tests {
         bytes.extend_from_slice(&6u32.to_ne_bytes());
         bytes.extend_from_slice(&(12u32 << 16).to_ne_bytes());
         bytes.extend_from_slice(&2u32.to_ne_bytes());
-        let mut message = WaylandWireMessage { bytes, fds: Vec::new() };
+        let mut message = WaylandWireMessage {
+            bytes,
+            fds: Vec::new(),
+        };
         rewrite_pointer_seat_capabilities(&event, &mut message)?;
-        assert_eq!(u32::from_ne_bytes(message.bytes[8..12].try_into().unwrap()), 3);
+        assert_eq!(
+            u32::from_ne_bytes(message.bytes[8..12].try_into().unwrap()),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn polled_seat_event_advertises_synthetic_pointer_to_second_client() -> Result<(), String> {
+        let (mut writer, reader) = StdUnixStream::pair().map_err(|err| err.to_string())?;
+        reader
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .map_err(|err| err.to_string())?;
+        let backend = WaylandBackendSession {
+            stream: reader,
+            globals: Vec::new(),
+            object_interfaces: HashMap::from([(6, "wl_seat".to_string())]),
+            pending_backend_fds: VecDeque::new(),
+        };
+        let client = WaylandClientId(2);
+        let mut server = WaylandProxyServer::new(WaylandProxyConfig {
+            socket_name: "test".to_string(),
+            backend_socket: "test".to_string(),
+        });
+        server.sessions.insert(
+            client,
+            WaylandClientSession::new(client, Vec::new(), Some(backend)),
+        );
+        writer
+            .write_all(&encode_u32_message(6, 0, &[2]))
+            .map_err(|err| err.to_string())?;
+        let events = server.poll_backend_events(client)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            u32::from_ne_bytes(events[0].encoded.bytes[8..12].try_into().unwrap()),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn injected_selection_is_consumed_without_synthesizing_server_objects() {
+        fn request(
+            id: u32,
+            name: &str,
+            kind: GeneratedRequestId,
+            implemented: GeneratedImplementedRequest,
+        ) -> DecodedWaylandRequest {
+            DecodedWaylandRequest {
+                object_id: id,
+                size: 8,
+                opcode: 0,
+                interface: String::new(),
+                request_name: name.to_string(),
+                request_id: kind,
+                implemented_request: Some(implemented),
+                hook_request: None,
+                tracked_request: None,
+                args: Vec::new(),
+            }
+        }
+        let mut session = WaylandClientSession::new(WaylandClientId(1), Vec::new(), None);
+        let offer = request(
+            20,
+            "wl_data_source.offer",
+            GeneratedRequestId::WlDataSourceOffer,
+            GeneratedImplementedRequest::WlDataSourceOffer {
+                mime_type: Some("text/plain;charset=utf-8".to_string()),
+            },
+        );
+        assert!(!local_clipboard_request(&mut session, &offer));
+        let synthetic_serial = session.next_synthetic_serial();
+        let copy = request(
+            30,
+            "wl_data_device.set_selection",
+            GeneratedRequestId::WlDataDeviceSetSelection,
+            GeneratedImplementedRequest::WlDataDeviceSetSelection {
+                source: Some(20),
+                serial: synthetic_serial,
+            },
+        );
+        assert!(local_clipboard_request(&mut session, &copy));
+        assert!(!session.synthetic_serials.contains(&synthetic_serial));
+        let host_serial = synthetic_serial + 1000;
+        let host_copy = request(
+            30,
+            "wl_data_device.set_selection",
+            GeneratedRequestId::WlDataDeviceSetSelection,
+            GeneratedImplementedRequest::WlDataDeviceSetSelection {
+                source: Some(20),
+                serial: host_serial,
+            },
+        );
+        assert!(!local_clipboard_request(&mut session, &host_copy));
+    }
+
+    #[test]
+    fn destroyed_surface_removes_pointer_target_window() -> Result<(), String> {
+        let mut tracker = WaylandFrameTracker::new("test-client".to_string());
+        tracker.note_xdg_surface_created(30, 10);
+        let window_id = tracker.note_xdg_toplevel_created(30, 31)?;
+        tracker.windows.get_mut(&window_id).unwrap().mapped = true;
+        assert!(
+            tracker
+                .list_windows()
+                .iter()
+                .any(|window| window.window_id == window_id)
+        );
+
+        tracker.note_surface_destroyed(10);
+        assert!(
+            !tracker
+                .list_windows()
+                .iter()
+                .any(|window| window.window_id == window_id)
+        );
+        assert!(!tracker.surface_to_window.contains_key(&10));
+        assert!(!tracker.xdg_surface_to_surface.contains_key(&30));
+        assert!(!tracker.xdg_toplevel_to_window.contains_key(&31));
         Ok(())
     }
 
@@ -6151,6 +6437,42 @@ mod tests {
             ));
         }
         Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+    }
+
+    #[test]
+    fn wire_send_retries_backpressure_and_delivers_fd_once() {
+        let (sender, mut receiver) = StdUnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let block = vec![0u8; 4096];
+        let mut filled = 0;
+        loop {
+            match (&sender).write(&block) {
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected fill result: {other:?}"),
+            }
+        }
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            receiver.read_exact(&mut vec![0; filled]).unwrap();
+            // Draining the socket wakes the writer but does not guarantee it
+            // has sent yet. Wait for its payload rather than racing MSG_DONTWAIT.
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            recv_wayland_wire_message_from_fd_blocking(receiver.as_raw_fd(), 8, 2).unwrap()
+        });
+        let file = tempfile::tempfile().unwrap();
+        file.write_at(b"fd survived backpressure", 0).unwrap();
+        send_wayland_wire_message(&sender, b"12345678", &[duplicate_file_fd(&file).unwrap()])
+            .unwrap();
+        let message = reader.join().unwrap();
+        assert_eq!(message.bytes, b"12345678");
+        assert_eq!(message.fds.len(), 1);
+        let mut received_file = File::from(message.fds.into_iter().next().unwrap());
+        let mut contents = String::new();
+        received_file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "fd survived backpressure");
     }
 
     #[test]
@@ -6597,6 +6919,56 @@ mod tests {
     }
 
     #[test]
+    fn fd_on_shm_pool_resize_is_reserved_for_following_create_pool() -> Result<(), String> {
+        let file = tempfile::tempfile().map_err(|err| err.to_string())?;
+        let mut session = WaylandClientSession::new(WaylandClientId(1), Vec::new(), None);
+        session.track_object_interface(7, "wl_shm");
+        session.track_object_interface(31, "wl_shm_pool");
+        session
+            .frame_tracker
+            .note_shm_pool_created(31, duplicate_file_fd(&file)?, 1024);
+        let mut resize = WaylandWireMessage {
+            bytes: encode_u32_message(31, 2, &[2048]),
+            fds: vec![duplicate_file_fd(&file)?],
+        };
+        apply_undecoded_client_tracking(&mut session, &mut resize)?;
+        assert!(resize.fds.is_empty());
+        assert_eq!(session.pending_client_fds.len(), 1);
+
+        let mut create = WaylandWireMessage {
+            bytes: encode_u32_message(7, 0, &[32, 2048]),
+            fds: Vec::new(),
+        };
+        apply_undecoded_client_tracking(&mut session, &mut create)?;
+        assert_eq!(create.fds.len(), 1);
+        assert!(session.pending_client_fds.is_empty());
+        assert!(session.frame_tracker.shm_pools.contains_key(&32));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_reader_preserves_fd_attached_to_message_payload() -> Result<(), String> {
+        let (mut writer, reader) = StdUnixStream::pair().map_err(|err| err.to_string())?;
+        reader
+            .set_nonblocking(true)
+            .map_err(|err| err.to_string())?;
+        let reader = UnixStream::from_std(reader).map_err(|err| err.to_string())?;
+        let bytes = encode_u32_message(5, 0, &[42]);
+        let fd_file = tempfile::tempfile().map_err(|err| err.to_string())?;
+        writer
+            .write_all(&bytes[..8])
+            .map_err(|err| err.to_string())?;
+        send_wayland_wire_message(&writer, &bytes[8..], &[duplicate_file_fd(&fd_file)?])?;
+
+        let message = read_wayland_wire_message_async(&reader, 4)
+            .await?
+            .ok_or_else(|| "message disappeared".to_string())?;
+        assert_eq!(message.bytes, bytes);
+        assert_eq!(message.fds.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn fd_batched_with_manual_wl_shm_event_is_reserved_for_following_backend_event()
     -> Result<(), String> {
         let file =
@@ -6740,6 +7112,19 @@ mod tests {
             server.last_runtime_error.as_deref(),
             Some("client 7 request ingest failed: fixture failure")
         );
+    }
+
+    #[test]
+    fn selecting_a_display_name_uses_the_backend_runtime_directory() {
+        assert_eq!(
+            resolve_backend_choice("wayland-1", "/run/user/1000/wayland-0").unwrap(),
+            PathBuf::from("/run/user/1000/wayland-1")
+        );
+        assert_eq!(
+            resolve_backend_choice("/other/session/wayland-2", "/run/user/1000/wayland-0").unwrap(),
+            PathBuf::from("/other/session/wayland-2")
+        );
+        assert!(resolve_backend_choice("../wayland-1", "/run/user/1000/wayland-0").is_err());
     }
 
     #[tokio::test]

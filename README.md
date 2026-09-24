@@ -108,6 +108,13 @@ remain available for protocol-level keyboard testing. Raw input calls invalidate
 cached helper focus automatically. `resetInputState()` clears cached focus after
 external focus changes; it does not release pressed keys.
 
+Clipboard selection claims made with injected input serials are consumed by
+the proxy, so the host compositor cannot reject the synthetic serial. A client
+that retains its own copied data can test its in-app copy/paste flow. The proxy
+does not synthesize a new selection offer or virtualize cross-client clipboard
+exchange; clients that rely on receiving an offer to paste may still see the
+host clipboard.
+
 For applications supporting Ctrl+Shift+U Unicode entry, use
 `wayland.typeText({windowId, text:"🌘", inputMethod:"unicode-hex"})`.
 This opt-in method enters each Unicode code point through the application's hex
@@ -158,10 +165,22 @@ the screenshot return value. It states that original HDR brightness, gamut,
 and highlight appearance cannot be judged from the SDR preview. The metadata
 is also retained in the full PNG alongside an sRGB declaration.
 
-Supported named primaries are sRGB/BT.709, BT.2020, and Display P3; supported
-transfer functions are extended linear, BT.1886, gamma 2.2/2.8, sRGB piecewise,
-and ST 2084 PQ. Windows-scRGB is supported. Untracked descriptions, ICC profiles,
-custom primaries/power functions, and HLG currently fail capture explicitly.
+All 10 named primaries in `wp_color_manager_v1` are supported: sRGB/BT.709,
+PAL-M, PAL, NTSC, generic film, BT.2020, CIE 1931 XYZ, DCI P3, Display P3,
+and Adobe RGB. Conversion adapts source white to D65 with Bradford adaptation.
+All 14 named transfer functions are supported, including ST 240, both log
+encodings, xvYCC, the deprecated sRGB names, ST 428, HLG, and compound power 2.4.
+HLG includes its luminance-coupled display OOTF and black-level compensation.
+The log encodings use the inverse encoding curve (zero maps to the lowest
+representable nonzero level). Windows-scRGB is also supported. Unknown enum
+values, untracked descriptions, and ICC profiles fail capture explicitly.
+Custom primary chromaticities and white points are preserved and converted with
+an RGB-to-XYZ matrix and Bradford adaptation computed once per description.
+This includes imaginary primaries and zero-y primaries such as CIE XYZ; singular
+matrices and invalid white points produce explicit errors, never an sRGB fallback.
+Custom power transfer functions support every protocol exponent from 1.0000 to
+10.0000, including sign-preserving negative and above-one channel values.
+Capture metadata retains the original chromaticities and power exponent.
 Untagged surfaces retain the existing assumed-sRGB path. Color state follows
 surface commit and image-description copy semantics.
 
