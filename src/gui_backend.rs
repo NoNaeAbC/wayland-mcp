@@ -76,6 +76,10 @@ pub(crate) enum GuiWaylandPointerEvent {
         #[serde(default)]
         serial: Option<u32>,
     },
+    Leave {
+        #[serde(default)]
+        serial: Option<u32>,
+    },
     Motion {
         x: i64,
         y: i64,

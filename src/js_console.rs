@@ -333,6 +333,19 @@ async fn handle_native_call(
             };
             Ok((diagnostics, None))
         }
+        "select_backend" => {
+            let display = args
+                .get("display")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "selectBackend requires display".to_string())?;
+            match backend {
+                GuiBackendHandle::Wayland(backend) => Ok((
+                    json!({"backend_socket": backend.select_backend(display.to_string()).await?}),
+                    None,
+                )),
+                _ => Err("Wayland proxy backend is not active".to_string()),
+            }
+        }
         "windows" => Ok((
             serde_json::to_value(backend.list_windows().await?).map_err(|err| err.to_string())?,
             None,
@@ -966,6 +979,40 @@ mod tests {
                 GuiWaylandPointerEvent::Button { state: 0, .. },
                 GuiWaylandPointerEvent::Frame,
             ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn pointer_move_leaves_previous_window_before_entering_next() {
+        let recording = Arc::new(RecordingBackend::default());
+        let backend = GuiBackendHandle::Test(recording.clone());
+        let artifacts = Arc::new(ArtifactStore::new());
+        let console = JsConsole::new(backend, artifacts);
+
+        console
+            .eval("await wayland.move({windowId:'first', x:10, y:20}); return await wayland.move({windowId:'second', x:30, y:40});".to_string())
+            .await
+            .expect("move between windows");
+
+        let actual = recording
+            .pointer_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|request| (request.window_id.clone(), request.event.clone()))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            actual.as_slice(),
+            [
+                (Some(first), GuiWaylandPointerEvent::Enter { .. }),
+                (Some(_), GuiWaylandPointerEvent::Motion { .. }),
+                (Some(_), GuiWaylandPointerEvent::Frame),
+                (Some(leaving), GuiWaylandPointerEvent::Leave { .. }),
+                (Some(_), GuiWaylandPointerEvent::Frame),
+                (Some(second), GuiWaylandPointerEvent::Enter { .. }),
+                (Some(_), GuiWaylandPointerEvent::Motion { .. }),
+                (Some(_), GuiWaylandPointerEvent::Frame),
+            ] if first == "first" && leaving == "first" && second == "second"
         ));
     }
 
