@@ -318,7 +318,7 @@ impl ColorDescription {
         )
     }
 
-    fn is_hdr(&self) -> bool {
+    pub(crate) fn is_hdr(&self) -> bool {
         let (min, max, reference) = self.levels();
         self.extended || (max - min) / reference > 1.01
     }
@@ -331,10 +331,10 @@ impl ColorDescription {
         }
     }
 
-    pub(crate) fn rgba8(&self, pixel: [f32; 4]) -> [u8; 4] {
+    pub(crate) fn linear_premultiplied(&self, pixel: [f32; 4]) -> [f32; 4] {
         let alpha = pixel[3].clamp(0.0, 1.0);
         if alpha <= 0.0 {
-            return [0; 4];
+            return [0.0; 4];
         }
         let (min, max, reference) = self.levels();
         let swing = if self.tf == 11 { 10000.0 } else { max - min };
@@ -370,43 +370,60 @@ impl ColorDescription {
                 }
             })
         };
-        let mut linear = matrix.map(|row| row.iter().zip(rgb).map(|(a, b)| a * b).sum::<f32>());
-        // HDR preview policy: luminance-preserving Reinhard compression. Keep
-        // SDR unchanged; HDR reference white maps to 0.5 in linear sRGB.
-        if self.is_hdr() {
-            let y = (0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]).max(0.0);
-            for c in &mut linear {
-                *c /= 1.0 + y;
-            }
-        }
-        // Fit the gamut toward neutral at constant luminance, avoiding hue
-        // shifts from clipping channels independently.
-        let grey = (0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]).clamp(0.0, 1.0);
-        let mut saturation = 1.0_f32;
-        for c in linear {
-            if c < 0.0 {
-                saturation = saturation.min(grey / (grey - c));
-            }
-            if c > 1.0 {
-                saturation = saturation.min((1.0 - grey) / (c - grey));
-            }
-        }
-        linear = linear.map(|c| grey + saturation * (c - grey));
-        let encode = |v: f32| {
-            let v = v.clamp(0.0, 1.0);
-            quantize(if v <= 0.0031308 {
-                12.92 * v
-            } else {
-                1.055 * v.powf(1.0 / 2.4) - 0.055
-            })
-        };
+        let linear = matrix.map(|row| row.iter().zip(rgb).map(|(a, b)| a * b).sum::<f32>());
         [
-            encode(linear[0]),
-            encode(linear[1]),
-            encode(linear[2]),
-            quantize(alpha),
+            linear[0] * alpha,
+            linear[1] * alpha,
+            linear[2] * alpha,
+            alpha,
         ]
     }
+    pub(crate) fn rgba8(&self, pixel: [f32; 4]) -> [u8; 4] {
+        encode_preview(self.linear_premultiplied(pixel), self.is_hdr())
+    }
+}
+
+pub(crate) fn encode_preview(pixel: [f32; 4], hdr: bool) -> [u8; 4] {
+    let alpha = pixel[3].clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return [0; 4];
+    }
+    let mut linear = [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha];
+    // HDR preview policy: luminance-preserving Reinhard compression. Keep
+    // SDR unchanged; HDR reference white maps to 0.5 in linear sRGB.
+    if hdr {
+        let y = (0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]).max(0.0);
+        for c in &mut linear {
+            *c /= 1.0 + y;
+        }
+    }
+    // Fit the gamut toward neutral at constant luminance, avoiding hue
+    // shifts from clipping channels independently.
+    let grey = (0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]).clamp(0.0, 1.0);
+    let mut saturation = 1.0_f32;
+    for c in linear {
+        if c < 0.0 {
+            saturation = saturation.min(grey / (grey - c));
+        }
+        if c > 1.0 {
+            saturation = saturation.min((1.0 - grey) / (c - grey));
+        }
+    }
+    linear = linear.map(|c| grey + saturation * (c - grey));
+    let encode = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        quantize(if v <= 0.0031308 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        })
+    };
+    [
+        encode(linear[0]),
+        encode(linear[1]),
+        encode(linear[2]),
+        quantize(alpha),
+    ]
 }
 
 // Inverse named encoding functions. BT.1886 and HLG display luminance/OOTF
@@ -923,6 +940,12 @@ pub(crate) struct SurfaceColors {
 }
 
 impl SurfaceColors {
+    pub(crate) fn next(&self, surface: u32) -> Option<&ColorDescription> {
+        match self.pending.get(&surface) {
+            Some(color) => color.as_ref(),
+            None => self.get(surface),
+        }
+    }
     pub(crate) fn get(&self, surface: u32) -> Option<&ColorDescription> {
         self.committed.get(&surface)
     }

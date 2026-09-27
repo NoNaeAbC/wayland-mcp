@@ -6,7 +6,8 @@ shared-memory and DMA-BUF buffers, and injects compositor-side pointer and
 keyboard events.
 
 The server exposes one MCP tool, `gui_console`. The tool evaluates JavaScript
-in a persistent, isolated Node.js process. Convenience functions cover routine
+in a persistent Node.js process with Node I/O permissions disabled. Convenience
+functions cover routine
 GUI interactions, while the raw Wayland event interface remains available for
 protocol-level testing.
 
@@ -16,12 +17,14 @@ Build requirements:
 
 - Linux;
 - Rust 1.88 or newer, including Cargo and a native linker;
+- Python 3.10 or newer (`python3`, or the executable specified by `PYTHON`);
+- installed Wayland core and `wayland-protocols` XML files under `/usr/share`;
 - libxkbcommon development files providing the `xkbcommon` linker library;
 - Vulkan loader development files providing the `vulkan` linker library.
 
 Runtime requirements:
 
-- Node.js 18 or newer available as `node` on `PATH`;
+- Node.js 26 or newer available as `node` on `PATH`;
 - an active Wayland session with `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` set;
 - a Vulkan 1.1 loader and a compatible graphics driver for DMA-BUF capture;
 - permission to connect to the compositor socket and, for GPU clients, the
@@ -47,6 +50,14 @@ linting, unit tests, and a release build together:
 ```sh
 ./scripts/validate.sh
 ```
+
+Cargo runs `scripts/generate_wayland_protocols.py` against the installed XML files
+in `/usr/share/wayland` and `/usr/share/wayland-protocols`. Generated Rust lives
+only in Cargo's `OUT_DIR` under the build target directory; it is not source and
+must not be committed. A fresh build regenerates it automatically. Changes to
+the generator or any consumed system XML file trigger regeneration. Missing XML
+files fail the build with their paths; install the corresponding Wayland development
+and `wayland-protocols` packages. Protocol versions follow the installed packages.
 
 The validation script honors Cargo's standard environment variables, including
 `CARGO_TARGET_DIR`, which is useful for verifying a fresh build outside an
@@ -86,7 +97,11 @@ The main observation calls are:
 - `wayland.windows()` — mapped surface inventory and capture metadata;
 - `wayland.screenshot({windowId})` — capture the current frame;
 - `wayland.captureNextFrame({windowId, afterCommitSerial, timeoutMs})` — wait
-  for and capture a later committed frame.
+  for and capture a later committed frame;
+- `wayland.beginObservation({windowId,durationMs})` and
+  `wayland.endObservation({id})` — retain owned GPU frames during a sequence
+  of actions, including popup commits. Leases expire automatically and can
+  overlap; ending one leaves the others active.
 
 High-level input and synchronization helpers include `waitForWindow`,
 `waitForWindowGone`, `click`, `doubleClick`, `move`, `drag`, `scroll`,
@@ -108,18 +123,46 @@ remain available for protocol-level keyboard testing. Raw input calls invalidate
 cached helper focus automatically. `resetInputState()` clears cached focus after
 external focus changes; it does not release pressed keys.
 
-Clipboard selection claims made with injected input serials are consumed by
-the proxy, so the host compositor cannot reject the synthetic serial. A client
-that retains its own copied data can test its in-app copy/paste flow. The proxy
-does not synthesize a new selection offer or virtualize cross-client clipboard
-exchange; clients that rely on receiving an offer to paste may still see the
-host clipboard.
+Clipboard operations use two independent selections. The latest trusted input
+source per client and seat selects the host-shared clipboard for human input and
+the private clipboard for model input. Before any input, the private clipboard is
+selected. Playback counts as model input. Switching actors preserves both values.
+Primary selection and clipboard-control extensions remain denied. See
+[clipboard routing](docs/clipboard-attribution.md).
 
 For applications supporting Ctrl+Shift+U Unicode entry, use
 `wayland.typeText({windowId, text:"🌘", inputMethod:"unicode-hex"})`.
 This opt-in method enters each Unicode code point through the application's hex
 input convention, without using the clipboard. It was exercised in Chromium;
 applications without that convention must use their own input method.
+
+Input listeners also accept `devices:["touch","relative_pointer","pointer_constraints"]`.
+`wayland.inputCapabilities({windowId})` lists the target client's bound resources,
+seat IDs and protocol versions. `touchEvent({windowId,surfaceId,event})` sends one
+touch event with surface-local signed 24.8 coordinates; emit `frame` explicitly.
+`pointerEvent` accepts `relative_motion` with `dx`, `dy`, `dx_unaccel`, `dy_unaccel`
+in signed 24.8 format and `utime_hi`/`utime_lo` timestamp words. Applications request
+pointer lock or confinement through the normal Wayland protocols. Model focus
+activates the corresponding constraint; absolute model motion fails while locked.
+Recording and playback use the same ordinary JS listeners and input calls.
+
+Observation composites committed subsurfaces and xdg popups in stacking order,
+including viewport cropping, buffer transforms, scaling, input regions and alpha.
+SHM pixels are owned snapshots taken at commit. GPU observation copies before
+forwarding a commit when capture is armed, honoring explicit acquire points;
+implicit buffer releases are deferred during an idle observation copy. Previously
+released, uncaptured buffers fail with `snapshot_unavailable`. GPU and SHM layers
+are blended in linear light and converted to the preview once. PNG metadata
+includes the scene origin and pixel-to-surface scale.
+
+Drag-and-drop has independent transfer state. Model drags use private sources and
+offers; human drags use mediated host offers. MIME acceptance, negotiated actions,
+finish/cancellation and bounded FD transfer run without changing either selection.
+
+Run `python3 scripts/demonstrate-live.py --input` for a visible GTK window with
+touch, pointer capture, relative input, private drag/drop and a native subsurface.
+Add `--gl` or `--vulkan` for GPU rendering. The window remains open and supports
+agent-written console programs through the printed control directory.
 
 Window inventory separates the two output domains. `on_capture_output` and
 `capture_output_count` describe membership on the MCP's single virtual capture
@@ -210,6 +253,64 @@ Its result includes `actionResult`, both commit serials, `frameObserved`,
 does not claim that the resulting pixels satisfy an application-level
 assertion.
 
+## Input listeners and demonstrations
+
+Record with ordinary JavaScript; the server provides listeners and raw input,
+with no built-in recorder or player. Start this in one console call:
+
+```js
+globalThis.samples = [];
+globalThis.recording = await wayland.onInput(
+  {windowId, origin: "human", devices: ["pointer"]},
+  event => samples.push(structuredClone(event))
+);
+return recording.initialState;
+```
+
+Ask the user to reproduce the bug. Events continue arriving between calls. End
+recording in another call, draining callbacks before using the saved data:
+
+```js
+return await recording.unsubscribe();
+```
+
+Define playback using the saved surface tokens and exact signed 24.8 coordinates:
+
+```js
+globalThis.replay = async () => {
+  let previous;
+  for (const sample of samples) {
+    if (previous !== undefined) {
+      await wayland.sleep(Math.max(0, sample.timestampMs - previous));
+    }
+    await wayland.pointerEvent({
+      windowId: sample.windowId,
+      surfaceId: sample.surfaceId,
+      coordinateSpace: "surface-fixed",
+      event: sample.event
+    });
+    previous = sample.timestampMs;
+  }
+};
+await replay();
+await replay();
+return samples.length;
+```
+
+The handle's `status()` exposes callback failures and queue overflow. An overflow
+ends the stream with a gap error. Destroyed or reused surface tokens are rejected.
+Callbacks may perform async GUI operations. Use `unsubscribe({drain:false})` when
+stopping from inside that same callback. Background captures return an image
+handle; present it explicitly in a later foreground call with
+`wayland.presentImage(handle)` and release it with `wayland.disposeImage(handle)`.
+
+`python3 scripts/validate-live.py` opens two visible GTK4 windows through the MCP
+on your current desktop. It checks private clipboard exchange and starts a
+JS-authored listener for human pointer input on the destination window. Both
+windows remain open for inspection. It requires GTK4 and Wayland development
+files, Node 26+, and `cargo build`. Test binaries and runtime state live in a
+temporary directory. The demonstration uses only the private model clipboard.
+
 ## Client launch workflow
 
 1. Start the MCP server in the host Wayland session.
@@ -232,21 +333,17 @@ endpoint stopped or its private runtime directory disappeared, the call creates
 a fresh endpoint; callers must therefore use the values from the latest call
 rather than caching them across MCP instances.
 
-`diagnostics()` repeats the socket/preflight state and retains the 32 most
-recent connection events with timestamps, client IDs, endpoint state, and close
-details. Normal EOF, connection reset, and broken-pipe client teardown are kept
-in that history without replacing the service-wide `last_runtime_error`.
-
-The proxy does not launch applications or grant filesystem, socket, or graphics
-device permissions. Those remain the responsibility of the invoking process.
-Host-owned system dialogs may connect to another compositor and therefore fall
-outside the proxy's observable surface set.
+`diagnostics()` returns sanitized endpoint/preflight and console permission status.
+Host socket paths, session internals and connection-history details are omitted
+from the JS response. Backend selection is trusted startup configuration through
+`WAYLAND_MCP_BACKEND_SOCKET`; the JS API cannot change it.
 
 ## Configuration
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `WAYLAND_MCP_ARTIFACT_DIR` | Directory for full PNG captures and JSONL event records | A private, unique directory under the system temporary directory |
+| `WAYLAND_MCP_DMABUF_MODE` | Trusted startup negotiation policy: `capture-compatible` filters formats, `transparent` preserves host format/modifier advertisements | capture-compatible |
 | `WAYLAND_MCP_EVAL_TIMEOUT_MS` | JavaScript evaluation timeout in milliseconds | 120000; values are clamped to the supported range |
 | `WAYLAND_MCP_SOCKET` | Proxy socket name inside its private runtime directory | `wayland-mcp-0` |
 | `WAYLAND_MCP_BACKEND_SOCKET` | Host compositor socket name or absolute socket path | The inherited `WAYLAND_DISPLAY`, otherwise `wayland-0` |
@@ -258,8 +355,8 @@ the environment in which the server runs.
 
 ## Limitations
 
-- The proxy only advertises Wayland interfaces whose wire metadata it can
-  safely decode and forward.
+- Protocol exposure follows an explicit capability policy; decoder availability
+  alone does not grant access. Registry versions and binds are checked.
 - DMA-BUF capture depends on Vulkan external-memory and DRM-format-modifier
   support in the host driver.
 - The compositor boundary does not provide a semantic widget or accessibility
