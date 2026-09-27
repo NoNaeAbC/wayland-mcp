@@ -2,10 +2,17 @@ mod gui_backend;
 mod gui_backend_wayland;
 mod gui_color;
 mod gui_vulkan_dmabuf;
-mod gui_wayland_generated;
+#[allow(dead_code)]
+mod gui_wayland_generated {
+    include!(concat!(env!("OUT_DIR"), "/gui_wayland_generated.rs"));
+}
+mod console_runtime;
 mod gui_xkb;
+mod input_events;
 mod js_console;
+mod wayland_policy;
 mod wayland_protocol_registry;
+mod wayland_writer;
 
 use std::borrow::Cow;
 use std::fs::OpenOptions;

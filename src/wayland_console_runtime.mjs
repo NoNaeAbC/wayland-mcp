@@ -2,9 +2,18 @@ import vm from "node:vm";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
 
+// Permission categories are validated on every runtime start and restart.
+if (Number(process.versions.node.split(".")[0]) < 26 || !process.permission) {
+  throw new Error("gui_console requires Node 26 or newer with --permission");
+}
+for (const permission of ["fs.read", "fs.write", "net", "child", "worker", "addons", "ffi", "wasi", "inspector"]) {
+  if (process.permission.has(permission)) throw new Error(`unexpected Node permission: ${permission}`);
+}
+
 const pendingNative = new Map();
 let nextNativeId = 1;
 const evalContext = new AsyncLocalStorage();
+const inputContext = new AsyncLocalStorage();
 const MAX_LOG_ENTRIES = 500;
 const MAX_LOG_CHARS = 4096;
 const MAX_RESULT_CHARS = 1_000_000;
@@ -46,9 +55,16 @@ function boundedResult(value) {
 }
 
 function native(method, args = {}) {
+  if (pendingNative.size >= 64) return Promise.reject(new Error("native request limit reached"));
   const id = nextNativeId++;
-  write({ type: "native_call", id, evalId: evalContext.getStore()?.id ?? null, method, args });
-  return new Promise((resolve, reject) => pendingNative.set(id, { resolve, reject }));
+  const evalId = evalContext.getStore()?.id ?? null;
+  const subscriptionId = inputContext.getStore()?.id ?? null;
+  write({type:"native_call", id, evalId, subscriptionId, method, args});
+  const promise = new Promise((resolve, reject) => pendingNative.set(id, {resolve, reject, evalId, subscriptionId}));
+  // Detached calls still reject when their evaluation ends; avoid turning that
+  // lifecycle cleanup into an unrelated unhandled-rejection process exit.
+  promise.catch(() => {});
+  return promise;
 }
 
 const pointerFocus = { windowId: null };
@@ -524,23 +540,39 @@ code point through that application convention; it is not universal and does
 not use the clipboard.
 pressKey accepts evdev codes, the names in wayland.keyNames, and one-character
 keys case-insensitively; character keys also use the target client's XKB map.
-Raw calls: environment(), diagnostics(), selectBackend({display}), windows(), screenshot({windowId}),
+Raw calls: environment(), diagnostics(), windows(), screenshot({windowId}),
 captureNextFrame({windowId, afterCommitSerial, timeoutMs}),
+beginObservation({windowId, durationMs}), endObservation({id}),
 resizeWindow({windowId,width,height}),
-pointerEvent({windowId,event}), keyboardEvent({windowId,event}), sleep(ms).
+pointerEvent({windowId,event}), keyboardEvent({windowId,event}),
+touchEvent({windowId,surfaceId,event}), inputCapabilities({windowId}), sleep(ms).
 environment() returns WAYLAND_DISPLAY, XDG_RUNTIME_DIR, an absolute socket_path,
 and launch_preflight; caller namespace and render-node access remain not_tested.
-diagnostics() includes the same endpoint state and a bounded connection_history.
-selectBackend({display:"wayland-1"}) selects a compositor for new proxied clients;
-use an absolute socket path when selecting outside XDG_RUNTIME_DIR. Close existing
-proxied windows first. The default backend comes from WAYLAND_DISPLAY.
+diagnostics() reports sanitized proxy and sandbox status.
+onInput({windowId,origin:"human",devices:["pointer"]}, callback) subscribes to
+ordered delivered input and works between evaluations. The handle has initialState,
+status(), and unsubscribe({drain:true}). Call drain:false from within a callback.
+Events use signed 24.8 surface-fixed coordinates and trusted origin labels.
+Queues are bounded; status reports overflow or callback failures. No recorder or
+player is built in: collect events and replay them using ordinary JS.
 windows() reports capture-output and backend-output membership separately.
 Each input call emits exactly one compositor-side protocol event; author
 sequences yourself. wl_pointer event types and fields:
   enter{x,y,serial?}, leave{serial?}, motion{x,y,time?}, button{button,state,serial?,time?},
   axis{axis,value,time?}, axis_source{axis_source}, axis_stop{axis,time?},
   axis_discrete{axis,discrete}, axis_value120{axis,value120},
-  axis_relative_direction{axis,direction}, frame{}.
+  axis_relative_direction{axis,direction}, frame{},
+  relative_motion{utime_hi,utime_lo,dx,dy,dx_unaccel,dy_unaccel}.
+Relative deltas are signed 24.8 fixed integers; timestamps are 64-bit microseconds
+split into two unsigned words. onInput devices also accepts relative_pointer,
+pointer_constraints and touch. Pointer constraints are requested by the client;
+model focus activates its lock/confinement, and absolute motion is rejected while
+locked. inputCapabilities lists bound resources and versions for the target.
+touchEvent uses surface-local signed 24.8 fixed x/y values and fresh serials/time:
+  down{id,x,y}, motion{id,x,y}, up{id}, shape{id,major,minor},
+  orientation{id,orientation}, frame{}, cancel{}.
+Touch contact IDs remain active until up/cancel; call frame explicitly.
+Recording and playback of these events remain agent-written JS.
 axis.value is the raw signed wl_fixed 24.8 integer. x/y are full screenshot
 pixels mapped to the input wl_surface. wl_keyboard event types and fields:
   enter{serial?,keys?:[evdevKey...]}, leave{serial?},
@@ -552,12 +584,82 @@ Use ordinary JavaScript functions, loops, Promise.all, and timers to build
 precise or repeated behavior. Track focus in your helpers: enter is a focus
 transition, not a prefix for every action.`;
 
+const inputSubscriptions = new Map();
+const earlyInput = new Map();
+function acceptInput(message) {
+  const state = inputSubscriptions.get(message.subscriptionId);
+  if (!state) {
+    let queue = earlyInput.get(message.subscriptionId);
+    if (!queue) { if (earlyInput.size >= 32) return; queue = []; earlyInput.set(message.subscriptionId, queue); }
+    if (queue.length < 257) queue.push(message);
+    return;
+  }
+  if (message.type === "input_end") {
+    state.end = message.end;
+    state.resolveEnd();
+    return;
+  }
+  if (state.cancelled) { state.discarded++; return; }
+  const bytes = JSON.stringify(message.event).length;
+  if (state.queued >= 256 || state.bytes + bytes > 4*1024*1024) {
+    state.error = "input callback queue overflow; recording has a gap";
+    state.cancelled = true;
+    void inputContext.run({id:state.id}, () => native("unsubscribe_input", {id:state.id})).catch(() => {});
+    return;
+  }
+  state.queued++; state.bytes += bytes;
+  state.tail = state.tail.then(async () => {
+    state.queued--; state.bytes -= bytes;
+    if (state.cancelled) { state.discarded++; return; }
+    await inputContext.run({id:state.id}, async () => {
+      let timer;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => state.callback(message.event)),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("input callback exceeded its time limit")), state.callbackTimeoutMs); }),
+        ]);
+      } catch (error) {
+        state.error = printable(error?.stack ?? error); state.cancelled = true;
+        try { await native("unsubscribe_input", {id:state.id}); await native("finish_input", {id:state.id}); } catch {}
+      } finally { clearTimeout(timer); }
+    });
+  });
+}
+async function onInput(args, callback) {
+  if (typeof callback !== "function") throw new TypeError("onInput callback must be a function");
+  const callbackTimeoutMs = args?.callbackTimeoutMs ?? 5000;
+  if (!Number.isInteger(callbackTimeoutMs) || callbackTimeoutMs < 1 || callbackTimeoutMs > 120000) throw new RangeError("callbackTimeoutMs must be from 1 through 120000");
+  const start = await native("subscribe_input", args);
+  const state = {id:start.id, callback, callbackTimeoutMs, tail:Promise.resolve(), queued:0, bytes:0, cancelled:false, discarded:0, error:null, end:null};
+  state.ended = new Promise(resolve => { state.resolveEnd = resolve; });
+  inputSubscriptions.set(state.id, state);
+  const buffered = earlyInput.get(state.id) ?? []; earlyInput.delete(state.id);
+  for (const message of buffered) acceptInput(message);
+  return Object.freeze({
+    id:state.id, initialState:start.initialState,
+    status: () => ({active:!state.end && !state.cancelled, queued:state.queued, discarded:state.discarded, error:state.error ?? state.end?.error ?? null, end:state.end}),
+    unsubscribe: async ({drain=true}={}) => {
+      if (drain && inputContext.getStore()?.id === state.id) throw new Error("cannot drain a subscription from its own callback; use drain:false");
+      if (!drain) state.cancelled = true;
+      if (!state.end) await native("unsubscribe_input", {id:state.id});
+      await state.ended;
+      if (drain) await state.tail;
+      // Retain status on the returned handle, but release broker authority and routing state.
+      if (drain) { await native("finish_input", {id:state.id}); inputSubscriptions.delete(state.id); }
+      else { void state.tail.then(() => inputContext.run({id:state.id}, () => native("finish_input", {id:state.id}))).then(() => inputSubscriptions.delete(state.id)).catch(() => {}); }
+      return {endSequence:state.end?.sequence, discarded:state.discarded, error:state.error ?? state.end?.error ?? null};
+    },
+  });
+}
+
 const wayland = Object.freeze({
   help: apiHelp,
+  onInput,
+  presentImage: (imageHandle) => native("present_image", {imageHandle}),
+  disposeImage: (imageHandle) => native("dispose_image", {imageHandle}),
   keyNames: namedKeyNames,
   environment: () => native("environment"),
   diagnostics: () => native("diagnostics"),
-  selectBackend: (args) => native("select_backend", args),
   windows: () => native("windows"),
   resizeWindow: (args) => native("resize_window", args),
   screenshot: (args = {}) => native("screenshot", args),
@@ -566,6 +668,10 @@ const wayland = Object.freeze({
     pointerFocus.windowId = null;
     return await native("pointer_event", args);
   },
+  touchEvent: (args) => native("touch_event", args),
+  inputCapabilities: (args) => native("input_capabilities", args),
+  beginObservation: (args) => native("begin_observation", args),
+  endObservation: (args) => native("end_observation", args),
   keyboardEvent: async (args) => {
     keyboardFocus.windowId = null;
     return await native("keyboard_event", args);
@@ -592,6 +698,8 @@ const context = vm.createContext({
   clearTimeout,
   setInterval,
   clearInterval,
+  structuredClone,
+  performance: Object.freeze({ now: () => performance.now() }),
   console: Object.freeze({
     log: (...args) => appendLog(args),
     error: (...args) => appendLog(args),
@@ -616,6 +724,12 @@ async function evaluate(message) {
         error: error?.stack ?? String(error),
         logs,
       });
+    } finally {
+      for (const [callId, call] of pendingNative) {
+        if (call.evalId === id && call.subscriptionId === null) {
+          pendingNative.delete(callId); call.reject(new Error("foreground evaluation ended before the native call completed"));
+        }
+      }
     }
   });
 }
@@ -631,6 +745,7 @@ lines.on("line", (line) => {
     void evaluate(message);
     return;
   }
+  if (message.type === "input_event" || message.type === "input_end") { acceptInput(message); return; }
   if (message.type === "native_result") {
     const pending = pendingNative.get(message.id);
     if (!pending) return;
@@ -639,3 +754,6 @@ lines.on("line", (line) => {
     else pending.reject(new Error(message.error));
   }
 });
+
+setInterval(() => write({type: "heartbeat"}), 500).unref();
+write({type: "ready"});

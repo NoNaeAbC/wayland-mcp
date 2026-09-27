@@ -23,6 +23,19 @@ pub(crate) struct DmabufImage<'a> {
 }
 
 pub(crate) fn read_dmabuf_rgba(image: DmabufImage<'_>) -> Result<Vec<u8>, String> {
+    let hdr = image
+        .color
+        .is_some_and(crate::gui_color::ColorDescription::is_hdr);
+    Ok(read_dmabuf_linear(image)?
+        .into_iter()
+        .flat_map(|p| crate::gui_color::encode_preview(p, hdr))
+        .collect())
+}
+
+pub(crate) fn read_dmabuf_linear(image: DmabufImage<'_>) -> Result<Vec<[f32; 4]>, String> {
+    if u64::from(image.width) * u64::from(image.height) > 8_388_608 {
+        return Err("GPU snapshot exceeds 128 MiB".into());
+    }
     if image.planes.is_empty() {
         return Err("dmabuf image has no planes".to_string());
     }
@@ -84,7 +97,7 @@ fn read_dmabuf_rgba_with_instance(
     instance: VkInstance,
     image: DmabufImage<'_>,
     vk_format: VkFormat,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<[f32; 4]>, String> {
     let physical_devices = enumerate_physical_devices(instance)?;
     let required_extensions = [
         CString::new("VK_KHR_external_memory_fd").map_err(|err| err.to_string())?,
@@ -152,7 +165,7 @@ fn read_dmabuf_rgba_with_device(
     queue_family_index: u32,
     image: &DmabufImage<'_>,
     vk_format: VkFormat,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<[f32; 4]>, String> {
     let mut queue = ptr::null_mut();
     unsafe { vkGetDeviceQueue(device, queue_family_index, 0, &mut queue) };
     let imported_fd = duplicate_fd(image.planes[0].fd)?;
@@ -233,7 +246,7 @@ fn copy_imported_image_to_rgba(
     imported_fd: RawFd,
     image: &DmabufImage<'_>,
     vk_format: VkFormat,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<[f32; 4]>, String> {
     let mut image_reqs = MaybeUninit::<VkMemoryRequirements>::zeroed();
     unsafe { vkGetImageMemoryRequirements(device, vk_image, image_reqs.as_mut_ptr()) };
     let image_reqs = unsafe { image_reqs.assume_init() };
@@ -332,7 +345,7 @@ fn copy_to_buffer_and_map(
     byte_len: u64,
     image: &DmabufImage<'_>,
     vk_format: VkFormat,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<[f32; 4]>, String> {
     let _ = image_memory;
     let mut buffer_reqs = MaybeUninit::<VkMemoryRequirements>::zeroed();
     unsafe { vkGetBufferMemoryRequirements(device, buffer, buffer_reqs.as_mut_ptr()) };
@@ -401,7 +414,7 @@ fn record_submit_copy_and_map(
     byte_len: u64,
     image: &DmabufImage<'_>,
     vk_format: VkFormat,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<[f32; 4]>, String> {
     let alloc = VkCommandBufferAllocateInfo {
         s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         p_next: ptr::null(),
@@ -541,7 +554,7 @@ fn record_submit_copy_and_map(
         "vkMapMemory",
     )?;
     let raw = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), byte_len as usize) };
-    let rgba = copied_pixels_to_rgba_with_color(
+    let rgba = copied_pixels_to_linear(
         raw,
         image.width as usize,
         image.height as usize,
@@ -551,6 +564,69 @@ fn record_submit_copy_and_map(
     );
     unsafe { vkUnmapMemory(device, buffer_memory) };
     Ok(rgba)
+}
+
+fn copied_pixels_to_linear(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    format: VkFormat,
+    alpha: bool,
+    color: Option<&crate::gui_color::ColorDescription>,
+) -> Vec<[f32; 4]> {
+    let bytes = bytes_per_pixel(format).expect("validated Vulkan format");
+    (0..width * height)
+        .map(|index| {
+            let raw = &raw[index * bytes..][..bytes];
+            let mut p = match format {
+                VK_FORMAT_R16G16B16A16_SFLOAT => std::array::from_fn(|i| {
+                    f16_channel_to_f32(u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]))
+                }),
+                VK_FORMAT_B8G8R8A8_UNORM => {
+                    [raw[2], raw[1], raw[0], raw[3]].map(|v| f32::from(v) / 255.0)
+                }
+                VK_FORMAT_R8G8B8A8_UNORM => {
+                    [raw[0], raw[1], raw[2], raw[3]].map(|v| f32::from(v) / 255.0)
+                }
+                _ => {
+                    let v = u32::from_le_bytes(raw.try_into().unwrap());
+                    let c = if format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 {
+                        [(v >> 20) & 1023, (v >> 10) & 1023, v & 1023]
+                    } else {
+                        [v & 1023, (v >> 10) & 1023, (v >> 20) & 1023]
+                    };
+                    [
+                        c[0] as f32 / 1023.0,
+                        c[1] as f32 / 1023.0,
+                        c[2] as f32 / 1023.0,
+                        (v >> 30) as f32 / 3.0,
+                    ]
+                }
+            };
+            if !alpha {
+                p[3] = 1.0;
+            }
+            if let Some(color) = color {
+                return color.linear_premultiplied(p);
+            }
+            if format == VK_FORMAT_R16G16B16A16_SFLOAT {
+                return p;
+            }
+            let a = p[3];
+            if a <= 0.0 {
+                return [0.0; 4];
+            }
+            for c in &mut p[..3] {
+                let v = *c / a;
+                *c = (if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }) * a;
+            }
+            p
+        })
+        .collect()
 }
 
 fn copied_pixels_to_rgba(
@@ -754,7 +830,7 @@ fn memory_type_index(
 }
 
 fn duplicate_fd(fd: RawFd) -> Result<RawFd, String> {
-    let duplicated = unsafe { libc::dup(fd) };
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
         Err(format!(
             "failed to duplicate dmabuf fd for Vulkan import: {}",
@@ -777,7 +853,7 @@ pub(crate) fn supports_screenshot_drm_format(format: u32) -> bool {
 pub(crate) fn screenshot_support_error(format: u32) -> Option<String> {
     (!supports_screenshot_drm_format(format)).then(|| {
         format!(
-            "DMA-BUF DRM format {} is not supported for screenshots and is not advertised by this MCP",
+            "DMA-BUF DRM format {} is unsupported for capture by this MCP",
             describe_drm_format(format)
         )
     })
