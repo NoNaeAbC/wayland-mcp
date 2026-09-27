@@ -33,12 +33,33 @@ pub(crate) struct GuiPointerMoveRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuiWaylandPointerEventRequest {
     pub(crate) window_id: Option<String>,
+    pub(crate) surface_id: Option<String>,
+    pub(crate) surface_fixed: bool,
     pub(crate) event: GuiWaylandPointerEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuiWaylandTouchEventRequest {
+    pub(crate) window_id: String,
+    pub(crate) surface_id: Option<String>,
+    pub(crate) event: GuiWaylandTouchEvent,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum GuiWaylandTouchEvent {
+    Down { id: i32, x: i32, y: i32 },
+    Up { id: i32 },
+    Motion { id: i32, x: i32, y: i32 },
+    Frame,
+    Cancel,
+    Shape { id: i32, major: i32, minor: i32 },
+    Orientation { id: i32, orientation: i32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuiWaylandKeyboardEventRequest {
     pub(crate) window_id: Option<String>,
+    pub(crate) surface_id: Option<String>,
     pub(crate) event: GuiWaylandKeyboardEvent,
 }
 
@@ -115,6 +136,14 @@ pub(crate) enum GuiWaylandPointerEvent {
     AxisValue120 {
         axis: u32,
         value120: i32,
+    },
+    RelativeMotion {
+        utime_hi: u32,
+        utime_lo: u32,
+        dx: i32,
+        dy: i32,
+        dx_unaccel: i32,
+        dy_unaccel: i32,
     },
     AxisRelativeDirection {
         axis: u32,
@@ -208,6 +237,12 @@ pub(crate) struct GuiWindowInfo {
 
 #[async_trait]
 pub(crate) trait GuiBackend: Send + Sync {
+    async fn cleanup_model_input(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn input_hub(&self) -> Option<Arc<crate::input_events::InputHub>> {
+        None
+    }
     async fn list_windows(&self) -> Result<Vec<GuiWindowInfo>, String>;
 
     async fn screenshot(&self, request: GuiScreenshotRequest) -> Result<Vec<u8>, String>;
@@ -243,6 +278,22 @@ pub(crate) enum GuiBackendHandle {
 }
 
 impl GuiBackendHandle {
+    pub(crate) async fn cleanup_model_input(&self) -> Result<(), String> {
+        match self {
+            Self::Wayland(backend) => backend.cleanup_model_input().await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.cleanup_model_input().await,
+            _ => Ok(()),
+        }
+    }
+    pub(crate) fn input_hub(&self) -> Option<Arc<crate::input_events::InputHub>> {
+        match self {
+            Self::Wayland(backend) => backend.input_hub(),
+            #[cfg(test)]
+            Self::Test(backend) => backend.input_hub(),
+            _ => None,
+        }
+    }
     pub(crate) async fn resize_window(
         &self,
         request: GuiResizeWindowRequest,
@@ -299,6 +350,45 @@ impl GuiBackendHandle {
             Self::Wayland(backend) => backend.emit_wayland_pointer_event(request).await,
             #[cfg(test)]
             Self::Test(backend) => backend.emit_wayland_pointer_event(request).await,
+        }
+    }
+
+    pub(crate) async fn begin_observation(
+        &self,
+        window: String,
+        duration_ms: u64,
+    ) -> Result<serde_json::Value, String> {
+        match self {
+            #[cfg(unix)]
+            Self::Wayland(backend) => backend.begin_observation(window, duration_ms).await,
+            _ => Err("observation requires the Wayland backend".into()),
+        }
+    }
+    pub(crate) async fn end_observation(&self, id: u64) -> Result<serde_json::Value, String> {
+        match self {
+            #[cfg(unix)]
+            Self::Wayland(backend) => backend.end_observation(id).await,
+            _ => Err("observation requires the Wayland backend".into()),
+        }
+    }
+    pub(crate) async fn input_capabilities(
+        &self,
+        window: &str,
+    ) -> Result<serde_json::Value, String> {
+        match self {
+            #[cfg(unix)]
+            Self::Wayland(backend) => backend.input_capabilities(window).await,
+            _ => Err("input capabilities require the Wayland proxy backend".into()),
+        }
+    }
+    pub(crate) async fn emit_wayland_touch_event(
+        &self,
+        request: GuiWaylandTouchEventRequest,
+    ) -> Result<String, String> {
+        match self {
+            #[cfg(unix)]
+            Self::Wayland(backend) => backend.emit_wayland_touch_event(request).await,
+            _ => Err("touch input requires the Wayland proxy backend".into()),
         }
     }
 
