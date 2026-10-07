@@ -24,10 +24,9 @@ Build requirements:
 - a C++26 compiler (GCC or Clang) and `ar`;
   project C++ is built with `-fno-rtti -fno-exceptions` and strict warnings;
   set `CXX` to select the compiler;
-- Shaderc headers and static archives: `shaderc_combined`, `glslang`,
-  `MachineIndependent`, `GenericCodeGen`, `OSDependent`, `SPIRV`,
-  `SPIRV-Tools-opt` and `SPIRV-Tools`. Additional archive directories can be
-  supplied via `WAYLAND_MCP_SHADERC_ARCHIVE_DIRS` (colon-separated on Linux).
+- Shaderc development headers (the `shaderc` package on Arch Linux);
+- CMake and a native build tool (Ninja or Make) to build the bundled Shaderc,
+  glslang and SPIRV-Tools sources. Python is also used by that build.
 
 Runtime requirements:
 
@@ -40,8 +39,14 @@ Runtime requirements:
 Distribution package names vary. Common packages are `libxkbcommon-dev` and
 `libvulkan-dev` on Debian-family systems, `libxkbcommon-devel` and
 `vulkan-loader-devel` on Fedora, and `libxkbcommon`, `vulkan-headers`, and
-`vulkan-loader` on Arch Linux. Compiler/runtime commands are resolved on PATH. Static archives are searched
-in `/usr/lib`, `/usr/local/lib`, `.private/compiler-lib` and configured directories.
+`vulkan-loader` on Arch Linux. On Arch, install `shaderc`, `cmake`, and `ninja`
+alongside the other build dependencies. Compiler/runtime commands are resolved
+on PATH. Cargo builds the compiler dependencies from the versions pinned in
+Cargo.lock and statically links them; distribution-provided compiler archives
+and private workspace files are not required. The first build takes longer
+because it also compiles these dependencies.
+The project limits Cargo's default build concurrency to two jobs to keep the
+native compiler build within a reasonable memory budget.
 
 ## Build and validation
 
@@ -285,8 +290,8 @@ unique strings of at most 64 bytes. `maxFps` is 1–120, `durationMs` is
 Shaderc and its compiler dependencies are statically linked as archives. GLSL
 source submitted through the console compiles entirely in memory; filesystem
 includes, shader files, SPIR-V uploads and runtime compiler plugins are absent.
-The fixed kernel is compiled into an embedded array by a statically linked build
-tool. Supply missing archive directories through `WAYLAND_MCP_SHADERC_ARCHIVE_DIRS`.
+The fixed kernel is compiled into an embedded array by the Cargo build script,
+using the same pinned, statically linked compiler as the runtime.
 
 Contexts are retained per DRM device (primary/render nodes are canonicalized),
 each with its own Vulkan instance,
@@ -423,19 +428,24 @@ checks cross-VM ArrayBuffer packing and callback decoding. Run
 to check that failed captures create no image files and the memory-only API is advertised.
 
 Native probes live in `tests/visual_program`. Configure CMake with
-`BASELINE_HEADER_DIR` pointing to Cargo's generated `visual_spirv.h` directory;
-provide static compiler archive directories via `CMAKE_LIBRARY_PATH` if needed.
+`BASELINE_HEADER_DIR` pointing to Cargo's generated `visual_spirv.h` directory
+and `SHADERC_ARCHIVE` pointing to Cargo's complete
+`target/release/build/shaderc-sys-*/out/lib/libshaderc_combined.a`. Select the
+archive from the current build when more than one build directory exists.
 Both Cargo and CMake enforce C++26, `-fno-exceptions`, `-fno-rtti`,
 `-Wall -Wextra -Wpedantic -Werror -Wold-style-cast` without warning suppressions
 for project-owned C++. Cargo respects `CXX`; CMake accepts
-`CMAKE_CXX_COMPILER=g++` or `clang++`. Supplied third-party compiler archives
-are linked as provided; these flags do not rebuild or instrument those archives.
-For GCC static analysis, configure a separate CMake build with
+`CMAKE_CXX_COMPILER=g++` or `clang++`. Third-party compiler sources use their
+upstream build flags; project warning and sanitizer flags do not rebuild or
+instrument the bundled compiler archive.
+Run native configurations sequentially with `cmake --build ... --parallel 2`
+and remove temporary probe artifacts after validation.
+For GCC static analysis, configure the CMake build with
 `CMAKE_CXX_COMPILER=g++` and `CMAKE_CXX_FLAGS="-fanalyzer"`, then build all targets.
-For native sanitizers, configure a separate CMake build with
+For native sanitizers, configure the CMake build with
 `CMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"` and run
 the compiler, runtime, normalization, and edge probes. Leak detection remains
-enabled. A separate build with `-fsanitize=thread -fno-omit-frame-pointer` runs
+enabled. A configuration with `-fsanitize=thread -fno-omit-frame-pointer` runs
 `concurrency_probe`: compilation/destruction overlaps 200 GPU submissions on
 one context.
 

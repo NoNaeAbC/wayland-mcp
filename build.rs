@@ -2,19 +2,45 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn compiler_archives() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/usr/lib"),
-        PathBuf::from("/usr/local/lib"),
-        PathBuf::from(".private/compiler-lib"),
-    ];
-    if let Some(paths) = env::var_os("WAYLAND_MCP_SHADERC_ARCHIVE_DIRS") {
-        dirs.extend(env::split_paths(&paths));
+fn compile_baseline(output: &std::path::Path) {
+    let color_header = std::fs::read_to_string("src/visual_color_shader.h")
+        .expect("read shared color shader source");
+    let color = color_header
+        .split_once("R\"GLSL(")
+        .and_then(|(_, rest)| rest.split_once(")GLSL\";"))
+        .map(|(source, _)| source)
+        .expect("shared color shader must use the GLSL raw-string delimiter");
+    let source = std::fs::read_to_string("src/visual.comp")
+        .expect("read baseline shader source")
+        .replace("// VISUAL_COLOR_GLSL", color);
+    let compiler = shaderc::Compiler::new().expect("initialize static Shaderc compiler");
+    let mut options = shaderc::CompileOptions::new().expect("initialize compiler options");
+    options.set_source_language(shaderc::SourceLanguage::GLSL);
+    options.set_target_env(
+        shaderc::TargetEnv::Vulkan,
+        shaderc::EnvVersion::Vulkan1_1 as u32,
+    );
+    options.set_optimization_level(shaderc::OptimizationLevel::Performance);
+    let spirv = compiler
+        .compile_into_spirv(
+            &source,
+            shaderc::ShaderKind::Compute,
+            "submitted-program",
+            "main",
+            Some(&options),
+        )
+        .expect("compile embedded baseline shader");
+    let words = spirv.as_binary();
+    let mut header = format!(
+        "#pragma once\n#include <array>\n#include <cstdint>\ninline constexpr std::array<std::uint32_t,{}> visual_spirv{{\n",
+        words.len()
+    );
+    for word in words {
+        use std::fmt::Write as _;
+        writeln!(header, "    0x{word:x},").expect("format SPIR-V word");
     }
-    ["shaderc_combined", "glslang", "MachineIndependent", "GenericCodeGen", "OSDependent", "SPIRV", "SPIRV-Tools-opt", "SPIRV-Tools"].into_iter().map(|name| {
-        let archive = format!("lib{name}.a");
-        dirs.iter().map(|dir| dir.join(&archive)).find(|file| file.is_file()).unwrap_or_else(|| panic!("static compiler archive {archive} required; provide its directory in WAYLAND_MCP_SHADERC_ARCHIVE_DIRS"))
-    }).collect()
+    header.push_str("};\n");
+    std::fs::write(output.join("visual_spirv.h"), header).expect("write embedded shader header");
 }
 
 fn main() {
@@ -33,12 +59,7 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={file}");
     }
-    println!("cargo:rerun-if-env-changed=WAYLAND_MCP_SHADERC_ARCHIVE_DIRS");
     let gpu_out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let archives = compiler_archives();
-    for archive in &archives {
-        println!("cargo:rerun-if-changed={}", archive.display());
-    }
     println!("cargo:rerun-if-env-changed=CXX");
     let native_cxx = env::var_os("CXX").unwrap_or_else(|| "g++".into());
     let native_flags = [
@@ -52,26 +73,7 @@ fn main() {
         "-Wold-style-cast",
     ];
 
-    let mut compiler = Command::new(&native_cxx);
-    compiler.args(native_flags).args([
-        "-O2",
-        "tools/compile_visual.cpp",
-        "src/shader_compiler.cpp",
-        "-Wl,--start-group",
-    ]);
-    compiler
-        .args(&archives)
-        .args(["-Wl,--end-group", "-lpthread", "-o"])
-        .arg(gpu_out.join("compile_visual"));
-    assert!(compiler.status().expect("C++ compiler required").success());
-    assert!(
-        Command::new(gpu_out.join("compile_visual"))
-            .arg("src/visual.comp")
-            .arg(gpu_out.join("visual_spirv.h"))
-            .status()
-            .expect("statically linked build compiler required")
-            .success()
-    );
+    compile_baseline(&gpu_out);
     assert!(
         Command::new(&native_cxx)
             .args(native_flags)
@@ -105,14 +107,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", gpu_out.display());
     println!("cargo:rustc-link-lib=static=visual_gpu");
     println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
-    for archive in &archives {
-        println!(
-            "cargo:rustc-link-arg={}",
-            std::fs::canonicalize(archive).unwrap().display()
-        );
-    }
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
     println!("cargo:rerun-if-changed=scripts/generate_wayland_protocols.py");
     println!("cargo:rerun-if-env-changed=PYTHON");
 

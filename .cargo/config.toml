@@ -1,0 +1,4 @@
+[build]
+# Shaderc's native compiler build is memory-intensive. Keep the default
+# jobserver budget bounded so builds leave room for the desktop and browser.
+jobs = 2
