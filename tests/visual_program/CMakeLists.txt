@@ -5,16 +5,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic -Werror -Wold-style-cast)
 
-# Compiler dependencies MUST be archives. Never fall back to shared libraries.
-set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
-foreach(name shaderc_combined glslang MachineIndependent GenericCodeGen OSDependent SPIRV SPIRV-Tools-opt SPIRV-Tools)
-  string(MAKE_C_IDENTIFIER "${name}" key)
-  find_library(ARCHIVE_${key} NAMES ${name} REQUIRED)
-  list(APPEND COMPILER_ARCHIVES "${ARCHIVE_${key}}")
-endforeach()
+# Use Cargo's complete bundled compiler, not a mixture of system versions.
+set(SHADERC_ARCHIVE "" CACHE FILEPATH "Cargo-built libshaderc_combined.a")
+if(NOT EXISTS "${SHADERC_ARCHIVE}" OR NOT SHADERC_ARCHIVE MATCHES "\\.a$")
+  message(FATAL_ERROR "Set SHADERC_ARCHIVE to Cargo's shaderc-sys OUT_DIR/lib/libshaderc_combined.a")
+endif()
 add_library(visual_compiler STATIC ../../src/shader_compiler.cpp)
 target_include_directories(visual_compiler PUBLIC ../../src)
-target_link_libraries(visual_compiler PUBLIC -Wl,--start-group ${COMPILER_ARCHIVES} -Wl,--end-group pthread)
+target_link_libraries(visual_compiler PUBLIC "${SHADERC_ARCHIVE}" pthread)
 add_executable(compiler_probe compiler_probe.cpp)
 target_link_libraries(compiler_probe PRIVATE visual_compiler)
 

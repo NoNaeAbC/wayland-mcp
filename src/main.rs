@@ -15,6 +15,10 @@ mod wayland_policy;
 mod wayland_protocol_registry;
 mod wayland_writer;
 
+// Carry Shaderc's bundled static native library into the final link. Its C API
+// is called by shader_compiler.cpp rather than by Rust.
+use shaderc_sys as _;
+
 use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io::Write;
