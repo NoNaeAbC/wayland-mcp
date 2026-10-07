@@ -19,6 +19,7 @@ struct Source {
 struct Device {
     seat: u32,
     selected_host: Option<u32>,
+    ready: bool,
 }
 #[derive(Default)]
 pub(super) struct Clipboard {
@@ -56,17 +57,18 @@ impl Clipboard {
         seat: u32,
         origin: Origin,
     ) -> Result<(), String> {
-        if self.origin(client, seat) == origin {
-            return Ok(());
-        }
+        let changed = self.origin(client, seat) != origin;
         self.origins.insert((client, seat), origin);
         let devices = self
             .devices
             .iter()
-            .filter(|((owner, _), device)| *owner == client && device.seat == seat)
+            .filter(|((owner, _), device)| {
+                *owner == client && device.seat == seat && (changed || !device.ready)
+            })
             .map(|(object, _)| *object)
             .collect::<Vec<_>>();
         for device in devices {
+            self.devices.get_mut(&device).unwrap().ready = true;
             self.notify(sessions, device)?;
         }
         Ok(())
@@ -115,6 +117,12 @@ impl Clipboard {
             .get(&device)
             .ok_or("clipboard device disappeared")?
             .clone();
+        // Binding a data device is not keyboard/input focus. In particular, Qt
+        // installs its listener before QGuiApplication's platform integration
+        // exists; unsolicited selection events during that roundtrip crash it.
+        if !info.ready {
+            return Ok(());
+        }
         let mimes = if self.origin(device.0, info.seat) == Origin::Human {
             info.selected_host
                 .and_then(|offer| self.host_mimes.get(&(device.0, offer)))
@@ -247,9 +255,9 @@ impl Clipboard {
                     Device {
                         seat: global,
                         selected_host: None,
+                        ready: false,
                     },
                 );
-                self.notify(sessions, (client, *id))?;
                 Ok(false)
             }
             Some(GeneratedHookRequest::WlDataSourceOffer {
@@ -721,6 +729,22 @@ mod tests {
                 vec![],
             )?;
             assert_eq!(next(host).bytes, encode_u32_message(2, 1, &[4, 3]));
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe {
+                    libc::recv(
+                        events.as_raw_fd(),
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                },
+                -1,
+                "no selection event before trusted focus/input"
+            );
+            server
+                .clipboard
+                .switch(&mut server.sessions, client, 7, Origin::Model)?;
             assert_eq!(next(events).bytes, encode_u32_message(4, 5, &[0]));
         }
         request(&mut server, owner, encode_u32_message(2, 0, &[5]), vec![])?;
@@ -840,6 +864,9 @@ mod tests {
             vec![],
         )?;
         let _ = next(&host);
+        server
+            .clipboard
+            .switch(&mut server.sessions, client, 7, Origin::Model)?;
         let _ = next(&events);
         request(&mut server, client, encode_u32_message(2, 0, &[5]), vec![])?;
         request(

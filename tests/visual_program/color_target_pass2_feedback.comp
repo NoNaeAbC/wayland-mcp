@@ -1,0 +1,100 @@
+#version 450
+// Pass 2 variant for automatic result feedback. Binding 2 is the previous
+// 32-byte result/state record; binding 5 is the current result record. The
+// framework copies result to the next ping-pong state buffer after completion.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 2, std430) readonly buffer PreviousResult {
+	uint flags;
+	uint minX;
+	uint minY;
+	uint maxX;
+	uint maxY;
+	uint sequence;
+	uint reserved0;
+	uint reserved1;
+}
+previousResult;
+
+layout(set = 0, binding = 4, std430) readonly buffer Scratch {
+	uint matchCount;
+	uint inverseMinX;
+	uint inverseMinY;
+	uint maxX;
+	uint maxY;
+	uint changedCount;
+	uint reserved0;
+	uint reserved1;
+}
+scratch;
+
+layout(set = 0, binding = 5, std430) buffer Result {
+	uint flags;
+	uint minX;
+	uint minY;
+	uint maxX;
+	uint maxY;
+	uint sequence;
+	uint reserved0;
+	uint reserved1;
+}
+result;
+
+layout(set = 0, binding = 6, std430) readonly buffer Parameters {
+	vec4  targetLow;
+	vec4  targetHigh;
+	uvec4 roi;
+	uint  minPixels;
+	uint  reserved0;
+	uint  reserved1;
+	uint  reserved2;
+}
+params;
+
+layout(push_constant) uniform FrameInfo {
+	uint frameWidth;
+	uint frameHeight;
+	uint sequence;
+	uint historyValid;
+}
+frameInfo;
+
+const uint FLAG_PRESENT       = 1u << 0;
+const uint FLAG_ENTERED       = 1u << 1;
+const uint FLAG_EXITED        = 1u << 2;
+const uint FLAG_MASK_CHANGED  = 1u << 3;
+const uint FLAG_HISTORY_VALID = 1u << 4;
+
+void main() {
+	bool present    = scratch.matchCount >= max(params.minPixels, 1u);
+	bool valid      = frameInfo.historyValid != 0u;
+	bool wasPresent = (previousResult.flags & FLAG_PRESENT) != 0u;
+	uint flags      = 0u;
+
+	if (present) {
+		flags |= FLAG_PRESENT;
+	}
+	if (valid) {
+		flags |= FLAG_HISTORY_VALID;
+		if (present && !wasPresent) {
+			flags |= FLAG_ENTERED;
+		}
+		if (!present && wasPresent) {
+			flags |= FLAG_EXITED;
+		}
+		if (scratch.changedCount != 0u) {
+			flags |= FLAG_MASK_CHANGED;
+		}
+	}
+
+	// Every field is overwritten. Result ping-pongs as state; the framework
+	// copies this output into the next feedback slot only after completion.
+	result.flags     = flags;
+	result.minX      = present ? frameInfo.frameWidth - 1u - scratch.inverseMinX : 0u;
+	result.minY      = present ? frameInfo.frameHeight - 1u - scratch.inverseMinY : 0u;
+	result.maxX      = present ? scratch.maxX : 0u;
+	result.maxY      = present ? scratch.maxY : 0u;
+	result.sequence  = frameInfo.sequence;
+	result.reserved0 = 0u;
+	result.reserved1 = 0u;
+}

@@ -1,0 +1,57 @@
+#version 450
+// Validate canonical source colors after the trusted GPU normalizer has
+// produced a linear-BT.2020, straight-alpha RGBA16F image.
+// Result readback contains only checked/error bitmasks and a sequence number.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D normalizedFrame;
+
+layout(set = 0, binding = 5, std430) buffer Result {
+	uint failedMask;
+	uint checkedMask;
+	uint sequence;
+	uint reserved;
+}
+result;
+
+struct Reference {
+	uvec4 coordAndBit; // x, y, bit index (must equal array index), reserved
+	vec4  expectedLow; // Inclusive normalized linear-BT.2020 RGBA bounds
+	vec4  expectedHigh;
+};
+
+layout(set = 0, binding = 6, std430) readonly buffer Parameters {
+	uvec4     metadata; // testCount, imageWidth, imageHeight, sequence
+	Reference references[];
+}
+params;
+
+void main() {
+	uint index     = gl_GlobalInvocationID.x;
+	uint testCount = min(params.metadata.x, 32u);
+	if (index >= testCount) {
+		return;
+	}
+
+	Reference expected        = params.references[index];
+	uint      bit             = 1u << index;
+	uvec2     pixel           = expected.coordAndBit.xy;
+	uvec2     actualExtent    = uvec2(imageSize(normalizedFrame));
+	bool      dimensionsMatch = actualExtent.x == params.metadata.y && actualExtent.y == params.metadata.z;
+	bool      inside          = dimensionsMatch && pixel.x < params.metadata.y && pixel.y < params.metadata.z;
+	bool      matches         = false;
+	if (inside) {
+		vec4 actual = imageLoad(normalizedFrame, ivec2(pixel));
+		matches     = all(greaterThanEqual(actual, expected.expectedLow)) &&
+					  all(lessThanEqual(actual, expected.expectedHigh));
+	}
+
+	atomicOr(result.checkedMask, bit);
+	if (!dimensionsMatch || !inside || !matches || expected.coordAndBit.z != index) {
+		atomicOr(result.failedMask, bit);
+	}
+	if (index == 0u) {
+		result.sequence = params.metadata.w;
+		result.reserved = 0u;
+	}
+}

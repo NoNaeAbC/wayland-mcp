@@ -10,6 +10,7 @@ mod console_runtime;
 mod gui_xkb;
 mod input_events;
 mod js_console;
+mod visual_events;
 mod wayland_policy;
 mod wayland_protocol_registry;
 mod wayland_writer;
@@ -54,7 +55,6 @@ struct WaylandMcp {
 pub(crate) struct ArtifactStore {
     directory: PathBuf,
     secure_directory: bool,
-    next_id: AtomicU64,
     event_log_lock: Mutex<()>,
 }
 
@@ -105,11 +105,17 @@ impl WaylandMcp {
                 let mut image_content = Vec::new();
                 let mut image_metadata = Vec::new();
                 for image in output.images {
+                    let buffer_coordinates = image
+                        .color
+                        .as_ref()
+                        .and_then(|color| color.get("coordinate_space"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("buffer");
                     let (returned, mut metadata) = match bounded_png_preview(&image.bytes) {
                         Some((bytes, full_width, full_height, preview_width, preview_height)) => (
                             bytes,
                             json!({
-                                "path": image.path,
+                                "storage": "memory",
                                 "full": {"width":full_width, "height":full_height},
                                 "embedded_preview": {"width":preview_width, "height":preview_height},
                                 "preview_to_full_scale": {
@@ -126,7 +132,7 @@ impl WaylandMcp {
                             (
                                 image.bytes.clone(),
                                 json!({
-                                    "path": image.path,
+                                    "storage": "memory",
                                     "full": {"width":dimensions.0, "height":dimensions.1},
                                     "embedded_preview": {"width":dimensions.0, "height":dimensions.1},
                                     "preview_to_full_scale": {"x":1.0, "y":1.0},
@@ -136,6 +142,14 @@ impl WaylandMcp {
                         }
                     };
                     metadata["color"] = image.color.unwrap_or(serde_json::Value::Null);
+                    if buffer_coordinates {
+                        metadata["coordinateSpace"] = json!("buffer");
+                        metadata["coordinate_space"] = json!(
+                            "Raw committed-buffer pixels match GLSL image coordinates. Multiply preview coordinates by preview_to_full_scale. Input helpers use window coordinates; keyboard input needs no conversion."
+                        );
+                    } else {
+                        metadata["coordinateSpace"] = json!("window");
+                    }
                     image_metadata.push(metadata);
                     image_content.push(Content::image(
                         BASE64_STANDARD.encode(returned),
@@ -181,7 +195,6 @@ impl ArtifactStore {
         let store = Self {
             directory,
             secure_directory,
-            next_id: AtomicU64::new(1),
             event_log_lock: Mutex::new(()),
         };
         if let Err(err) = store.ensure_directory() {
@@ -250,46 +263,6 @@ impl ArtifactStore {
             eprintln!("wayland-mcp: failed to append {}: {err}", path.display());
         }
     }
-
-    pub(crate) fn save_png(
-        &self,
-        operation: &str,
-        window_id: Option<&str>,
-        bytes: &[u8],
-    ) -> Result<PathBuf, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let window = sanitize_filename(window_id.unwrap_or("auto"));
-        let path = self
-            .directory
-            .join(format!("{id:06}-{operation}-{window}.png"));
-        self.ensure_directory().map_err(|err| {
-            format!(
-                "failed to prepare artifact directory {}: {err}",
-                self.directory.display()
-            )
-        })?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        options
-            .open(&path)
-            .and_then(|mut file| file.write_all(bytes))
-            .map_err(|err| format!("failed to retain screenshot {}: {err}", path.display()))?;
-        self.record(
-            "frame_saved",
-            json!({
-                "operation": operation,
-                "window_id": window_id,
-                "path": path,
-                "byte_length": bytes.len(),
-            }),
-        );
-        Ok(path)
-    }
 }
 
 fn unix_time_ms() -> u128 {
@@ -299,24 +272,10 @@ fn unix_time_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn sanitize_filename(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(80)
-        .collect()
-}
-
 impl ServerHandler for WaylandMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "This server intentionally advertises one persistent graphics tool: gui_console. Evaluate JavaScript with the required code field; variables and globalThis function definitions survive calls. Begin with `return wayland.help`, which documents supported click/drag/scroll/key/shortcut/text/wait helpers and the raw wl_pointer/wl_keyboard event shapes. Use wayland.environment/diagnostics/windows/screenshot/captureNextFrame for observation. Complete PNGs and JSONL traces are retained at returned paths. A delivered event is not proof the application accepted it. Launch the GUI as a live foreground process session when the caller reaps detached `&`/nohup jobs. This MCP cannot configure the caller sandbox; native-GPU applications may require caller-granted access to the returned Unix socket and /dev/dri/renderD*. Request the caller's supported permission if launch diagnostics show those resources are blocked; do not silently switch to software rendering. This MCP is for graphics/input diagnostics, not DOM automation."
+            "This server intentionally advertises one persistent graphics tool: gui_console. Evaluate JavaScript with the required code field; variables and globalThis function definitions survive calls. Begin with `return wayland.help`, which documents supported click/drag/scroll/key/shortcut/text/wait helpers and the raw wl_pointer/wl_keyboard event shapes. Use wayland.environment/diagnostics/windows for metadata, screenshot/captureNextFrame for explicit in-memory visual bootstrap, and onVisualProgram/onVisual for continuous GPU analysis with bounded results. Images are retained only in memory; no image files or paths are created. New captures automatically evict the oldest handles when the 16-image/32 MiB cache fills; manual disposal is optional. Agent GLSL compiles in memory with statically linked Shaderc. A delivered event is not proof the application accepted it. Launch the GUI as a live foreground process session when the caller reaps detached &/nohup jobs. This MCP cannot configure the caller sandbox; native-GPU applications may require caller-granted access to the returned Unix socket and /dev/dri/renderD*. Request the caller's supported permission if launch diagnostics show those resources are blocked; do not silently switch to software rendering. This MCP is for graphics/input diagnostics, not DOM automation."
         )
     }
 
@@ -394,7 +353,7 @@ fn tool_error(message: String) -> CallToolResult {
 fn tool_inventory() -> Vec<Tool> {
     vec![tool(
         "gui_console",
-        "Persistent JavaScript Wayland graphics console. Pass code; state and globalThis function definitions survive calls. First evaluate `return wayland.help` for the exact API. Supported helpers cover click, drag, scroll, named keys, keymap-aware shortcuts and text, window discovery, and action/commit waits; raw pointerEvent and keyboardEvent calls remain available. Coordinates come from returned screenshots and are never silently clamped. Native GPU apps need caller-granted access to the returned Unix socket and /dev/dri/renderD*; request caller-supported permission if blocked, never silently substitute software rendering.",
+        "Persistent JavaScript Wayland graphics console. Pass code; state and globalThis function definitions survive calls. First evaluate `return wayland.help` for the exact API. Supported helpers cover click, drag, scroll, named keys, keymap-aware shortcuts and text, window discovery, and action/commit waits; raw pointerEvent and keyboardEvent calls remain available. Explicit screenshot/captureNextFrame calls require windowId and return disposable in-memory image handles; foreground captures attach images to the MCP response. No image files or paths are created. screenshot({windowId,coordinateSpace:'buffer'}) uses native buffer coordinates for GLSL bootstrap. presentImage/disposeImage manage retained images. onVisualProgram accepts agent-written GLSL compiled in memory with statically linked Shaderc, runs Vulkan on the DMA-BUF-affine DRM device, and passes bounded result buffers to JS callbacks. Continuous current/optional previous frames stay on GPU as FP16 linear BT.2020. onVisual fixed rules also remain available. Shader files/plugins are unsupported. Native GPU apps need caller-granted access to the returned Unix socket and /dev/dri/renderD*; request caller-supported permission if blocked, never silently substitute software rendering.",
         json!({
             "type": "object",
             "properties": {
@@ -462,13 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn artifact_store_recreates_missing_directory_for_events_and_pngs() {
+    fn artifact_store_recreates_missing_directory_for_events() {
         let temporary = tempfile::tempdir().expect("create temporary directory");
         let directory = temporary.path().join("artifacts");
         let store = ArtifactStore {
             directory: directory.clone(),
             secure_directory: true,
-            next_id: AtomicU64::new(1),
             event_log_lock: Mutex::new(()),
         };
 
@@ -479,14 +437,6 @@ mod tests {
             .expect("event log should be recreated");
         assert!(events.contains("directory_recreated"));
 
-        std::fs::remove_dir_all(&directory).expect("remove artifact directory again");
-        let png = store
-            .save_png("test", Some("window/1"), b"png bytes")
-            .expect("PNG write should recreate the artifact directory");
-        assert_eq!(
-            std::fs::read(&png).expect("read retained PNG"),
-            b"png bytes"
-        );
         assert!(directory.join("events.jsonl").is_file());
 
         #[cfg(unix)]

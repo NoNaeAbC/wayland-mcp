@@ -1,0 +1,101 @@
+#version 450
+// Trusted event processor. No agent shader code, samples, counts or hashes leave GPU.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Pixels { uint rgba[]; }
+raw;
+layout(set = 0, binding = 1, std430) buffer History { vec4 previous[]; };
+struct Rule {
+	uint  offset;
+	uint  width;
+	uint  height;
+	uint  kind;
+	float threshold;
+	uint  minimum;
+	uint  above;
+	uint  debounce;
+	uint  cooldown;
+};
+layout(set = 0, binding = 2, std430) readonly buffer Rules { Rule rules[]; };
+struct State {
+	uint initialized;
+	uint occupied;
+	uint candidate;
+	uint stable;
+	uint frame;
+	uint lastEvent;
+};
+layout(set = 0, binding = 3, std430) buffer States { State states[]; };
+layout(set = 0, binding = 4, std430) buffer Events {
+	uint  count;
+	uint  padding[3];
+	uvec4 events[];
+};
+layout(push_constant) uniform Push { uint format; }
+pc;
+#define COLOR_BINDING 5
+// VISUAL_COLOR_GLSL
+shared uint votes[64];
+void        main() {
+	uint r = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+	Rule rule = rules[r];
+	uint n = rule.width * rule.height, found = 0;
+	for (uint i = lane; i < n; i += 64) {
+		uint words = (pc.format == 0x48344258u || pc.format == 0x48344241u) ? 2u : 1u;
+		vec4 p     = normalizeSource(unpackSource(rule.offset * 2u + i * words, pc.format));
+		vec3 c     = p.rgb;
+		bool hit;
+		if (rule.kind == 0u) {
+			float y = dot(c, vec3(0.2627002, 0.6779981, 0.0593017));
+			hit     = rule.above != 0u ? y >= rule.threshold : y <= rule.threshold;
+		} else {
+			vec3 difference = abs(c - previous[rule.offset + i].rgb);
+			hit             = max(max(difference.x, difference.y), difference.z) >= rule.threshold;
+		}
+		if (hit) {
+			found++;
+		}
+		previous[rule.offset + i] = p;
+	}
+	votes[lane] = found;
+	barrier();
+	for (uint stride = 32; stride > 0; stride /= 2) {
+		if (lane < stride) {
+			votes[lane] += votes[lane + stride];
+		}
+		barrier();
+	}
+	if (lane != 0) {
+		return;
+	}
+	State s = states[r];
+	s.frame++;
+	uint occupied = uint(votes[0] >= rule.minimum);
+	if (s.initialized == 0u) {
+		s.initialized = 1u;
+		s.candidate   = occupied;
+		s.stable      = 1u;
+		// Difference history needs a baseline; luminance publishes initial state.
+		if (rule.kind == 1u) {
+			s.candidate = 0u;
+			s.stable    = 0u;
+			states[r]   = s;
+			return;
+		}
+	} else if (s.candidate == occupied) {
+		s.stable++;
+	} else {
+		s.candidate = occupied;
+		s.stable    = 1u;
+	}
+	bool ready = s.stable >= rule.debounce && s.frame - s.lastEvent >= rule.cooldown;
+	bool emit  = rule.kind == 0u ? (s.lastEvent == 0u || occupied != s.occupied) : occupied != 0u;
+	if (ready && emit) {
+		uint slot = atomicAdd(count, 1u);
+		if (slot < 16u) {
+			events[slot] = uvec4(r, occupied, s.frame, 0u);
+		}
+		s.occupied  = occupied;
+		s.lastEvent = s.frame;
+	}
+	states[r] = s;
+}

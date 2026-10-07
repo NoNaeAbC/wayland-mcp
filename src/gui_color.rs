@@ -216,7 +216,7 @@ fn custom_primary_conversion(xy: [i32; 8]) -> Result<PrimaryConversion, String> 
     Ok((matrix, weights))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ColorDescription {
     tf: u32,
     primaries: u32,
@@ -227,7 +227,124 @@ pub(crate) struct ColorDescription {
     extended: bool,
 }
 
+/// std430 layout shared with the trusted GPU normalizer. This is metadata only.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GpuColorProfile {
+    pub transfer: u32,
+    pub alpha_mode: u32,
+    pub power: f32,
+    pub minimum: f32,
+    pub maximum: f32,
+    pub reference: f32,
+    pub reserved: [u32; 2],
+    pub matrix: [[f32; 4]; 3],
+    pub weights: [f32; 4],
+}
+
 impl ColorDescription {
+    pub(crate) fn source_metadata(&self) -> serde_json::Value {
+        let mut metadata = self.metadata();
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key.starts_with("source_"));
+        metadata
+    }
+
+    pub(crate) fn visual_assumption(value: &serde_json::Value) -> Result<Self, String> {
+        let fields = value.as_object().ok_or("sourceColor must be an object")?;
+        if fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "transfer" | "primaries" | "alpha" | "luminances"
+            )
+        }) {
+            return Err("unknown sourceColor field".into());
+        }
+        let transfer = value
+            .get("transfer")
+            .ok_or("sourceColor requires transfer")?;
+        let primaries = value
+            .get("primaries")
+            .ok_or("sourceColor requires primaries")?;
+        let tf = match transfer.as_str() {
+            Some("srgb") => 14,
+            Some("linear") => 5,
+            Some("pq") => 11,
+            Some("hlg") => 13,
+            Some("bt1886") => 1,
+            Some("gamma22") => 2,
+            Some("gamma28") => 3,
+            _ => transfer
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or("unknown source transfer; use a named transfer or Wayland transfer ID")?,
+        };
+        let primary = match primaries.as_str() {
+            Some("bt709") | Some("srgb") => 1,
+            Some("bt2020") => 6,
+            Some("display-p3") => 9,
+            Some("adobe-rgb") => 10,
+            _ => primaries
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or("unknown source primaries; use named primaries or Wayland primaries ID")?,
+        };
+        let mut color = Self {
+            tf,
+            primaries: primary,
+            luminances: Some((0.0, 1.0, 1.0)),
+            ..Default::default()
+        };
+        if matches!(tf, 1 | 11 | 13) {
+            color.luminances = None;
+        }
+        if let Some(levels) = value.get("luminances") {
+            color.luminances = Some(
+                serde_json::from_value(levels.clone())
+                    .map_err(|e| format!("sourceColor luminances: {e}"))?,
+            );
+        }
+        color.validate()?;
+        Ok(color)
+    }
+
+    pub(crate) fn gpu_profile(&self, alpha_mode: u32) -> Result<GpuColorProfile, String> {
+        self.validate()?;
+        let (matrix, weights) = match &self.custom_conversion {
+            Some(Ok(conversion)) => *conversion,
+            Some(Err(error)) => return Err(error.clone()),
+            None => primary_conversion(self.primaries),
+        };
+        let srgb_to_bt2020 = [
+            [0.6274039, 0.32928303, 0.043313067],
+            [0.06909729, 0.9195404, 0.011362316],
+            [0.01639144, 0.08801331, 0.89559525],
+        ];
+        let matrix = std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                if j == 3 {
+                    0.0
+                } else {
+                    (0..3).map(|k| srgb_to_bt2020[i][k] * matrix[k][j]).sum()
+                }
+            })
+        });
+        let (minimum, maximum, reference) = self.levels();
+        Ok(GpuColorProfile {
+            transfer: self.tf,
+            alpha_mode,
+            power: self.power.map_or(0.0, |v| v as f32 / 10000.0),
+            minimum,
+            maximum,
+            reference,
+            reserved: [0; 2],
+            matrix,
+            weights: [weights[0], weights[1], weights[2], 0.0],
+        })
+    }
+
     pub(crate) fn metadata(&self) -> serde_json::Value {
         let (min, max, reference) = self.levels();
         let hdr = self.is_hdr();
@@ -485,6 +602,48 @@ pub(crate) fn quantize(v: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_profile_preserves_bt2020_identity_custom_primaries_and_std430_layout() {
+        assert_eq!(std::mem::size_of::<GpuColorProfile>(), 96);
+        assert_eq!(std::mem::offset_of!(GpuColorProfile, matrix), 32);
+        assert_eq!(std::mem::offset_of!(GpuColorProfile, weights), 80);
+        let color = ColorDescription::visual_assumption(&serde_json::json!({
+            "transfer":"linear", "primaries":"bt2020", "luminances":[0.0,1000.0,203.0]
+        }))
+        .unwrap();
+        let profile = color.gpu_profile(2).unwrap();
+        assert_eq!((profile.transfer, profile.alpha_mode), (5, 2));
+        assert_eq!((profile.maximum, profile.reference), (1000.0, 203.0));
+        for (i, row) in profile.matrix.iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                assert!((value - f32::from(i == j)).abs() < 1e-6);
+            }
+        }
+        let xy = NAMED_PRIMARIES[5];
+        let custom = ColorDescription {
+            primaries: 0,
+            chromaticities: Some(xy),
+            custom_conversion: Some(custom_primary_conversion(xy)),
+            ..color
+        }
+        .gpu_profile(2)
+        .unwrap();
+        for (a, b) in custom
+            .matrix
+            .iter()
+            .flatten()
+            .zip(profile.matrix.iter().flatten())
+        {
+            assert!((a - b).abs() < 1e-6);
+        }
+        assert!(
+            ColorDescription::visual_assumption(
+                &serde_json::json!({"transfer":"pq","primaries":"bt2020"})
+            )
+            .is_ok()
+        );
+        assert!(ColorDescription::visual_assumption(&serde_json::json!({"transfer":"linear","primaries":"bt2020","luminances":[0,1000,0]})).is_err());
+    }
     fn linear(primaries: u32, max: f32, reference: f32) -> ColorDescription {
         ColorDescription {
             tf: 5,

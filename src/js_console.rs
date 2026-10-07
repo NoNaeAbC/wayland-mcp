@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -19,6 +19,38 @@ const MAX_EVAL_CODE_BYTES: usize = 1_048_576;
 const DEFAULT_EVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_EVAL_TIMEOUT_MS: u64 = 1_000;
 const MAX_EVAL_TIMEOUT_MS: u64 = 900_000;
+const MAX_RETAINED_IMAGES: usize = 16;
+const MAX_RETAINED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct RetainedImages {
+    images: BTreeMap<u64, JsConsoleImage>,
+    bytes: usize,
+}
+
+impl RetainedImages {
+    fn insert(&mut self, id: u64, image: JsConsoleImage) -> Vec<u64> {
+        let mut evicted = Vec::new();
+        while self.images.len() >= MAX_RETAINED_IMAGES
+            || self.bytes + image.bytes.len() > MAX_RETAINED_IMAGE_BYTES
+        {
+            let Some((old_id, old_image)) = self.images.pop_first() else {
+                break;
+            };
+            self.bytes -= old_image.bytes.len();
+            evicted.push(old_id);
+        }
+        self.bytes += image.bytes.len();
+        self.images.insert(id, image);
+        evicted
+    }
+
+    fn remove(&mut self, id: u64) -> Option<JsConsoleImage> {
+        let image = self.images.remove(&id)?;
+        self.bytes -= image.bytes.len();
+        Some(image)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct JsConsole {
@@ -37,7 +69,6 @@ pub(crate) struct JsEvalOutput {
 pub(crate) struct JsConsoleImage {
     pub(crate) color: Option<Value>,
     pub(crate) bytes: Vec<u8>,
-    pub(crate) path: String,
 }
 
 enum ActorCommand {
@@ -142,6 +173,31 @@ struct NativeCompletion {
     result: Result<(Value, Option<JsConsoleImage>), String>,
 }
 
+// An unclaimed completion owns its hub registration. This also cleans up a
+// blocking compiler that finishes after its evaluation or runtime has ended.
+struct SubscriptionCompletion {
+    call_id: u64,
+    eval_id: u64,
+    subscription_id: Option<u64>,
+    backend: GuiBackendHandle,
+    result: Option<Result<crate::input_events::Subscription, String>>,
+}
+impl Drop for SubscriptionCompletion {
+    fn drop(&mut self) {
+        if let Some(Ok(subscription)) = &self.result {
+            if crate::visual_events::VisualHub::is_visual(subscription.id) {
+                if let GuiBackendHandle::Wayland(backend) = &self.backend {
+                    let _ = backend
+                        .visual_hub()
+                        .stop(subscription.id, "subscription_cancelled");
+                }
+            } else if let Some(hub) = self.backend.input_hub() {
+                let _ = hub.stop(subscription.id, "subscription_cancelled");
+            }
+        }
+    }
+}
+
 async fn run_node_session(
     commands: &mut mpsc::Receiver<ActorCommand>,
     backend: &GuiBackendHandle,
@@ -225,9 +281,16 @@ async fn run_node_session(
     let mut observations = tokio::task::JoinSet::new();
     let mut subscriptions = HashMap::<u64, tokio_util::sync::CancellationToken>::new();
     let mut streams = tokio::task::JoinSet::new();
+    let (stream_ends, mut ended_streams) = tokio::sync::mpsc::channel::<(u64, Value)>(64);
     let hub = backend.input_hub();
-    let mut retained_images = HashMap::<u64, JsConsoleImage>::new();
-    let mut retained_bytes = 0usize;
+    let visual_hub = match &backend {
+        GuiBackendHandle::Wayland(backend) => Some(backend.visual_hub()),
+        _ => None,
+    };
+    let (subscription_sender, mut subscription_completions) =
+        mpsc::channel::<SubscriptionCompletion>(32);
+    let mut pending_subscriptions = 0usize;
+    let mut retained_images = RetainedImages::default();
     let mut next_image = 0u64;
     let mut pending = HashMap::<u64, PendingEval>::new();
     let mut cancellation = tokio_util::sync::CancellationToken::new();
@@ -238,6 +301,17 @@ async fn run_node_session(
     let mut closed = false;
     let failure = loop {
         tokio::select! {
+            Some((id,end)) = ended_streams.recv() => {
+                if end.get("reason").and_then(Value::as_str) != Some("unsubscribed") {
+                    if let Some(token)=subscriptions.remove(&id) {token.cancel();}
+                    let revoked=active_calls.iter().filter_map(|(call,subscription)|(*subscription==Some(id)).then_some(*call)).collect::<Vec<_>>();
+                    for call in revoked {
+                        active_calls.remove(&call);
+                        let _=outgoing.try_send(json!({"type":"native_result","id":call,"ok":false,"error":"subscription ended; background authority revoked"}));
+                    }
+                }
+                if outgoing.try_send(json!({"type":"input_end","subscriptionId":id,"end":end})).is_err() {break "console output queue is full".into();}
+            }
             _ = observations.join_next(), if !observations.is_empty() => {}
             _ = streams.join_next(), if !streams.is_empty() => {}
             command = commands.recv() => {
@@ -254,6 +328,7 @@ async fn run_node_session(
                 }
             }
             _ = health.tick() => {
+                if let Some(visual) = &visual_hub { visual.expire(); }
                 let now = tokio::time::Instant::now();
                 if deadline.is_some_and(|deadline| now >= deadline) {
                     break format!("JavaScript evaluation exceeded {} ms", evaluation_timeout.as_millis());
@@ -268,6 +343,34 @@ async fn run_node_session(
                     other => format!("console input writer stopped: {other:?}"),
                 };
             }
+            Some(mut completion) = subscription_completions.recv() => {
+                pending_subscriptions -= 1;
+                let current = active_calls.remove(&completion.call_id).is_some()
+                    && (pending.contains_key(&completion.eval_id)
+                        || completion.subscription_id.is_some_and(|id| subscriptions.get(&id).is_some_and(|t| !t.is_cancelled())));
+                if !current { continue; }
+                match completion.result.take().expect("unclaimed subscription completion") {
+                    Ok(mut subscription) => {
+                        let id = subscription.id;
+                        subscriptions.insert(id, tokio_util::sync::CancellationToken::new());
+                        // Acknowledgement must precede even already buffered events.
+                        if outgoing.try_send(json!({"type":"native_result","id":completion.call_id,"ok":true,"value":{"id":id,"initialState":subscription.initial}})).is_err() { break "console output queue is full".into(); }
+                        let queue = outgoing.clone();
+                        let terminal = stream_ends.clone();
+                        streams.spawn(async move {
+                            while let Some(event) = subscription.events.recv().await {
+                                subscription.bytes.fetch_sub(event.bytes, std::sync::atomic::Ordering::Relaxed);
+                                if queue.send(json!({"type":"input_event","subscriptionId":id,"event":event.value})).await.is_err() { return; }
+                            }
+                            let end = subscription.end.borrow_and_update().clone().unwrap_or_else(|| json!({"reason":"closed"}));
+                            let _ = terminal.send((id,end)).await;
+                        });
+                    }
+                    Err(error) => {
+                        if outgoing.try_send(json!({"type":"native_result","id":completion.call_id,"ok":false,"error":error})).is_err() { break "console output queue is full".into(); }
+                    }
+                }
+            }
             completion = completions.recv() => {
                 if let Some(completion) = completion {
                     active_calls.remove(&completion.call_id);
@@ -275,17 +378,19 @@ async fn run_node_session(
                     let reply = match completion.result {
                         Ok((mut value, image)) => {
                             if let Some(image) = image {
+                                if image.bytes.len() > MAX_RETAINED_IMAGE_BYTES {
+                                    if outgoing.try_send(json!({"type":"native_result","id":completion.call_id,"ok":false,"error":"captured image exceeds the 32 MiB image size limit"})).is_err() { break "console output queue is full".into(); } continue;
+                                }
                                 if completion.subscription_id.is_none() && let Some(eval) = pending.get_mut(&completion.eval_id) {
                                     if eval.images.len() >= 16 || eval.images.iter().map(|image| image.bytes.len()).sum::<usize>() + image.bytes.len() > 32*1024*1024 {
                                         if outgoing.try_send(json!({"type":"native_result","id":completion.call_id,"ok":false,"error":"evaluation image budget exceeded"})).is_err() { break "console output queue is full".into(); } continue;
                                     }
-                                    eval.images.push(image);
-                                } else {
-                                    if retained_images.len() >= 16 || retained_bytes + image.bytes.len() > 32*1024*1024 {
-                                        if outgoing.try_send(json!({"type":"native_result","id":completion.call_id,"ok":false,"error":"retained image budget exceeded; dispose old handles"})).is_err() { break "console output queue is full".into(); } continue;
-                                    }
-                                    next_image += 1; value["imageHandle"] = json!(next_image); retained_bytes += image.bytes.len(); retained_images.insert(next_image,image);
+                                    eval.images.push(image.clone());
                                 }
+                                next_image += 1;
+                                value["imageHandle"] = json!(next_image);
+                                let evicted = retained_images.insert(next_image,image);
+                                if !evicted.is_empty() { value["evictedImageHandles"] = json!(evicted); }
                             }
                             json!({"type":"native_result", "id":completion.call_id, "ok":true, "value":value})
                         }
@@ -315,30 +420,29 @@ async fn run_node_session(
                             continue;
                         }
                         let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
-                        if method == "subscribe_input" {
-                            let result = if subscriptions.len() >= 32 { Err("console subscription limit reached".into()) } else {
-                                match &hub { Some(hub) => hub.subscribe(&args), None => Err("input subscriptions require the Wayland proxy".into()) }
-                            };
-                            let reply = match result {
-                                Ok(mut subscription) => {
-                                    let id = subscription.id; subscriptions.insert(id, tokio_util::sync::CancellationToken::new());
-                                    let queue = outgoing.clone();
-                                    // Queue the acknowledgement before any event, including already buffered input.
-                                    if outgoing.try_send(json!({"type":"native_result","id":call_id,"ok":true,"value":{"id":id,"initialState":subscription.initial}})).is_err() { break "console output queue is full".into(); }
-                                    streams.spawn(async move {
-                                        while let Some(event) = subscription.events.recv().await {
-                                            subscription.bytes.fetch_sub(event.bytes, std::sync::atomic::Ordering::Relaxed);
-                                            if queue.send(json!({"type":"input_event","subscriptionId":id,"event":event.value})).await.is_err() { return; }
-                                        }
-                                        let end = subscription.end.borrow_and_update().clone().unwrap_or_else(|| json!({"reason":"closed"}));
-                                        let _ = queue.send(json!({"type":"input_end","subscriptionId":id,"end":end})).await;
-                                    });
-                                    active_calls.remove(&call_id); continue;
-                                }
-                                Err(error) => json!({"type":"native_result","id":call_id,"ok":false,"error":error}),
-                            };
-                            active_calls.remove(&call_id);
-                            if outgoing.try_send(reply).is_err() { break "console output queue is full".into(); } continue;
+                        if matches!(method.as_str(), "subscribe_input" | "subscribe_visual" | "subscribe_visual_program") {
+                            if subscriptions.len() + pending_subscriptions >= 32 {
+                                active_calls.remove(&call_id);
+                                if outgoing.try_send(json!({"type":"native_result","id":call_id,"ok":false,"error":"console subscription limit reached"})).is_err() { break "console output queue is full".into(); }
+                                continue;
+                            }
+                            pending_subscriptions += 1;
+                            let backend = backend.clone();
+                            let sender = subscription_sender.clone();
+                            // Do not abort this task on cancellation: spawn_blocking
+                            // compilation must finish so its registration can be reclaimed.
+                            tokio::spawn(async move {
+                                let result = if method == "subscribe_input" {
+                                    match backend.input_hub() { Some(hub) => hub.subscribe(&args), None => Err("input subscriptions require the Wayland proxy".into()) }
+                                } else {
+                                    match &backend {
+                                        GuiBackendHandle::Wayland(backend) => if method == "subscribe_visual_program" { backend.subscribe_visual_program(&args).await } else { backend.subscribe_visual(&args).await },
+                                        _ => Err("visual subscriptions require the Wayland proxy".into()),
+                                    }
+                                };
+                                let _ = sender.send(SubscriptionCompletion { call_id, eval_id, subscription_id, backend, result: Some(result) }).await;
+                            });
+                            continue;
                         }
                         if method == "finish_input" {
                             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
@@ -352,19 +456,21 @@ async fn run_node_session(
                         }
                         if method == "unsubscribe_input" {
                             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
-                            let result = match (&hub, subscriptions.get(&id)) { (Some(hub), Some(_)) => hub.stop(id,"unsubscribed"), _ => Err("unknown subscription".into()) };
+                            let result = if crate::visual_events::VisualHub::is_visual(id) {
+                                match (&visual_hub,subscriptions.get(&id)) { (Some(hub),Some(_)) => hub.stop(id,"unsubscribed"), _ => Err("unknown subscription".into()) }
+                            } else { match (&hub, subscriptions.get(&id)) { (Some(hub), Some(_)) => hub.stop(id,"unsubscribed"), _ => Err("unknown subscription".into()) } };
                             let reply = match result { Ok(value) => json!({"type":"native_result","id":call_id,"ok":true,"value":value}), Err(error) => json!({"type":"native_result","id":call_id,"ok":false,"error":error}) };
                             active_calls.remove(&call_id); if outgoing.try_send(reply).is_err() { break "console output queue is full".into(); } continue;
                         }
                         if matches!(method.as_str(), "present_image" | "dispose_image") {
                             let id = args.get("imageHandle").and_then(Value::as_u64).unwrap_or(0);
                             let result = if method == "dispose_image" {
-                                if let Some(image) = retained_images.remove(&id) { retained_bytes -= image.bytes.len(); Ok(json!({"disposed":true})) } else { Err("unknown or disposed image handle") }
+                                if retained_images.remove(id).is_some() { Ok(json!({"disposed":true})) } else { Err("unknown, disposed, or expired image handle") }
                             } else if subscription_id.is_some() { Err("presentImage requires a foreground evaluation") }
-                            else if let (Some(image),Some(eval)) = (retained_images.get(&id),pending.get_mut(&eval_id)) {
+                            else if let (Some(image),Some(eval)) = (retained_images.images.get(&id),pending.get_mut(&eval_id)) {
                                 if eval.images.len() >= 16 || eval.images.iter().map(|image| image.bytes.len()).sum::<usize>() + image.bytes.len() > 32*1024*1024 { Err("evaluation image budget exceeded") }
                                 else { eval.images.push(image.clone()); Ok(json!({"presented":true,"imageHandle":id})) }
-                            } else { Err("unknown or disposed image handle") };
+                            } else { Err("unknown, disposed, or expired image handle") };
                             let reply = match result { Ok(value) => json!({"type":"native_result","id":call_id,"ok":true,"value":value}),Err(error) => json!({"type":"native_result","id":call_id,"ok":false,"error":error}) };
                             active_calls.remove(&call_id); if outgoing.try_send(reply).is_err() { break "console output queue is full".into(); } continue;
                         }
@@ -399,9 +505,16 @@ async fn run_node_session(
         }
     };
     cancellation.cancel();
+    subscription_completions.close();
+    while let Ok(completion) = subscription_completions.try_recv() {
+        drop(completion);
+    }
     for (id, token) in subscriptions {
         token.cancel();
         if let Some(hub) = &hub {
+            let _ = hub.stop(id, "runtime_closed");
+        }
+        if let Some(hub) = &visual_hub {
             let _ = hub.stop(id, "runtime_closed");
         }
     }
@@ -512,6 +625,29 @@ async fn handle_native_call(
             serde_json::to_value(backend.list_windows().await?).map_err(|err| err.to_string())?,
             None,
         )),
+        "visual_info" => match backend {
+            GuiBackendHandle::Wayland(backend) => Ok((
+                backend
+                    .visual_info(
+                        &optional_string(&args, "windowId")
+                            .ok_or("visualInfo requires windowId")?,
+                    )
+                    .await?,
+                None,
+            )),
+            _ => Err("visualInfo requires the Wayland proxy".into()),
+        },
+        "visual_metrics" => match backend {
+            GuiBackendHandle::Wayland(backend) => Ok((
+                backend.visual_hub().metrics(
+                    args.get("id")
+                        .and_then(Value::as_u64)
+                        .ok_or("visual metrics require id")?,
+                )?,
+                None,
+            )),
+            _ => Err("visual metrics require the Wayland proxy".into()),
+        },
         "resize_window" => {
             let window_id = args
                 .get("windowId")
@@ -542,16 +678,66 @@ async fn handle_native_call(
             Ok((json!({"delivered":true,"detail":detail}), None))
         }
         "screenshot" => {
-            let window_id = optional_string(&args, "windowId");
-            let bytes = backend
-                .screenshot(GuiScreenshotRequest {
-                    window_id: window_id.clone(),
-                })
-                .await?;
-            retained_image("console-screenshot", window_id.as_deref(), bytes, artifacts)
+            let window_id = Some(
+                optional_string(&args, "windowId")
+                    .filter(|id| !id.is_empty())
+                    .ok_or("screenshot requires an explicit windowId")?,
+            );
+            let surface_id = match args.get("surfaceId") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .filter(|id| *id > 0)
+                        .ok_or("screenshot surfaceId must be a positive protocol object ID")?,
+                ),
+            };
+            if surface_id.is_some()
+                && args.get("coordinateSpace").and_then(Value::as_str) == Some("window")
+            {
+                return Err("surfaceId screenshots require buffer coordinates".into());
+            }
+            let buffer_coordinates = match args.get("coordinateSpace").and_then(Value::as_str) {
+                None => surface_id.is_some(),
+                Some("window") => false,
+                Some("buffer") => true,
+                Some(_) => return Err("screenshot coordinateSpace must be window or buffer".into()),
+            };
+            let bytes = if buffer_coordinates {
+                match backend {
+                    GuiBackendHandle::Wayland(backend) => {
+                        if let Some(surface_id) = surface_id {
+                            backend
+                                .screenshot_surface(window_id.clone().unwrap(), surface_id)
+                                .await?
+                        } else {
+                            backend
+                                .screenshot_buffer(window_id.clone().unwrap())
+                                .await?
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "buffer-coordinate screenshot requires the Wayland proxy".into()
+                        );
+                    }
+                }
+            } else {
+                backend
+                    .screenshot(GuiScreenshotRequest {
+                        window_id: window_id.clone(),
+                    })
+                    .await?
+            };
+            retained_image(bytes)
         }
         "capture_next_frame" => {
-            let window_id = optional_string(&args, "windowId");
+            let window_id = Some(
+                optional_string(&args, "windowId")
+                    .filter(|id| !id.is_empty())
+                    .ok_or("captureNextFrame requires an explicit windowId")?,
+            );
             let bytes = backend
                 .capture_next_frame(GuiCaptureNextFrameRequest {
                     window_id: window_id.clone(),
@@ -559,7 +745,7 @@ async fn handle_native_call(
                     timeout_ms: args.get("timeoutMs").and_then(Value::as_u64),
                 })
                 .await?;
-            retained_image("console-next-frame", window_id.as_deref(), bytes, artifacts)
+            retained_image(bytes)
         }
         "pointer_event" => {
             let window_id = optional_string(&args, "windowId");
@@ -674,17 +860,10 @@ async fn handle_native_call(
     }
 }
 
-fn retained_image(
-    operation: &str,
-    window_id: Option<&str>,
-    bytes: Vec<u8>,
-    artifacts: &ArtifactStore,
-) -> Result<(Value, Option<JsConsoleImage>), String> {
-    let path = artifacts.save_png(operation, window_id, &bytes)?;
+fn retained_image(bytes: Vec<u8>) -> Result<(Value, Option<JsConsoleImage>), String> {
     let dimensions = image::load_from_memory(&bytes)
         .map(|image| (image.width(), image.height()))
         .map_err(|err| format!("captured invalid PNG: {err}"))?;
-    let path = path.display().to_string();
     let reader = png::Decoder::new(std::io::Cursor::new(&bytes))
         .read_info()
         .map_err(|err| err.to_string())?;
@@ -697,8 +876,9 @@ fn retained_image(
         .transpose()
         .map_err(|err| err.to_string())?;
     Ok((
-        json!({"path":path, "width":dimensions.0, "height":dimensions.1, "color": color}),
-        Some(JsConsoleImage { bytes, path, color }),
+        json!({"storage":"memory", "width":dimensions.0, "height":dimensions.1,
+            "coordinateSpace":color.as_ref().and_then(|color|color.get("coordinate_space")).and_then(Value::as_str).unwrap_or("window"), "color": color}),
+        Some(JsConsoleImage { bytes, color }),
     ))
 }
 
@@ -741,6 +921,9 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingBackend {
+        windows: Vec<GuiWindowInfo>,
+        observation_count: AtomicUsize,
+        require_observation: bool,
         input: Arc<crate::input_events::InputHub>,
         image: Option<Vec<u8>>,
         capture_gate: Option<Arc<tokio::sync::Notify>>,
@@ -754,11 +937,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GuiBackend for RecordingBackend {
+        async fn begin_observation(
+            &self,
+            _window: String,
+            duration_ms: u64,
+        ) -> Result<Value, String> {
+            self.observation_count.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"id":1,"durationMs":duration_ms}))
+        }
+        async fn end_observation(&self, _id: u64) -> Result<Value, String> {
+            self.observation_count.fetch_sub(1, Ordering::Relaxed);
+            Ok(json!({"ended":true}))
+        }
         fn input_hub(&self) -> Option<Arc<crate::input_events::InputHub>> {
             Some(self.input.clone())
         }
         async fn list_windows(&self) -> Result<Vec<GuiWindowInfo>, String> {
-            Ok(Vec::new())
+            Ok(self.windows.clone())
         }
 
         async fn screenshot(&self, _request: GuiScreenshotRequest) -> Result<Vec<u8>, String> {
@@ -771,6 +966,9 @@ mod tests {
             &self,
             _request: GuiCaptureNextFrameRequest,
         ) -> Result<Vec<u8>, String> {
+            if self.require_observation && self.observation_count.load(Ordering::Relaxed) == 0 {
+                return Err("capture began without observation".into());
+            }
             if let Some(gate) = &self.capture_gate {
                 gate.notified().await;
             }
@@ -783,6 +981,9 @@ mod tests {
             &self,
             request: GuiWaylandPointerEventRequest,
         ) -> Result<String, String> {
+            if self.require_observation && self.observation_count.load(Ordering::Relaxed) == 0 {
+                return Err("input arrived before observation".into());
+            }
             if let Some(gate) = &self.capture_gate {
                 gate.notify_one();
             }
@@ -1007,6 +1208,207 @@ mod tests {
         assert_eq!(output.value[1]["delivered"], true);
     }
 
+    fn observed_action_backend() -> Arc<RecordingBackend> {
+        Arc::new(RecordingBackend {
+            windows: vec![GuiWindowInfo {
+                window_id: "fixture".into(),
+                title: None,
+                app_id: None,
+                width: 1,
+                height: 1,
+                mapped: true,
+                commit_serial: 1,
+                on_capture_output: true,
+                capture_output_count: 1,
+                on_backend_output: false,
+                backend_output_count: 0,
+                buffer_kind: None,
+                subsurface_count: 0,
+                subsurfaces: Vec::new(),
+                sync_state: None,
+                capturable: true,
+                capture_error: None,
+                render_surface_id: 10,
+                input_surface_id: 10,
+                capture_details: None,
+            }],
+            image: Some(
+                crate::gui_backend_wayland::encode_rgba_png(1, 1, &[1, 2, 3, 255], None).unwrap(),
+            ),
+            require_observation: true,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn act_and_capture_observes_before_input_and_releases_lease_on_success_and_failure() {
+        let backend = observed_action_backend();
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(backend.clone()),
+            Arc::new(ArtifactStore::new()),
+        );
+        let output = console.eval("return await wayland.actAndCapture({windowId:'fixture',action:()=>wayland.click({windowId:'fixture',x:0,y:0})});".into()).await.unwrap();
+        assert_eq!(output.value["frameObserved"], true);
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
+        assert!(!backend.pointer_events.lock().unwrap().is_empty());
+        let output = console.eval("try {await wayland.actAndCapture({windowId:'fixture',action:()=>{throw new Error('action failed')}});} catch(e) {return e.message;}".into()).await.unwrap();
+        assert_eq!(output.value, "action failed");
+        assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
+        backend
+            .fail_pointer_event_once_at
+            .lock()
+            .unwrap()
+            .replace(backend.pointer_event_attempts.load(Ordering::Relaxed));
+        let output = console.eval("try {await wayland.actAndCapture({windowId:'fixture',action:()=>wayland.click({windowId:'fixture',x:0,y:0})});} catch(e) {return e.message;}".into()).await.unwrap();
+        assert!(
+            output
+                .value
+                .as_str()
+                .unwrap()
+                .contains("injected pointer event failure")
+        );
+        assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_commit_observes_and_releases_lease_on_timeout() {
+        let backend = observed_action_backend();
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(backend.clone()),
+            Arc::new(ArtifactStore::new()),
+        );
+        let output = console.eval("try {await wayland.waitForCommit({windowId:'fixture',timeoutMs:20});} catch(e) {return e.message;}".into()).await.unwrap();
+        assert_eq!(output.value, "waitForCommit timed out");
+        assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
+        let output = console.eval("return await wayland.waitForCommit({windowId:'fixture',afterCommitSerial:0,timeoutMs:20});".into()).await.unwrap();
+        assert_eq!(output.value["frameObserved"], true);
+        assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
+        let output = console.eval("try {await wayland.waitForCommit({windowId:'fixture',timeoutMs:NaN});} catch(e) {return e.message;}".into()).await.unwrap();
+        assert!(output.value.as_str().unwrap().contains("timeoutMs must be"));
+    }
+
+    #[tokio::test]
+    async fn foreground_capture_is_retained_in_memory_and_disposable_without_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_directory = directory.path().join("unused-image-artifacts");
+        let artifacts = Arc::new(ArtifactStore {
+            directory: artifact_directory.clone(),
+            secure_directory: true,
+            event_log_lock: std::sync::Mutex::new(()),
+        });
+        let png = crate::gui_backend_wayland::encode_rgba_png(
+            2,
+            1,
+            &[20, 30, 40, 255, 200, 210, 220, 255],
+            None,
+        )
+        .unwrap();
+        let backend = Arc::new(RecordingBackend {
+            image: Some(png.clone()),
+            ..Default::default()
+        });
+        let console = JsConsole::new(GuiBackendHandle::Test(backend), artifacts);
+        let unscoped = console.eval("try {await wayland.screenshot(); return 'unexpected';} catch(e) {return e.message;}".into()).await.unwrap();
+        assert!(
+            unscoped
+                .value
+                .as_str()
+                .unwrap()
+                .contains("explicit windowId")
+        );
+        assert!(unscoped.images.is_empty());
+        let capture = console
+            .eval(
+                "globalThis.shot=await wayland.screenshot({windowId:'fixture'}); return shot;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capture.value["storage"], "memory");
+        assert_eq!(capture.value["width"], 2);
+        assert!(capture.value["imageHandle"].is_u64());
+        assert!(capture.value.get("path").is_none());
+        assert_eq!(capture.images[0].bytes, png);
+        let present = console
+            .eval("return await wayland.presentImage(shot.imageHandle);".into())
+            .await
+            .unwrap();
+        assert_eq!(present.images[0].bytes, png);
+        let disposed = console.eval("await wayland.disposeImage(shot.imageHandle); try {await wayland.presentImage(shot.imageHandle); return 'unexpected';} catch(e) {return e.message;}".into()).await.unwrap();
+        assert!(disposed.value.as_str().unwrap().contains("disposed"));
+        assert!(
+            !artifact_directory.exists(),
+            "image operations must not create artifact files"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_captures_evict_old_handles_without_blocking_new_screenshots() {
+        let png = crate::gui_backend_wayland::encode_rgba_png(1, 1, &[1, 2, 3, 255], None).unwrap();
+        let backend = Arc::new(RecordingBackend {
+            image: Some(png.clone()),
+            ..Default::default()
+        });
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(backend),
+            Arc::new(ArtifactStore::new()),
+        );
+        for id in 1..=18 {
+            let output = console
+                .eval("return await wayland.screenshot({windowId:'fixture'});".into())
+                .await
+                .unwrap();
+            assert_eq!(output.value["imageHandle"], id);
+            assert_eq!(output.images[0].bytes, png);
+            if id > 16 {
+                assert_eq!(output.value["evictedImageHandles"], json!([id - 16]));
+            }
+        }
+        let expired = console
+            .eval("try {await wayland.presentImage(1);} catch(e) {return e.message;}".into())
+            .await
+            .unwrap();
+        assert!(expired.value.as_str().unwrap().contains("expired"));
+        let recent = console
+            .eval("return await wayland.presentImage(18);".into())
+            .await
+            .unwrap();
+        assert_eq!(recent.images[0].bytes, png);
+    }
+
+    #[test]
+    fn retained_images_evict_by_bytes_and_disposal_reclaims_capacity() {
+        let mut cache = RetainedImages::default();
+        let image = |size| JsConsoleImage {
+            color: None,
+            bytes: vec![0; size],
+        };
+        assert!(
+            cache
+                .insert(1, image(MAX_RETAINED_IMAGE_BYTES / 2))
+                .is_empty()
+        );
+        assert!(
+            cache
+                .insert(2, image(MAX_RETAINED_IMAGE_BYTES / 2))
+                .is_empty()
+        );
+        assert_eq!(cache.insert(3, image(1)), vec![1]);
+        assert_eq!(cache.bytes, MAX_RETAINED_IMAGE_BYTES / 2 + 1);
+        assert!(cache.remove(2).is_some());
+        assert!(cache.remove(2).is_none());
+        assert_eq!(cache.bytes, 1);
+        assert!(
+            cache
+                .insert(4, image(MAX_RETAINED_IMAGE_BYTES - 1))
+                .is_empty()
+        );
+        assert_eq!(cache.bytes, MAX_RETAINED_IMAGE_BYTES);
+        assert_eq!(cache.insert(5, image(2)), vec![3, 4]);
+        assert_eq!(cache.bytes, 2);
+    }
+
     #[tokio::test]
     async fn background_images_require_explicit_foreground_presentation() {
         let backend = Arc::new(RecordingBackend {
@@ -1095,7 +1497,7 @@ mod tests {
         assert!(help.value.as_str().unwrap().contains("wayland.click"));
         assert!(help.value.as_str().unwrap().contains("pressShortcut"));
         assert!(help.value.as_str().unwrap().contains("typeText"));
-        assert!(help.value.as_str().unwrap().contains("actAndCapture"));
+        assert!(help.value.as_str().unwrap().contains("onVisual"));
         assert!(help.value.as_str().unwrap().contains("wayland.keyNames"));
 
         console
@@ -1123,8 +1525,7 @@ mod tests {
             reader.info().srgb,
             Some(png::SrgbRenderingIntent::Perceptual)
         );
-        let (value, image) =
-            retained_image("color-test", None, png, &ArtifactStore::new()).unwrap();
+        let (value, image) = retained_image(png).unwrap();
         assert_eq!(value["color"], color);
         assert_eq!(image.unwrap().color, Some(color));
     }
@@ -1240,6 +1641,104 @@ mod tests {
                 .filter(|request| matches!(request.event, GuiWaylandKeyboardEvent::Enter { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn helpers_establish_explicit_targets_on_every_operation() {
+        let recording = Arc::new(RecordingBackend::default());
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(recording.clone()),
+            Arc::new(ArtifactStore::new()),
+        );
+        let action = "await wayland.click({windowId:'fixture',x:10,y:20}); await wayland.pressKey({windowId:'fixture',key:'ENTER',holdMs:0});";
+        console.eval(action.into()).await.unwrap();
+        console.eval(action.into()).await.unwrap();
+        assert_eq!(
+            recording
+                .pointer_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.event, GuiWaylandPointerEvent::Enter { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            recording
+                .keyboard_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.event, GuiWaylandKeyboardEvent::Enter { .. }))
+                .count(),
+            2
+        );
+        // Desktop events do not control the explicitly requested target.
+        for device in ["pointer", "keyboard"] {
+            recording.input.publish(json!({"windowId":"fixture","surfaceId":"fixture-surface","device":device,"origin":"human","event":{"type":"leave"}}));
+        }
+        console.eval(action.into()).await.unwrap();
+        assert_eq!(
+            recording
+                .pointer_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.event, GuiWaylandPointerEvent::Enter { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            recording
+                .keyboard_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.event, GuiWaylandKeyboardEvent::Enter { .. }))
+                .count(),
+            3
+        );
+        // Desktop events for another window must not change the requested target.
+        for device in ["pointer", "keyboard"] {
+            recording.input.publish(json!({"windowId":"other","surfaceId":"other-surface","device":device,"origin":"human","event":{"type":"enter","keys":[],"x":0,"y":0}}));
+        }
+        console.eval(action.into()).await.unwrap();
+        assert_eq!(
+            recording
+                .pointer_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.event, GuiWaylandPointerEvent::Enter { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            recording
+                .keyboard_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r.event, GuiWaylandKeyboardEvent::Enter { .. }))
+                .count(),
+            4
+        );
+        assert!(
+            recording
+                .pointer_events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.window_id.as_deref() == Some("fixture"))
+        );
+        assert!(
+            recording
+                .keyboard_events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.window_id.as_deref() == Some("fixture"))
         );
     }
 
@@ -1523,6 +2022,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.logs, vec!["current evaluation"]);
+    }
+
+    #[test]
+    fn unclaimed_subscription_completion_reclaims_registration() {
+        let backend = Arc::new(RecordingBackend::default());
+        let subscription = backend
+            .input
+            .subscribe(&json!({"windowId":"fixture"}))
+            .unwrap();
+        let end = subscription.end.clone();
+        let completion = SubscriptionCompletion {
+            call_id: 1,
+            eval_id: 1,
+            subscription_id: None,
+            backend: GuiBackendHandle::Test(backend),
+            result: Some(Ok(subscription)),
+        };
+        drop(completion);
+        assert_eq!(
+            end.borrow().as_ref().unwrap()["reason"],
+            "subscription_cancelled"
+        );
+    }
+
+    #[test]
+    fn claimed_subscription_completion_preserves_registration() {
+        let backend = Arc::new(RecordingBackend::default());
+        let subscription = backend
+            .input
+            .subscribe(&json!({"windowId":"fixture"}))
+            .unwrap();
+        let mut completion = SubscriptionCompletion {
+            call_id: 1,
+            eval_id: 1,
+            subscription_id: None,
+            backend: GuiBackendHandle::Test(backend.clone()),
+            result: Some(Ok(subscription)),
+        };
+        let subscription = completion.result.take().unwrap().unwrap();
+        drop(completion);
+        assert!(subscription.end.borrow().is_none());
+        backend.input.stop(subscription.id, "unsubscribed").unwrap();
     }
 
     #[tokio::test]

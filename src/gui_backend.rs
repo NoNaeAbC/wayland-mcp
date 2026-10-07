@@ -207,6 +207,24 @@ pub(crate) struct GuiResizeWindowRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct GuiSubsurfaceInfo {
+    pub(crate) subsurface_id: u32,
+    pub(crate) surface_id: u32,
+    pub(crate) parent_surface_id: u32,
+    pub(crate) position: (i32, i32),
+    /// Effective synchronization includes synchronized ancestors.
+    pub(crate) synchronized: bool,
+    pub(crate) has_committed_buffer: bool,
+    pub(crate) buffer_id: Option<u32>,
+    pub(crate) buffer_kind: Option<String>,
+    pub(crate) buffer_width: Option<u32>,
+    pub(crate) buffer_height: Option<u32>,
+    pub(crate) commit_serial: u64,
+    pub(crate) capture_details: Option<String>,
+    pub(crate) capture_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GuiWindowInfo {
     pub(crate) window_id: String,
     pub(crate) title: Option<String>,
@@ -214,7 +232,6 @@ pub(crate) struct GuiWindowInfo {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) mapped: bool,
-    pub(crate) focused: bool,
     pub(crate) commit_serial: u64,
     /// Membership on the MCP's virtual capture output. A mapped window with a
     /// readable committed buffer belongs to exactly one capture output.
@@ -223,7 +240,12 @@ pub(crate) struct GuiWindowInfo {
     /// Membership reported by wl_surface.enter/leave from the host compositor.
     pub(crate) on_backend_output: bool,
     pub(crate) backend_output_count: usize,
+    /// Buffer metadata below describes render_surface_id (currently the root),
+    /// not every buffer in the window's subsurface tree.
     pub(crate) buffer_kind: Option<String>,
+    /// All live wl_subsurface descendants, including nested and unbuffered ones.
+    pub(crate) subsurface_count: usize,
+    pub(crate) subsurfaces: Vec<GuiSubsurfaceInfo>,
     pub(crate) sync_state: Option<String>,
     pub(crate) capturable: bool,
     pub(crate) capture_error: Option<String>,
@@ -237,6 +259,18 @@ pub(crate) struct GuiWindowInfo {
 
 #[async_trait]
 pub(crate) trait GuiBackend: Send + Sync {
+    #[cfg(test)]
+    async fn begin_observation(
+        &self,
+        _window: String,
+        _duration_ms: u64,
+    ) -> Result<serde_json::Value, String> {
+        Err("observation is not implemented by this test backend".into())
+    }
+    #[cfg(test)]
+    async fn end_observation(&self, _id: u64) -> Result<serde_json::Value, String> {
+        Err("observation is not implemented by this test backend".into())
+    }
     async fn cleanup_model_input(&self) -> Result<(), String> {
         Ok(())
     }
@@ -361,6 +395,8 @@ impl GuiBackendHandle {
         match self {
             #[cfg(unix)]
             Self::Wayland(backend) => backend.begin_observation(window, duration_ms).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.begin_observation(window, duration_ms).await,
             _ => Err("observation requires the Wayland backend".into()),
         }
     }
@@ -368,6 +404,8 @@ impl GuiBackendHandle {
         match self {
             #[cfg(unix)]
             Self::Wayland(backend) => backend.end_observation(id).await,
+            #[cfg(test)]
+            Self::Test(backend) => backend.end_observation(id).await,
             _ => Err("observation requires the Wayland backend".into()),
         }
     }
