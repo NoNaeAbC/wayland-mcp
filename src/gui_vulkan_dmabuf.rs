@@ -566,6 +566,28 @@ fn record_submit_copy_and_map(
     Ok(rgba)
 }
 
+pub(crate) fn copied_dmabuf_pixels_to_linear(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    format: u32,
+    color: Option<&crate::gui_color::ColorDescription>,
+) -> Result<Vec<[f32; 4]>, String> {
+    let format_vk = vk_format_for_drm_format(format).ok_or("unsupported screenshot format")?;
+    let expected = width as usize * height as usize * bytes_per_pixel(format_vk).unwrap();
+    if raw.len() != expected {
+        return Err("screenshot byte count mismatch".into());
+    }
+    Ok(copied_pixels_to_linear(
+        raw,
+        width as usize,
+        height as usize,
+        format_vk,
+        drm_format_has_alpha(format),
+        color,
+    ))
+}
+
 fn copied_pixels_to_linear(
     raw: &[u8],
     width: usize,

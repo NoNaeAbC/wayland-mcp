@@ -11,3 +11,10 @@
 *.py[cod]
 *.swp
 .DS_Store
+
+# Local review notes and usability reports are not project sources.
+/feedback*.md
+/BUG_REPORT_*.md
+/USABILITY_REPORT_*.md
+/wayland-mcp-usability-assessment.md
+/docs/visual-program-design.txt

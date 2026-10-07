@@ -1,8 +1,8 @@
 # wayland-mcp
 
 `wayland-mcp` is a Linux MCP server for observing and driving native Wayland
-clients. It runs a per-process Wayland proxy, tracks client surfaces, captures
-shared-memory and DMA-BUF buffers, and injects compositor-side pointer and
+clients. It runs a per-process Wayland proxy, tracks client surfaces, evaluates GPU-resident visual predicates on DMA-BUFs,
+and injects compositor-side pointer and
 keyboard events.
 
 The server exposes one MCP tool, `gui_console`. The tool evaluates JavaScript
@@ -20,7 +20,14 @@ Build requirements:
 - Python 3.10 or newer (`python3`, or the executable specified by `PYTHON`);
 - installed Wayland core and `wayland-protocols` XML files under `/usr/share`;
 - libxkbcommon development files providing the `xkbcommon` linker library;
-- Vulkan loader development files providing the `vulkan` linker library.
+- Vulkan loader development files providing the `vulkan` linker library;
+- a C++26 compiler (GCC or Clang) and `ar`;
+  project C++ is built with `-fno-rtti -fno-exceptions` and strict warnings;
+  set `CXX` to select the compiler;
+- Shaderc headers and static archives: `shaderc_combined`, `glslang`,
+  `MachineIndependent`, `GenericCodeGen`, `OSDependent`, `SPIRV`,
+  `SPIRV-Tools-opt` and `SPIRV-Tools`. Additional archive directories can be
+  supplied via `WAYLAND_MCP_SHADERC_ARCHIVE_DIRS` (colon-separated on Linux).
 
 Runtime requirements:
 
@@ -33,8 +40,8 @@ Runtime requirements:
 Distribution package names vary. Common packages are `libxkbcommon-dev` and
 `libvulkan-dev` on Debian-family systems, `libxkbcommon-devel` and
 `vulkan-loader-devel` on Fedora, and `libxkbcommon`, `vulkan-headers`, and
-`vulkan-loader` on Arch Linux. The project does not use absolute paths to
-compilers, runtimes, or locally installed dependencies.
+`vulkan-loader` on Arch Linux. Compiler/runtime commands are resolved on PATH. Static archives are searched
+in `/usr/lib`, `/usr/local/lib`, `.private/compiler-lib` and configured directories.
 
 ## Build and validation
 
@@ -83,233 +90,269 @@ for MCP transport; diagnostic logging is written to standard error.
 
 ## Console API
 
-Start by asking the console for its built-in API reference:
+Start with `return wayland.help`. JavaScript state persists between calls.
+
+Continuous observation is **GPU-only and event-only**. Agents submit GLSL source
+strings and receive their bounded result records. Explicit `screenshot({windowId})`
+and `captureNextFrame({windowId})` support visual bootstrap through this MCP:
+images remain in memory, attach to the foreground response and return opaque
+`imageHandle` metadata. `presentImage(handle)` presents a retained image;
+`disposeImage(handle)` releases it early. New captures automatically evict the oldest
+handles when the 16-image/32 MiB cache fills and report `evictedImageHandles`.
+Evicted handles expire; manual disposal is optional. No PNG files or image paths are created.
+JavaScript does not receive image bytes or arbitrary GPU-buffer access. The server
+does not create SHM pixel snapshots in production. Screenshot imports use the
+same canonical DRM-device context and serialized queue as programmable observers.
+For shader bootstrap, `screenshot({windowId, coordinateSpace:"buffer"})` presents
+the selected render buffer at its native extent, so sampled pixel coordinates
+match GLSL images. The default `"window"` mode retains scene composition and its
+input coordinate mapping. Apply `preview_to_full_scale` when viewing a reduced
+MCP preview. Buffer mode does not crop or compose other surfaces.
+To capture a specific rendering child rather than a SHM parent, use
+`screenshot({windowId, surfaceId:30, coordinateSpace:"buffer"})` with a numeric
+surface ID from `windows().subsurfaces`. Explicit surface capture validates
+membership in that window's live tree and requires a committed DMA-BUF. It holds
+an observation lease and waits up to one second for a fresh commit, copying the
+GPU buffer before forwarding that commit. Released producer buffers are never
+reimported. The returned image is in memory and excludes every other surface;
+its metadata records `surface_id` and `commit_serial`.
+Eligible render-buffer commits retain a bounded latest-frame cache in device-local
+Vulkan storage. Buffer-mode screenshots can therefore present a completed frame
+while the client is idle, without reimporting a producer buffer after release.
+
+Capture leases, active visual subscriptions and explicitly targeted input drive committed `wl_surface.frame`
+callbacks locally, so covered windows can render without being raised on the host
+desktop. Input grants a 500 ms rendering lease for its target window. Callbacks
+already forwarded to the host can complete once during observation; their IDs
+remain reserved until the host releases them, and late duplicate completions are
+suppressed.
+
+`actAndCapture` starts capture observation before invoking its action and releases
+the lease on success or failure. `waitForCommit` holds a scoped observation lease
+while waiting. Targeted input retains capture pixels for its 500 ms render lease,
+so capture can follow a quick update without rereading a released producer buffer.
+Visual subscriptions drive the frame clock without enabling CPU pixel capture.
+`wayland.help` documents helper arguments, raw event fields, coordinate and scroll
+units, observation lifetimes, image limits, and the precise color calculations used
+by the fixed and programmable visual APIs.
+
+The principal calls are `environment()`, `diagnostics()`, `windows()`,
+`waitForWindow()`, `waitForWindowGone()`, `visualInfo()`, `onVisualProgram()`, and `onVisual()`.
+`windows()` includes `subsurface_count` and `subsurfaces`: the exact live
+`wl_subsurface` descendants of each window root, including nested and unbuffered
+children. Each entry reports the role ID, surface ID, parent ID, committed
+position, effective synchronization, committed buffer ID/type/dimensions, commit
+serial and capture diagnostics. Pending attachments are not reported as committed
+buffers. Destroyed roles are excluded. Protocol IDs are local to a client connection.
+Window-level `buffer_kind` and `capture_details` describe `render_surface_id` only;
+a SHM root does not imply a SHM rendering child. `visualInfo()` also includes
+`subsurfaceCount` and `subsurfaces` for the same tree.
+
+`visualInfo({windowId})` reports protocol buffer dimensions, scale/viewport, format,
+and DRM affinity, without pixels or a promise of successful import.
+Viewport destination dimensions describe Wayland logical coordinates; they do not
+identify browser CSS dimensions, zoom or device-pixel ratio. Shader coordinates
+and the default input coordinates use committed-buffer pixels.
+`waitForCommit()` waits
+for serial metadata and returns no image.
+
+### Agent-defined visual reactions
+
+Agents write general GLSL compute passes and script their reactions in JavaScript:
 
 ```js
-return wayland.help;
-```
-
-The main observation calls are:
-
-- `wayland.environment()` — environment variables, absolute socket path, and
-  launch preflight state for clients that should connect through the proxy;
-- `wayland.diagnostics()` — proxy, compositor, session, and error state;
-- `wayland.windows()` — mapped surface inventory and capture metadata;
-- `wayland.screenshot({windowId})` — capture the current frame;
-- `wayland.captureNextFrame({windowId, afterCommitSerial, timeoutMs})` — wait
-  for and capture a later committed frame;
-- `wayland.beginObservation({windowId,durationMs})` and
-  `wayland.endObservation({id})` — retain owned GPU frames during a sequence
-  of actions, including popup commits. Leases expire automatically and can
-  overlap; ending one leaves the others active.
-
-High-level input and synchronization helpers include `waitForWindow`,
-`waitForWindowGone`, `click`, `doubleClick`, `move`, `drag`, `scroll`,
-`pressKey`, `pressShortcut`, `typeText`, `waitForCommit`, `actAndCapture`, and
-`resetInputState`. `pointerEvent` and `keyboardEvent` provide direct access to
-individual protocol events.
-
-`resizeWindow({windowId,width,height})` sends an `xdg_toplevel.configure`
-size suggestion to a mapped window. Check `windows()` or a later screenshot
-to confirm the client applied it; Wayland clients may choose a different size.
-
-`pressKey` accepts an evdev code, a common name
-such as `"Escape"`, or a one-character key such as `"W"` (case-insensitive).
-The complete named-key vocabulary is available as `wayland.keyNames`.
-`pressKey`, `typeText`, and character keys in `pressShortcut`
-derive their key codes and serialized modifier masks from the exact XKB keymap
-forwarded to the target client and honor its active layout group. Raw events
-remain available for protocol-level keyboard testing. Raw input calls invalidate
-cached helper focus automatically. `resetInputState()` clears cached focus after
-external focus changes; it does not release pressed keys.
-
-Clipboard operations use two independent selections. The latest trusted input
-source per client and seat selects the host-shared clipboard for human input and
-the private clipboard for model input. Before any input, the private clipboard is
-selected. Playback counts as model input. Switching actors preserves both values.
-Primary selection and clipboard-control extensions remain denied. See
-[clipboard routing](docs/clipboard-attribution.md).
-
-For applications supporting Ctrl+Shift+U Unicode entry, use
-`wayland.typeText({windowId, text:"🌘", inputMethod:"unicode-hex"})`.
-This opt-in method enters each Unicode code point through the application's hex
-input convention, without using the clipboard. It was exercised in Chromium;
-applications without that convention must use their own input method.
-
-Input listeners also accept `devices:["touch","relative_pointer","pointer_constraints"]`.
-`wayland.inputCapabilities({windowId})` lists the target client's bound resources,
-seat IDs and protocol versions. `touchEvent({windowId,surfaceId,event})` sends one
-touch event with surface-local signed 24.8 coordinates; emit `frame` explicitly.
-`pointerEvent` accepts `relative_motion` with `dx`, `dy`, `dx_unaccel`, `dy_unaccel`
-in signed 24.8 format and `utime_hi`/`utime_lo` timestamp words. Applications request
-pointer lock or confinement through the normal Wayland protocols. Model focus
-activates the corresponding constraint; absolute model motion fails while locked.
-Recording and playback use the same ordinary JS listeners and input calls.
-
-Observation composites committed subsurfaces and xdg popups in stacking order,
-including viewport cropping, buffer transforms, scaling, input regions and alpha.
-SHM pixels are owned snapshots taken at commit. GPU observation copies before
-forwarding a commit when capture is armed, honoring explicit acquire points;
-implicit buffer releases are deferred during an idle observation copy. Previously
-released, uncaptured buffers fail with `snapshot_unavailable`. GPU and SHM layers
-are blended in linear light and converted to the preview once. PNG metadata
-includes the scene origin and pixel-to-surface scale.
-
-Drag-and-drop has independent transfer state. Model drags use private sources and
-offers; human drags use mediated host offers. MIME acceptance, negotiated actions,
-finish/cancellation and bounded FD transfer run without changing either selection.
-
-Run `python3 scripts/demonstrate-live.py --input` for a visible GTK window with
-touch, pointer capture, relative input, private drag/drop and a native subsurface.
-Add `--gl` or `--vulkan` for GPU rendering. The window remains open and supports
-agent-written console programs through the printed control directory.
-
-Window inventory separates the two output domains. `on_capture_output` and
-`capture_output_count` describe membership on the MCP's single virtual capture
-output; a mapped, capturable window reports `true` and `1`.
-`on_backend_output` and `backend_output_count` report only host-compositor
-`wl_surface.enter`/`leave` membership and may remain false/zero while capture
-works.
-
-JavaScript state survives calls. Define reusable functions on `globalThis` when
-an interaction needs custom timing or event sequencing:
-
-```js
-globalThis.clickCenter = async function (windowId, width, height) {
-  return wayland.click({
-    windowId,
-    x: width / 2,
-    y: height / 2,
-    coordinateSpace: "full"
-  });
-};
-return "ready";
-```
-
-Coordinates default to full screenshot pixels. Screenshot responses include
-full and embedded-preview dimensions plus the conversion scale. A helper call
-may instead specify `coordinateSpace: "preview"` together with the returned
-`preview_to_full_scale` value; the helpers accept that response spelling as
-well as `previewToFullScale`.
-
-Screenshots convert committed Wayland color descriptions to 8-bit SDR sRGB
-PNG pixels. FP16 and 10-bit values are converted before quantization; the
-pipeline decodes the transfer function, applies the declared luminance scale,
-converts primaries, maps HDR luminance with Reinhard `Y/(1+Y)` relative to
-source reference white, compresses the gamut toward neutral, and encodes sRGB.
-This is a deterministic SDR preview policy, not a reproduction of the host
-display's HDR appearance or its tone mapper. HDR reference white maps to
-linear sRGB 0.5. The player's own HDR10+ scene processing remains in its pixels.
-
-Each converted capture reports a `color` object in both the screenshot result
-and the tool's `images` metadata, including a model-facing notice when the
-image is tone mapped. This notice remains present even if JavaScript discards
-the screenshot return value. It states that original HDR brightness, gamut,
-and highlight appearance cannot be judged from the SDR preview. The metadata
-is also retained in the full PNG alongside an sRGB declaration.
-
-All 10 named primaries in `wp_color_manager_v1` are supported: sRGB/BT.709,
-PAL-M, PAL, NTSC, generic film, BT.2020, CIE 1931 XYZ, DCI P3, Display P3,
-and Adobe RGB. Conversion adapts source white to D65 with Bradford adaptation.
-All 14 named transfer functions are supported, including ST 240, both log
-encodings, xvYCC, the deprecated sRGB names, ST 428, HLG, and compound power 2.4.
-HLG includes its luminance-coupled display OOTF and black-level compensation.
-The log encodings use the inverse encoding curve (zero maps to the lowest
-representable nonzero level). Windows-scRGB is also supported. Unknown enum
-values, untracked descriptions, and ICC profiles fail capture explicitly.
-Custom primary chromaticities and white points are preserved and converted with
-an RGB-to-XYZ matrix and Bradford adaptation computed once per description.
-This includes imaginary primaries and zero-y primaries such as CIE XYZ; singular
-matrices and invalid white points produce explicit errors, never an sRGB fallback.
-Custom power transfer functions support every protocol exponent from 1.0000 to
-10.0000, including sign-preserving negative and above-one channel values.
-Capture metadata retains the original chromaticities and power exponent.
-Untagged surfaces retain the existing assumed-sRGB path. Color state follows
-surface commit and image-description copy semantics.
-
-OpenAI's [image-input documentation](https://developers.openai.com/api/docs/guides/images-vision)
-does not specify an HDR tone mapper or an ICC/HDR processing contract. The SDR
-output policy above is this tool's compatibility choice, not a documented
-OpenAI tone-mapping requirement.
-
-Input delivery and application behavior are separate observations. A successful
-input call means that the protocol event was emitted; capture a later commit to
-verify the application's response.
-
-For the common action/wait/capture sequence, `actAndCapture` reports delivery
-and observation separately:
-
-```js
-return await wayland.actAndCapture({
+globalThis.watch = await wayland.onVisualProgram({
   windowId,
-  afterCommitSerial: baseline.commit_serial,
-  action: () => wayland.click({windowId, x: 320, y: 48}),
-  timeoutMs: 2000
+  passes: [{source: agentWrittenGLSL, dispatch: [groupsX, groupsY, 1]}],
+  resultBytes: 16,
+  stateBytes: 16,
+  scratchBytes: 4096,
+  parameters: new Uint8Array(64),
+  previousFrame: true,
+  feedback: "previousResult",
+  sourceColor: {transfer: "srgb", primaries: "bt709", alpha: "opaque"},
+  maxFps: 60,
+  durationMs: 120000
+}, async (buffer, metadata) => {
+  const words = new Uint32Array(buffer);
+  // Interpret agent-defined bools/coordinates and conditionally generate input.
+  globalThis.latestResult = {words: Array.from(words), metadata};
 });
+return watch.initialState;
 ```
 
-Its result includes `actionResult`, both commit serials, `frameObserved`,
-`surfaceDisappeared`, elapsed time, capture metadata, and any capture error. It
-does not claim that the resulting pixels satisfy an application-level
-assertion.
+All resources use descriptor set 0. Bindings 0/1 are readonly `rgba16f image2D`
+current/optional previous images in linear BT.2020. Bindings 2–6 are `std430`
+storage buffers: readonly previous state, next state, scratch, result, readonly
+CPU-authored parameters. Push constants are four consecutive `uint` values:
+width, height, processed sequence, history-valid. Atomic boolean flags use `uint`.
+The agent supplies dispatch workgroup counts; local dimensions are declared in GLSL.
 
-## Input listeners and demonstrations
+Scratch and result are zeroed on GPU each processed frame. Separate state is
+carried forward before passes; `previousResult` copies the completed result to
+GPU state. History refers to processed frames, including frames whose results JS
+ignores. Multiple passes execute in order with GPU memory dependencies.
 
-Record with ordinary JavaScript; the server provides listeners and raw input,
-with no built-in recorder or player. Start this in one console call:
+Results are delivered as fresh ArrayBuffers plus commit/timestamp/sequence metadata.
+`status()`, `metrics()` and `unsubscribe()` are available. Callback authority
+persists between console evaluations. Queue overflow, callback failure/timeout,
+expiry and geometry/format/device changes terminate explicitly. Resubscription
+starts with zero state and invalid history. Compilation occurs on subscription,
+and parameters remain fixed until resubscription.
+
+Limits: 1–8 passes, source ≤256 KiB/pass, result 4–256 bytes, state 4–65,536
+bytes, scratch 4–1,048,576 bytes, parameters ≤4096 bytes; buffer sizes are multiples
+of four. Frames have at most 8,388,608 pixels. One subscription per window, at most
+eight windows; maxFps 1–120, lease 1–600,000 ms. SPIR-V resources, readonly access,
+local workgroups and dispatch dimensions are checked before execution. Programs
+are trusted agent analysis code: bounded output is not proof of semantic content.
+
+Tracked Wayland color descriptions control GPU normalization, including named and
+custom primaries, custom transfer powers, luminance ranges, PQ and HLG. An explicit
+`sourceColor` supplies a fallback only for untagged buffers. Transfer names include
+`srgb`, `linear`, `pq`, `hlg`, `bt1886`, `gamma22`, and `gamma28`, or Wayland IDs
+1–14; primaries include `bt709`, `bt2020`, `display-p3`, and `adobe-rgb`, or Wayland
+IDs 1–10. Optional `luminances: [minimum, maximum, referenceWhite]` specifies cd/m².
+Alpha can be opaque, straight, or encoded premultiplied (the default); RGBX formats
+always have alpha 1. Results identify the actual source description and whether
+it was assumed. Color interpretation changes start a new `epoch` with
+`historyValid: false` and zero GPU state. Source decoding preserves HDR highlights,
+negative extended values and wide gamut in linear BT.2020 RGBA16F without SDR
+clamping or tone mapping.
+
+The earlier fixed predicate API remains available:
+
+Agents configure fixed predicates and author their own reactions. For example,
+this watches an application's status area; it contains no application-specific
+controller:
 
 ```js
-globalThis.samples = [];
-globalThis.recording = await wayland.onInput(
-  {windowId, origin: "human", devices: ["pointer"]},
-  event => samples.push(structuredClone(event))
-);
-return recording.initialState;
+globalThis.statusWatch = await wayland.onVisual({
+  windowId,
+  rules: [{
+    id: "status-lit",
+    rect: [100, 100, 100, 100], // x, y, width, height in committed-buffer pixels
+    kind: "luminance",
+    polarity: "above",
+    threshold: 0.8,
+    minPixels: 100,
+    debounceFrames: 2,
+    cooldownFrames: 3
+  }],
+  maxFps: 60,
+  durationMs: 120000
+}, async event => {
+  // Script the application's reaction here; callbacks run between console calls.
+  globalThis.latestStatusEvent = event;
+});
+return statusWatch.initialState;
 ```
 
-Ask the user to reproduce the bug. Events continue arriving between calls. End
-recording in another call, draining callbacks before using the saved data:
+`luminance` reduces linear BT.2020 RGB (`0.2627002 R + 0.6779981 G + 0.0593017 B`) entirely on
+GPU. A rule becomes active when at least `minPixels` meet its threshold. It emits
+its initial occupancy, then occupancy transitions. `polarity` is `below` by
+default; `above` is also supported. `change` compares maximum absolute RGB-channel
+difference against a previous frame retained only on the GPU. Its first frame
+establishes history; subsequent sufficiently changed frames emit active pulses.
+Neither pixel counts nor samples are returned. Thresholds are finite and nonnegative;
+HDR values may exceed 1. Both fixed and programmable observers use the tracked
+source color profile or an explicit fallback for untagged buffers.
 
-```js
-return await recording.unsubscribe();
-```
+Events contain only `windowId`, `ruleId`, `active`, processed `frame`,
+`commitSerial`, observation `timestampMs`, `deliveryTimestampMs`, `sequence`,
+`sourceColor`, `epoch`, and `historyValid`.
+Rule order is stable within a processed commit. Frame debounce and cooldown run
+in the embedded compute kernel and count processed frames, not wall time.
+`maxFps` limits processing; intermediate commits may intentionally be skipped.
+History compares consecutive processed frames.
 
-Define playback using the saved surface tokens and exact signed 24.8 coordinates:
+The handle offers `status()` and `unsubscribe({drain:true})`. Inside its own
+callback use `drain:false`. Callback exceptions/timeouts, bounded-queue overflow,
+expiry, window destruction, and geometry/format/device changes terminate the
+stream explicitly. An overflow reports a gap; it does not silently drop events.
+Terminal status includes processed frames and CPU wall time spent in GPU
+submission/wait, including import work. These are operational metrics, not
+image-derived values.
 
-```js
-globalThis.replay = async () => {
-  let previous;
-  for (const sample of samples) {
-    if (previous !== undefined) {
-      await wayland.sleep(Math.max(0, sample.timestampMs - previous));
-    }
-    await wayland.pointerEvent({
-      windowId: sample.windowId,
-      surfaceId: sample.surfaceId,
-      coordinateSpace: "surface-fixed",
-      event: sample.event
-    });
-    previous = sample.timestampMs;
-  }
-};
-await replay();
-await replay();
-return samples.length;
-```
+Budgets: one subscription per window, at most eight windows and sixteen rules
+per window. Each rectangle needs width/height at least four and area at least
+64 pixels; aggregate area per window is at most 1,048,576 pixels. Rule IDs are
+unique strings of at most 64 bytes. `maxFps` is 1–120, `durationMs` is
+1–3,600,000; debounce/cooldown are 1–3,600 processed frames.
 
-The handle's `status()` exposes callback failures and queue overflow. An overflow
-ends the stream with a gap error. Destroyed or reused surface tokens are rejected.
-Callbacks may perform async GUI operations. Use `unsubscribe({drain:false})` when
-stopping from inside that same callback. Background captures return an image
-handle; present it explicitly in a later foreground call with
-`wayland.presentImage(handle)` and release it with `wayland.disposeImage(handle)`.
+### Vulkan ownership and readback boundary
 
-`python3 scripts/validate-live.py` opens two visible GTK4 windows through the MCP
-on your current desktop. It checks private clipboard exchange and starts a
-JS-authored listener for human pointer input on the destination window. Both
-windows remain open for inspection. It requires GTK4 and Wayland development
-files, Node 26+, and `cargo build`. Test binaries and runtime state live in a
-temporary directory. The demonstration uses only the private model clipboard.
+Shaderc and its compiler dependencies are statically linked as archives. GLSL
+source submitted through the console compiles entirely in memory; filesystem
+includes, shader files, SPIR-V uploads and runtime compiler plugins are absent.
+The fixed kernel is compiled into an embedded array by a statically linked build
+tool. Supply missing archive directories through `WAYLAND_MCP_SHADERC_ARCHIVE_DIRS`.
+
+Contexts are retained per DRM device (primary/render nodes are canonicalized),
+each with its own Vulkan instance,
+device, queue, and pipeline. Wayland DMA-BUF `main_device` feedback is matched
+against `VkPhysicalDeviceDrmPropertiesEXT`. Feedback is a preferred-device hint,
+not proof of the producer's device: imports must succeed on that device; there is
+no attempt to assume another GPU can import a compressed buffer. Missing affinity
+or failed import terminates observation. No CPU/software fallback exists.
+
+Imports are cached (eight buffers per subscription). The buffer's inode remains
+pinned by imported memory and a duplicated FD, preventing reused Wayland buffer
+IDs or recycled process FDs from selecting stale images. Producer fences are
+exported as sync files and waited on by the Vulkan transfer submission. Explicit
+Wayland acquire timeline points are honored before observation. Foreign queue
+ownership is acquired and returned. The proxy completes the GPU copy into owned device-local storage before forwarding
+the source commit, preventing premature buffer reuse. Programmable normalization
+and analysis then run on owned resources in a worker, after forwarding. Busy or
+rate-limited observations are skipped before acquisition, with counters exposed
+through `metrics()`. Acquisition still adds a measured bounded commit delay.
+
+For continuous observers, frame/history images, raw pixels, scratch and state are never mapped. Only the
+agent-declared result (at most 256 bytes) is read back. The other CPU-visible
+buffer holds CPU-authored parameters. The fixed predicate path maps a separate
+272-byte transition packet. No frame resource becomes CPU-readable through the
+observer interface, including on unified-memory hardware.
+
+Explicit screenshots require a windowId and use a separate temporary host output
+after copying and releasing the producer on its DRM device. PNG encoding and MCP
+presentation stay in memory; source resources are not mapped. This bootstrap
+readback does not run for `onVisualProgram`/`onVisual` subscriptions. Screenshot
+handles are bounded to 16 images/32 MiB; new captures automatically evict the oldest
+handles, so repeated screenshots do not require manual disposal. Each foreground
+evaluation remains limited to 16 attached images/32 MiB.
+The GPU cache holds at most eight windows and is released when their clients or
+windows disappear. Cache copies skip busy devices; a screenshot reports its
+retained commit serial, which can precede the latest commit. Observer metrics
+measure observer acquisition and processing, not the additional cache copy.
+
+Observers handle all advertised 8-bit, packed 10-bit and FP16 RGB DMA-BUF formats in raw
+buffer coordinates. Destination-only viewport scaling and buffer scale are supported in these raw
+coordinates. SHM, transformed/cropped content,
+synchronized render subsurfaces and scene composition need additional GPU support; unsupported content
+fails explicitly. It does not claim to observe host desktop windows that bypass
+the proxy.
+
+### Input and background scripts
+
+Use `click`, `doubleClick`, `move`, `drag`, `scroll`, `pressKey`, `pressShortcut`,
+`typeText`, `resizeWindow`, and `resetInputState`. Raw `pointerEvent`,
+`keyboardEvent`, `touchEvent`, and `inputCapabilities` remain available.
+`pressKey({windowId,key:"Space",holdMs:20})` accepts evdev codes, named keys, and
+characters; `wayland.keyNames` lists named keys. Character helpers honor the
+client's XKB layout. `resizeWindow` sends a size suggestion; confirm the applied
+size through window metadata. A delivered input event does not prove that the
+application accepted it.
+
+Visual callbacks may schedule input using ordinary JavaScript and timers. Their
+subscription authority survives foreground evaluations and is revoked on stop.
+Agents should keep callbacks bounded and store summaries in `globalThis` for
+later inspection. Model reasoning is not invoked by every event: the program
+handles fast reactions while the agent inspects event summaries and updates it.
+
+`onInput({windowId,origin:"human",devices:["pointer"]}, callback)` observes input
+between calls with the same handle lifecycle. Input recording and playback remain
+agent-written JavaScript. Clipboard routing preserves independent human and model
+selections; see [clipboard attribution](docs/clipboard-attribution.md).
 
 ## Client launch workflow
 
@@ -318,7 +361,7 @@ temporary directory. The demonstration uses only the private model clipboard.
 3. Launch the target client with the returned `XDG_RUNTIME_DIR` and
    `WAYLAND_DISPLAY` values.
 4. Use `waitForWindow` or `windows` to identify the mapped surface.
-5. Capture a baseline, perform input, then wait for a later commit.
+5. Configure `onVisual` predicates, perform input, and inspect returned events.
 6. Terminate the client and confirm that its window disappears.
 
 `environment()` validates the listener and socket before returning. Alongside
@@ -342,14 +385,14 @@ from the JS response. Backend selection is trusted startup configuration through
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `WAYLAND_MCP_ARTIFACT_DIR` | Directory for full PNG captures and JSONL event records | A private, unique directory under the system temporary directory |
+| `WAYLAND_MCP_ARTIFACT_DIR` | Directory for JSONL operational records (no production PNG captures) | A private, unique directory under the system temporary directory |
 | `WAYLAND_MCP_DMABUF_MODE` | Trusted startup negotiation policy: `capture-compatible` filters formats, `transparent` preserves host format/modifier advertisements | capture-compatible |
 | `WAYLAND_MCP_EVAL_TIMEOUT_MS` | JavaScript evaluation timeout in milliseconds | 120000; values are clamped to the supported range |
 | `WAYLAND_MCP_SOCKET` | Proxy socket name inside its private runtime directory | `wayland-mcp-0` |
 | `WAYLAND_MCP_BACKEND_SOCKET` | Host compositor socket name or absolute socket path | The inherited `WAYLAND_DISPLAY`, otherwise `wayland-0` |
 | `WAYLAND_MCP_TRACE` | Enable verbose proxy tracing on standard error | Unset |
 
-Artifacts can contain captured application content and input metadata. Store
+Artifacts can contain input metadata and agent-returned event summaries. Store
 them in an appropriately protected location and apply the retention policy of
 the environment in which the server runs.
 
@@ -357,8 +400,7 @@ the environment in which the server runs.
 
 - Protocol exposure follows an explicit capability policy; decoder availability
   alone does not grant access. Registry versions and binds are checked.
-- DMA-BUF capture depends on Vulkan external-memory and DRM-format-modifier
-  support in the host driver.
+- GPU events require successful DMA-BUF import on the selected DRM device.
 - The compositor boundary does not provide a semantic widget or accessibility
   tree; assertions are based on frames, surface metadata, and application
   commits.
@@ -370,3 +412,49 @@ the environment in which the server runs.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+
+### Programmable observer validation
+
+`cargo test` and `cargo clippy --all-targets -- -D warnings` cover console/input
+lifetime and configuration bounds. `python3 tests/visual_program/console_contract_probe.py`
+checks cross-VM ArrayBuffer packing and callback decoding. Run
+`python3 scripts/validate-gpu-boundary.py` against the built production binary
+to check that failed captures create no image files and the memory-only API is advertised.
+
+Native probes live in `tests/visual_program`. Configure CMake with
+`BASELINE_HEADER_DIR` pointing to Cargo's generated `visual_spirv.h` directory;
+provide static compiler archive directories via `CMAKE_LIBRARY_PATH` if needed.
+Both Cargo and CMake enforce C++26, `-fno-exceptions`, `-fno-rtti`,
+`-Wall -Wextra -Wpedantic -Werror -Wold-style-cast` without warning suppressions
+for project-owned C++. Cargo respects `CXX`; CMake accepts
+`CMAKE_CXX_COMPILER=g++` or `clang++`. Supplied third-party compiler archives
+are linked as provided; these flags do not rebuild or instrument those archives.
+For GCC static analysis, configure a separate CMake build with
+`CMAKE_CXX_COMPILER=g++` and `CMAKE_CXX_FLAGS="-fanalyzer"`, then build all targets.
+For native sanitizers, configure a separate CMake build with
+`CMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"` and run
+the compiler, runtime, normalization, and edge probes. Leak detection remains
+enabled. A separate build with `-fsanitize=thread -fno-omit-frame-pointer` runs
+`concurrency_probe`: compilation/destruction overlaps 200 GPU submissions on
+one context.
+
+`runtime_probe --validation` exercises the actual programmable engine with
+GPU-generated sources, both state modes, bounded results and invalid-resource
+rejections. `runtime_edge_probe --validation` checks zero/partial writes in both
+feedback modes, rejection of oversized push blocks, all ten advertised RGB
+formats, all fourteen transfer functions, HDR/extended FP16 values, alpha,
+color-change history resets and import-cache layout identity.
+`normalization_probe --validation` checks channel order, color and
+alpha through predicate outputs, with `--wrong-reference` as a negative control.
+These use DRM 226:128 and never map source frames. Live acquisition/controller
+measurements are separate from synthetic shader tests.
+
+`python3 tests/visual_program/live_capture_probe.py` launches the release MCP and
+an actual Wayland Vulkan cube. It decodes in-memory screenshots, checks that the
+pixels change, then verifies changing program results and fixed motion events.
+It also checks that native reads complete during shader compilation and that
+ending an evaluation during compilation reclaims the late subscription.
+It requires `vkcube`, Pillow and access to the host Wayland/DRM session. This
+checks live DMA-BUF acquisition and callback delivery; synthetic GPU numerical
+probes separately cover every supported source format and color transfer.
