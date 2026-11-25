@@ -1,9 +1,9 @@
 # Rootless Xwayland feasibility
 
-Rootless Xwayland is not implemented or validated. `/usr/bin/Xwayland` is installed,
-but launching it through the proxy alone cannot provide a working rootless desktop.
+Rootless Xwayland is not implemented or validated. A working rootless desktop
+requires an X window manager and a Wayland role adapter alongside Xwayland.
 
-The installed `/usr/share/wayland-protocols/staging/xwayland-shell/xwayland-shell-v1.xml`
+The `xwayland-shell-v1` protocol in `wayland-protocols`
 defines a privileged surface role and an association serial shared with the X11
 `WL_SURFACE_SERIAL` property. Its shell must be hidden from ordinary clients.
 The current proxy denies that shell and manages xdg-shell surfaces; there is no
@@ -22,6 +22,3 @@ windows, each with its own inventory identity, capture, resize and model input.
 Follow it with transient menus, map/unmap and crash cleanup; then selections,
 agent-authored input recording/replay and GPU buffer sharing. Do not substitute
 one desktop window or claim support from a successful server launch.
-
-This remains the plan's very-low-priority compatibility investigation. It has no
-dependency on native Wayland clipboard, input or composition milestones.

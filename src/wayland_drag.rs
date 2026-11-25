@@ -126,44 +126,6 @@ impl Clipboard {
         }
         Ok(id)
     }
-    fn ensure_host_source(
-        &mut self,
-        sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
-        source: Object,
-    ) -> Result<(), String> {
-        let info = self
-            .sources
-            .get(&source)
-            .ok_or("unknown drag source")?
-            .clone();
-        if !info.upstream {
-            Self::upstream(
-                sessions,
-                source.0,
-                encode_u32_message(info.manager, 0, &[source.1]),
-                &[],
-            )?;
-            for mime in &info.mimes {
-                Self::upstream(sessions, source.0, string_request(source.1, 0, mime), &[])?;
-            }
-            if let Some(actions) = info.actions {
-                Self::upstream(
-                    sessions,
-                    source.0,
-                    encode_u32_message(source.1, 2, &[actions]),
-                    &[],
-                )?;
-            }
-            sessions
-                .get_mut(&source.0)
-                .and_then(|s| s.backend.as_mut())
-                .ok_or("host compositor unavailable")?
-                .object_interfaces
-                .insert(source.1, "wl_data_source".into());
-            self.sources.get_mut(&source).unwrap().upstream = true;
-        }
-        Ok(())
-    }
     pub(super) fn cancel_drag(
         &mut self,
         sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
@@ -327,7 +289,7 @@ impl Clipboard {
                 if source.actions.replace(*dnd_actions).is_some() {
                     return Err("drag source actions already set".into());
                 }
-                if source.upstream {
+                if source.published {
                     Self::upstream(sessions, client, message.bytes.clone(), &[])?;
                 }
                 return Ok(Some(true));
@@ -336,7 +298,7 @@ impl Clipboard {
                 let seat = self.devices.get(&object).ok_or("unknown drag device")?.seat;
                 if self.origin(client, seat) == Origin::Human {
                     if let Some(source) = source {
-                        self.ensure_host_source(sessions, (client, *source))?;
+                        self.publish_host_source(sessions, (client, *source))?;
                     }
                     Self::upstream(sessions, client, message.bytes.clone(), &[])?;
                 } else {

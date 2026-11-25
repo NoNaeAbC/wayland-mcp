@@ -8,6 +8,46 @@
 #include <memory>
 #include <span>
 
+extern "C" void visual_cache_vulkan_instances(bool enabled) {
+	std::lock_guard lock(visual::vulkan_instances_mutex);
+	if (enabled) {
+		visual::vulkan_instances.emplace();
+	} else {
+		visual::vulkan_instances.reset();
+	}
+}
+
+extern "C" bool visual_capture_modifier_supported(uint32_t format, uint64_t modifier) {
+	struct Devices {
+		VkInstance _instance{};
+		std::vector<VkPhysicalDevice> _devices{};
+		Devices() {
+			const VkApplicationInfo app{
+				.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pNext = nullptr, .pApplicationName = nullptr,
+				.applicationVersion = 0, .pEngineName = nullptr, .engineVersion = 0, .apiVersion = VK_API_VERSION_1_1,
+			};
+			const VkInstanceCreateInfo create{
+				.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pNext = nullptr, .flags = 0, .pApplicationInfo = &app,
+				.enabledLayerCount = 0, .ppEnabledLayerNames = nullptr, .enabledExtensionCount = 0, .ppEnabledExtensionNames = nullptr,
+			};
+			if (vkCreateInstance(&create, nullptr, &_instance) != VK_SUCCESS) { return; }
+			uint32_t count = 0;
+			if (vkEnumeratePhysicalDevices(_instance, &count, nullptr) != VK_SUCCESS) { return; }
+			_devices.resize(count);
+			if (vkEnumeratePhysicalDevices(_instance, &count, _devices.data()) != VK_SUCCESS) { _devices.clear(); }
+		}
+		~Devices() {
+			if (_instance) { vkDestroyInstance(_instance, nullptr); }
+		}
+	};
+	const auto vk_format = visual_capture_format(format);
+	if (vk_format == VK_FORMAT_UNDEFINED) { return false; }
+	static const Devices devices;
+	return std::ranges::any_of(devices._devices, [&](VkPhysicalDevice device) {
+		return visual_can_import_transfer(device, vk_format, modifier);
+	});
+}
+
 extern "C" void *visual_snapshot_create(void *c, uint32_t w, uint32_t h, uint32_t fmt, char *error) {
 	auto snapshot = std::make_unique<Cached_Snapshot_Native>(static_cast<Context *>(c), w, h, fmt);
 	if (auto status = snapshot->init(); !status) {

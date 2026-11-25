@@ -10,6 +10,9 @@ mod console_runtime;
 mod gui_xkb;
 mod input_events;
 mod js_console;
+mod ssh_transport;
+mod ssh_video;
+mod ssh_wayland;
 mod visual_events;
 mod wayland_policy;
 mod wayland_protocol_registry;
@@ -109,56 +112,20 @@ impl WaylandMcp {
                 let mut image_content = Vec::new();
                 let mut image_metadata = Vec::new();
                 for image in output.images {
-                    let buffer_coordinates = image
-                        .color
-                        .as_ref()
-                        .and_then(|color| color.get("coordinate_space"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("buffer");
-                    let (returned, mut metadata) = match bounded_png_preview(&image.bytes) {
-                        Some((bytes, full_width, full_height, preview_width, preview_height)) => (
-                            bytes,
-                            json!({
-                                "storage": "memory",
-                                "full": {"width":full_width, "height":full_height},
-                                "embedded_preview": {"width":preview_width, "height":preview_height},
-                                "preview_to_full_scale": {
-                                    "x": full_width as f64 / preview_width as f64,
-                                    "y": full_height as f64 / preview_height as f64,
-                                },
-                                "coordinate_space": "All Wayland input x/y values use full screenshot pixels. Multiply preview coordinates by preview_to_full_scale.",
-                            }),
-                        ),
-                        None => {
-                            let dimensions = image::load_from_memory(&image.bytes)
-                                .map(|image| (image.width(), image.height()))
-                                .unwrap_or((0, 0));
-                            (
-                                image.bytes.clone(),
-                                json!({
-                                    "storage": "memory",
-                                    "full": {"width":dimensions.0, "height":dimensions.1},
-                                    "embedded_preview": {"width":dimensions.0, "height":dimensions.1},
-                                    "preview_to_full_scale": {"x":1.0, "y":1.0},
-                                    "coordinate_space": "All Wayland input x/y values use full screenshot pixels.",
-                                }),
-                            )
-                        }
-                    };
-                    metadata["color"] = image.color.unwrap_or(serde_json::Value::Null);
-                    if buffer_coordinates {
-                        metadata["coordinateSpace"] = json!("buffer");
-                        metadata["coordinate_space"] = json!(
-                            "Raw committed-buffer pixels match GLSL image coordinates. Multiply preview coordinates by preview_to_full_scale. Input helpers use window coordinates; keyboard input needs no conversion."
-                        );
+                    if let Some(packet) = image.encoded {
+                        image_metadata.push(json!({"color": image.color, "packet": packet}));
+                        image_content.push(Content::image(
+                            BASE64_STANDARD.encode(image.bytes),
+                            ssh_video::MIME,
+                        ));
                     } else {
-                        metadata["coordinateSpace"] = json!("window");
+                        let (returned, metadata) = prepare_png_image(image.bytes, image.color);
+                        image_metadata.push(metadata);
+                        image_content.push(Content::image(
+                            BASE64_STANDARD.encode(returned),
+                            "image/png",
+                        ));
                     }
-                    image_metadata.push(metadata);
-                    image_content.push(Content::image(
-                        BASE64_STANDARD.encode(returned),
-                        "image/png",
-                    ));
                 }
                 let structured = json!({
                     "value": output.value,
@@ -178,6 +145,74 @@ impl WaylandMcp {
         }
     }
 }
+pub(crate) fn video_preview_extent(color: &serde_json::Value) -> Option<[u32; 4]> {
+    let sizes: [u32; 4] =
+        serde_json::from_value(color.get("video_preview_extent")?.clone()).ok()?;
+    sizes.iter().all(|&value| value != 0).then_some(sizes)
+}
+
+pub(crate) fn prepare_png_image(
+    bytes: Vec<u8>,
+    color: Option<serde_json::Value>,
+) -> (Vec<u8>, serde_json::Value) {
+    let buffer_coordinates = color
+        .as_ref()
+        .and_then(|color| color.get("coordinate_space"))
+        .and_then(serde_json::Value::as_str)
+        == Some("buffer");
+    let preview = if let Some([width, height, preview_width, preview_height]) =
+        color.as_ref().and_then(video_preview_extent)
+    {
+        Some((None, width, height, preview_width, preview_height))
+    } else {
+        bounded_png_preview(&bytes).map(
+            |(preview, width, height, preview_width, preview_height)| {
+                (Some(preview), width, height, preview_width, preview_height)
+            },
+        )
+    };
+    let (returned, mut metadata) = match preview {
+        Some((preview, full_width, full_height, preview_width, preview_height)) => (
+            preview.unwrap_or(bytes),
+            json!({
+                "storage": "memory",
+                "full": {"width":full_width, "height":full_height},
+                "embedded_preview": {"width":preview_width, "height":preview_height},
+                "preview_to_full_scale": {
+                    "x": full_width as f64 / preview_width as f64,
+                    "y": full_height as f64 / preview_height as f64,
+                },
+                "coordinate_space": "All Wayland input x/y values use full screenshot pixels. Multiply preview coordinates by preview_to_full_scale.",
+            }),
+        ),
+        None => {
+            let dimensions = image::load_from_memory(&bytes)
+                .map(|image| (image.width(), image.height()))
+                .unwrap_or((0, 0));
+            (
+                bytes,
+                json!({
+                    "storage": "memory",
+                    "full": {"width":dimensions.0, "height":dimensions.1},
+                    "embedded_preview": {"width":dimensions.0, "height":dimensions.1},
+                    "preview_to_full_scale": {"x":1.0, "y":1.0},
+                    "coordinate_space": "All Wayland input x/y values use full screenshot pixels.",
+                }),
+            )
+        }
+    };
+    metadata["color"] = color.unwrap_or(serde_json::Value::Null);
+    if buffer_coordinates {
+        metadata["coordinateSpace"] = json!("buffer");
+        metadata["coordinate_space"] = json!(
+            "Raw committed-buffer pixels match GLSL image coordinates. Multiply preview coordinates by preview_to_full_scale. Input helpers use window coordinates; keyboard input needs no conversion."
+        );
+    } else {
+        metadata["coordinateSpace"] = json!("window");
+    }
+    (returned, metadata)
+}
+
 impl ArtifactStore {
     pub(crate) fn new() -> Self {
         let configured_directory = std::env::var_os("WAYLAND_MCP_ARTIFACT_DIR");
@@ -279,7 +314,7 @@ fn unix_time_ms() -> u128 {
 impl ServerHandler for WaylandMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "This server intentionally advertises one persistent graphics tool: gui_console. Evaluate JavaScript with the required code field; variables and globalThis function definitions survive calls. Begin with `return wayland.help`, which documents supported click/drag/scroll/key/shortcut/text/wait helpers and the raw wl_pointer/wl_keyboard event shapes. Use wayland.environment/diagnostics/windows for metadata, screenshot/captureNextFrame for explicit in-memory visual bootstrap, and onVisualProgram/onVisual for continuous GPU analysis with bounded results. Images are retained only in memory; no image files or paths are created. New captures automatically evict the oldest handles when the 16-image/32 MiB cache fills; manual disposal is optional. Agent GLSL compiles in memory with statically linked Shaderc. A delivered event is not proof the application accepted it. Launch the GUI as a live foreground process session when the caller reaps detached &/nohup jobs. This MCP cannot configure the caller sandbox; native-GPU applications may require caller-granted access to the returned Unix socket and /dev/dri/renderD*. Request the caller's supported permission if launch diagnostics show those resources are blocked; do not silently switch to software rendering. This MCP is for graphics/input diagnostics, not DOM automation."
+            "This server intentionally advertises one persistent graphics tool: gui_console. Evaluate JavaScript with the required code field; variables and globalThis function definitions survive calls. Begin with `return wayland.help`, which documents supported click/drag/scroll/key/shortcut/text/wait helpers and the raw wl_pointer/wl_keyboard event shapes. Use wayland.environment/diagnostics/windows for metadata, screenshot/captureNextFrame for explicit in-memory visual bootstrap, and onVisualProgram/onVisual for continuous GPU analysis with bounded results. Use videoFrame for verified H.265 capture with SSH. Images are retained only in memory; no image files or paths are created. New captures automatically evict the oldest handles when the 16-image/32 MiB cache fills; manual disposal is optional. Agent GLSL compiles in memory with statically linked Shaderc. A delivered event is not proof the application accepted it. Launch the GUI as a live foreground process session when the caller reaps detached &/nohup jobs. This MCP cannot configure the caller sandbox; native-GPU applications may require caller-granted access to the returned Unix socket and /dev/dri/renderD*. Request the caller's supported permission if launch diagnostics show those resources are blocked; do not silently switch to software rendering. This MCP is for graphics/input diagnostics, not DOM automation."
         )
     }
 
@@ -357,7 +392,7 @@ fn tool_error(message: String) -> CallToolResult {
 fn tool_inventory() -> Vec<Tool> {
     vec![tool(
         "gui_console",
-        "Persistent JavaScript Wayland graphics console. Pass code; state and globalThis function definitions survive calls. First evaluate `return wayland.help` for the exact API. Supported helpers cover click, drag, scroll, named keys, keymap-aware shortcuts and text, window discovery, and action/commit waits; raw pointerEvent and keyboardEvent calls remain available. Explicit screenshot/captureNextFrame calls require windowId and return disposable in-memory image handles; foreground captures attach images to the MCP response. No image files or paths are created. screenshot({windowId,coordinateSpace:'buffer'}) uses native buffer coordinates for GLSL bootstrap. presentImage/disposeImage manage retained images. onVisualProgram accepts agent-written GLSL compiled in memory with statically linked Shaderc, runs Vulkan on the DMA-BUF-affine DRM device, and passes bounded result buffers to JS callbacks. Continuous current/optional previous frames stay on GPU as FP16 linear BT.2020. onVisual fixed rules also remain available. Shader files/plugins are unsupported. Native GPU apps need caller-granted access to the returned Unix socket and /dev/dri/renderD*; request caller-supported permission if blocked, never silently substitute software rendering.",
+        "Persistent JavaScript Wayland graphics console. Pass code; state and globalThis function definitions survive calls. First evaluate `return wayland.help` for the exact API. Supported helpers cover click, drag, scroll, named keys, keymap-aware shortcuts and text, window discovery, and action/commit waits; raw pointerEvent and keyboardEvent calls remain available. Explicit screenshot/captureNextFrame calls require windowId and return disposable in-memory image handles; foreground captures attach images to the MCP response. No image files or paths are created. screenshot({windowId,coordinateSpace:'buffer'}) uses native buffer coordinates for GLSL bootstrap. presentImage/disposeImage manage retained images. onVisualProgram accepts agent-written GLSL compiled in memory with statically linked Shaderc, runs Vulkan on the DMA-BUF-affine DRM device, and passes bounded result buffers to JS callbacks. Continuous current/optional previous frames stay on GPU as FP16 linear BT.2020. videoFrame exposes verified H.265 capture and GPU color controls. onVisual fixed rules also remain available. Shader files/plugins are unsupported. Native GPU apps need caller-granted access to the returned Unix socket and /dev/dri/renderD*; request caller-supported permission if blocked, never silently substitute software rendering.",
         json!({
             "type": "object",
             "properties": {
@@ -385,16 +420,60 @@ fn stdio() -> (tokio::io::Stdin, tokio::io::Stdout) {
     (tokio::io::stdin(), tokio::io::stdout())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("WAYLAND_MCP_TRACE").is_some() {
-        tracing_subscriber::fmt()
-            .with_env_filter("wayland_mcp_proxy=trace")
-            .with_writer(std::io::stderr)
-            .init();
+struct VulkanInstances;
+
+impl Drop for VulkanInstances {
+    fn drop(&mut self) {
+        visual_events::cache_vulkan_instances(false);
     }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Keep the driver loaded across client connections. Release the cached
+    // instances after the runtime exits and before the driver's exit handlers.
+    visual_events::cache_vulkan_instances(true);
+    let _instances = VulkanInstances;
+    run()
+}
+
+#[tokio::main]
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args_os().skip(1);
+    match args.next().as_deref() {
+        Some(flag) if flag == "--ssh-wayland" => {
+            return ssh_wayland::run(args).await.map_err(Into::into);
+        }
+        Some(flag) if flag == "--ssh-wayland-worker" => {
+            return ssh_wayland::worker(args).await.map_err(Into::into);
+        }
+        Some(flag) if flag == "--ssh" => return ssh_transport::run(args).await.map_err(Into::into),
+        Some(flag) if flag == "--ssh-worker" => {
+            if let Some(path) = args.next() {
+                if args.next().is_some() {
+                    return Err("--ssh-worker accepts a single runtime socket".into());
+                }
+                js_console::use_console_socket(path.into());
+            }
+            ssh_video::enable_ssh_worker()?;
+        }
+        Some(flag) => return Err(format!("unknown option {}", flag.to_string_lossy()).into()),
+        None => {}
+    }
+    let filter = if std::env::var_os("WAYLAND_MCP_TRACE").is_some() {
+        "error,wayland_mcp_proxy=trace"
+    } else {
+        "error"
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     let running = WaylandMcp::new().serve(stdio()).await?;
-    running.waiting().await?;
+    let result = running.waiting().await;
+    if let gui_backend::GuiBackendHandle::Wayland(backend) = gui_backend::default_gui_backend() {
+        backend.shutdown().await;
+    }
+    result?;
     Ok(())
 }
 

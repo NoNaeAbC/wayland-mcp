@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -67,6 +66,7 @@ pub(crate) struct GuiWaylandKeyboardEventRequest {
 pub(crate) struct GuiKeyboardTextPlanRequest {
     pub(crate) window_id: Option<String>,
     pub(crate) text: String,
+    pub(crate) allow_compose: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -458,7 +458,10 @@ impl GuiBackendHandle {
 }
 
 pub(crate) fn desktop_session() -> Option<DesktopSession> {
-    if cfg!(unix) && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    if cfg!(unix)
+        && (std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_MCP_BACKEND_SOCKET").is_some())
+    {
         Some(DesktopSession::Wayland)
     } else {
         None
@@ -476,55 +479,9 @@ pub(crate) fn default_gui_backend() -> GuiBackendHandle {
 }
 
 pub(crate) fn ensure_default_gui_backend_initialized() {
-    #[cfg(unix)]
-    {
-        const BACKEND_SOCKET_ENV: &str = "WAYLAND_MCP_BACKEND_SOCKET";
-
-        if std::env::var_os(BACKEND_SOCKET_ENV).is_none()
-            && let (Some(runtime_dir), Some(display)) = (
-                std::env::var_os("XDG_RUNTIME_DIR"),
-                std::env::var_os("WAYLAND_DISPLAY"),
-            )
-        {
-            let backend_socket = PathBuf::from(runtime_dir).join(display);
-            unsafe {
-                std::env::set_var(BACKEND_SOCKET_ENV, backend_socket);
-            }
-        }
-
-        let backend = default_gui_backend();
-        if wayland_backend_socket_exists(BACKEND_SOCKET_ENV)
-            && let GuiBackendHandle::Wayland(backend) = &backend
-            && backend.transport_available()
-        {
-            unsafe {
-                std::env::remove_var("DISPLAY");
-                std::env::remove_var("XAUTHORITY");
-            }
-            if let Ok(environment) = backend.sandbox_env() {
-                for (key, value) in environment {
-                    unsafe {
-                        std::env::set_var(key, value);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn wayland_backend_socket_exists(backend_socket_env: &str) -> bool {
-    let Some(backend_socket) = std::env::var_os(backend_socket_env) else {
-        return false;
-    };
-    let path = PathBuf::from(backend_socket);
-    if path.is_absolute() {
-        return path.exists();
-    }
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .map(|runtime_dir| runtime_dir.join(path).exists())
-        .unwrap_or(false)
+    // The host environment belongs to this process. Applications receive the
+    // proxy environment explicitly through wayland.environment().
+    let _ = default_gui_backend();
 }
 
 fn default_command_backend() -> Arc<CommandGuiBackend> {
@@ -603,7 +560,6 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::ffi::OsString;
-    use std::fs::File;
 
     struct EnvRestore {
         key: &'static str,
@@ -632,49 +588,50 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn wayland_proxy_initialization_removes_x11_display_env() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+    async fn wayland_proxy_initialization_preserves_the_host_environment() {
+        let host_runtime = tempfile::tempdir().expect("host runtime");
         let _restore_backend = EnvRestore::save("WAYLAND_MCP_BACKEND_SOCKET");
         let _restore_runtime = EnvRestore::save("XDG_RUNTIME_DIR");
         let _restore_wayland = EnvRestore::save("WAYLAND_DISPLAY");
         let _restore_display = EnvRestore::save("DISPLAY");
         let _restore_xauthority = EnvRestore::save("XAUTHORITY");
-
-        let host_display = "wayland-host-0";
-        let host_socket = temp_dir.path().join(host_display);
-        let xauthority = temp_dir.path().join("xauthority");
-        File::create(&host_socket).expect("host socket placeholder");
-
+        let host_display = "host-session-socket";
+        let xauthority = host_runtime.path().join("xauthority");
         unsafe {
             env::remove_var("WAYLAND_MCP_BACKEND_SOCKET");
-            env::set_var("XDG_RUNTIME_DIR", temp_dir.path());
+            env::set_var("XDG_RUNTIME_DIR", host_runtime.path());
             env::set_var("WAYLAND_DISPLAY", host_display);
-            env::set_var("DISPLAY", ":1");
+            env::set_var("DISPLAY", "inherited-x-display");
             env::set_var("XAUTHORITY", &xauthority);
         }
-
         ensure_default_gui_backend_initialized();
-
-        let startup_error = match default_gui_backend() {
-            GuiBackendHandle::Wayland(backend) => backend.transport_startup_error(),
-            GuiBackendHandle::Command(_) => Some("command backend selected".to_string()),
-            GuiBackendHandle::Test(_) => Some("test backend selected".to_string()),
-        };
-        if startup_error.is_some() {
-            assert_eq!(env::var_os("DISPLAY"), Some(":1".into()));
-            assert_eq!(env::var_os("XAUTHORITY"), Some(xauthority.into_os_string()));
-            assert_eq!(env::var_os("XDG_RUNTIME_DIR"), Some(temp_dir.path().into()));
-            return;
-        }
-        assert_eq!(env::var_os("DISPLAY"), None);
-        assert_eq!(env::var_os("XAUTHORITY"), None);
-        let proxy_runtime_dir = env::var_os("XDG_RUNTIME_DIR").expect("proxy runtime dir");
-        assert!(
-            !PathBuf::from(proxy_runtime_dir).starts_with(temp_dir.path()),
-            "proxy runtime dir must not live under host compositor runtime dir {}; got {}; startup error: {:?}",
-            temp_dir.path().display(),
-            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").unwrap()).display(),
-            startup_error,
+        assert_eq!(env::var_os("WAYLAND_DISPLAY"), Some(host_display.into()));
+        assert_eq!(
+            env::var_os("XDG_RUNTIME_DIR"),
+            Some(host_runtime.path().into())
         );
+        assert_eq!(env::var_os("DISPLAY"), Some("inherited-x-display".into()));
+        assert_eq!(env::var_os("XAUTHORITY"), Some(xauthority.into_os_string()));
+        assert_eq!(env::var_os("WAYLAND_MCP_BACKEND_SOCKET"), None);
+        let GuiBackendHandle::Wayland(backend) = default_gui_backend() else {
+            panic!("host Wayland environment was not selected");
+        };
+        if let Ok(proxy) = backend.launch_environment() {
+            assert_ne!(proxy.xdg_runtime_dir, host_runtime.path().to_string_lossy());
+            assert_ne!(proxy.wayland_display, host_display);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_backend_configuration_does_not_require_a_display_name() {
+        let _restore_backend = EnvRestore::save("WAYLAND_MCP_BACKEND_SOCKET");
+        let _restore_wayland = EnvRestore::save("WAYLAND_DISPLAY");
+        let directory = tempfile::tempdir().unwrap();
+        unsafe {
+            env::remove_var("WAYLAND_DISPLAY");
+            env::set_var("WAYLAND_MCP_BACKEND_SOCKET", directory.path().join("host"));
+        }
+        assert_eq!(desktop_session(), Some(DesktopSession::Wayland));
     }
 }

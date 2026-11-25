@@ -12,17 +12,23 @@ layout(set = 0, binding = COLOR_BINDING, std430) readonly buffer SourceColor {
 	uvec2 reserved;
 	vec4  matrix[3];
 	vec4  weights;
+#ifdef VIDEO_TRANSFER_TABLE
+	float transferTable[];
+#endif
 }
 color;
+#ifndef VISUAL_SOURCE_WORD
+#define VISUAL_SOURCE_WORD(index) raw.rgba[index]
+#endif
 vec4 unpackSource(uint index, uint format) {
 	if (format == 0x48344258u || format == 0x48344241u) {
-		vec4 p = vec4(unpackHalf2x16(raw.rgba[index]), unpackHalf2x16(raw.rgba[index + 1u]));
+		vec4 p = vec4(unpackHalf2x16(VISUAL_SOURCE_WORD(index)), unpackHalf2x16(VISUAL_SOURCE_WORD(index + 1u)));
 		if (format == 0x48344258u) {
 			p.a = 1.0;
 		}
 		return p;
 	}
-	uint v = raw.rgba[index];
+	uint v = VISUAL_SOURCE_WORD(index);
 	vec4 p;
 	if (format == 0x30335258u || format == 0x30335241u || format == 0x30334258u || format == 0x30334241u) {
 		p = vec4(float(v & 1023u) / 1023.0, float((v >> 10) & 1023u) / 1023.0, float((v >> 20) & 1023u) / 1023.0,
@@ -42,7 +48,19 @@ vec4 unpackSource(uint index, uint format) {
 	return p;
 }
 float compound(float v) { return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
+#ifdef VIDEO_TRANSFER_TABLE
+float lookupVideoTransfer(float channel, uint offset) {
+	float index = channel * 4096.0;
+	uint lo = uint(index);
+	return mix(color.transferTable[offset + lo], color.transferTable[offset + min(lo + 1u, 4096u)], fract(index));
+}
+#endif
 float decodeTransfer(float v) {
+#ifdef VIDEO_TRANSFER_TABLE
+	if (VIDEO_TRANSFER_TABLE_ENABLED && v >= 0.0 && v <= 1.0) {
+		return lookupVideoTransfer(v, 0u);
+	}
+#endif
 	if (color.power > 0.0) {
 		return sign(v) * pow(abs(v), color.power);
 	}

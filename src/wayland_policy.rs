@@ -30,7 +30,7 @@ pub(crate) fn global(interface: &str) -> GlobalPolicy {
         "zwp_linux_dmabuf_v1" => (Mediate, 6),
         "wp_linux_drm_syncobj_manager_v1" => (Mediate, 1),
         "wp_color_manager_v1" => (Mediate, 3),
-        "wp_presentation" => (Mediate, 2),
+        "wp_presentation" => (Mediate, 3),
         "wp_tearing_control_manager_v1" => (Forward, 1),
         "wp_fifo_manager_v1" => (Forward, 1),
         // Remains closed until the local data-device service is installed.

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "wayland_bridge.rs"]
+pub(crate) mod bridge;
 #[path = "wayland_clipboard.rs"]
 mod clipboard;
 #[path = "wayland_scene.rs"]
@@ -19,6 +21,7 @@ use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
+use std::os::fd::RawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
@@ -125,7 +128,7 @@ impl WaylandGuiBackend {
             if surface.buffer_kind != Some("dmabuf") {
                 return Err("surface screenshot requires a committed DMA-BUF buffer".into());
             }
-            let baseline = surface.commit_serial;
+            let baseline = surface.pixel_visible_serial;
             let id = inner.begin_observation(Some(window_id.clone()), refresh_for)?;
             (
                 baseline,
@@ -150,19 +153,14 @@ impl WaylandGuiBackend {
                     })
                     .ok_or("capture window disappeared")?;
                 let surface = tracker.surface_for_capture(&window_id, surface_id)?;
-                if surface.commit_serial > baseline {
+                if surface.pixel_visible_serial > baseline {
                     Some(tracker.capture_surface_rgba(surface))
                 } else {
                     None
                 }
             };
             if let Some(Ok(frame)) = frame {
-                break encode_rgba_png(
-                    frame.width,
-                    frame.height,
-                    &frame.rgba,
-                    frame.color.as_ref(),
-                );
+                break frame.encode_png(baseline);
             }
             if tokio::time::Instant::now() >= deadline {
                 break Err(match frame {
@@ -179,13 +177,28 @@ impl WaylandGuiBackend {
     pub(crate) async fn screenshot_buffer(&self, window_id: String) -> Result<Vec<u8>, String> {
         let refresh_for = Duration::from_secs(1);
         let deadline = tokio::time::Instant::now() + refresh_for;
-        let observation = {
+        let (baseline, observation) = {
             let mut inner = self.state.inner.lock().await;
+            let baseline = inner
+                .sessions
+                .values()
+                .find_map(|session| {
+                    session
+                        .frame_tracker
+                        .windows
+                        .get(&window_id)
+                        .filter(|window| window.mapped)
+                        .map(|window| window.commit_serial)
+                })
+                .ok_or("screenshot target is not mapped")?;
             let id = inner.begin_observation(Some(window_id.clone()), refresh_for)?;
-            ObservationGuard {
-                inner: self.state.inner.clone(),
-                id,
-            }
+            (
+                baseline,
+                ObservationGuard {
+                    inner: self.state.inner.clone(),
+                    id,
+                },
+            )
         };
         let result = loop {
             let surface = {
@@ -206,15 +219,28 @@ impl WaylandGuiBackend {
             let visual = self.state.visual.clone();
             let window = window_id.clone();
             let frame = tokio::task::spawn_blocking(move || {
-                let snapshot = visual.read_snapshot(&window)?;
+                let snapshot = visual.read_snapshot(&window, None)?;
                 let linear = surface.retained_snapshot_pixels(&snapshot)?;
                 let color = surface.color;
-                let hdr = color.as_ref().is_some_and(crate::gui_color::ColorDescription::is_hdr);
-                let rgba: Vec<_> = linear.into_iter().flat_map(|p| crate::gui_color::encode_preview(p, hdr)).collect();
-                encode_rgba_png(snapshot.width, snapshot.height, &rgba,
-                    Some(&serde_json::json!({"coordinate_space":"buffer","commit_serial":snapshot.serial,
-                        "tone_mapped":hdr,"source":color.as_ref().map(|color|color.metadata())})))
-            }).await.map_err(|error| format!("in-memory screenshot worker failed: {error}"))?;
+                let hdr = color
+                    .as_ref()
+                    .is_some_and(crate::gui_color::ColorDescription::is_hdr);
+                let rgba: Vec<_> = linear
+                    .into_iter()
+                    .flat_map(|p| crate::gui_color::encode_preview(p, hdr))
+                    .collect();
+                CapturedRgbaFrame {
+                    width: snapshot.width,
+                    height: snapshot.height,
+                    rgba,
+                    pixel_commit_serial: snapshot.serial,
+                    color: Some(serde_json::json!({"coordinate_space":"buffer",
+                        "tone_mapped":hdr,"source":color.as_ref().map(|color|color.metadata())})),
+                }
+                .encode_png(baseline)
+            })
+            .await
+            .map_err(|error| format!("in-memory screenshot worker failed: {error}"))?;
             match frame {
                 Ok(png) => break Ok(png),
                 Err(error)
@@ -232,6 +258,88 @@ impl WaylandGuiBackend {
         drop(observation);
         result
     }
+    pub(crate) async fn video_frame(
+        &self,
+        request: crate::ssh_video::FrameRequest,
+    ) -> Result<(Vec<u8>, crate::ssh_video::PacketInfo, serde_json::Value), String> {
+        request.validate()?;
+        let capture_gpu = request.capture_affinity()?;
+        let refresh_for = Duration::from_millis(request.timeout_ms);
+        let deadline = tokio::time::Instant::now() + refresh_for;
+        let observation = {
+            let mut inner = self.state.inner.lock().await;
+            let id = inner.begin_video_observation(
+                request.window_id.clone(),
+                refresh_for,
+                capture_gpu,
+            )?;
+            ObservationGuard {
+                inner: self.state.inner.clone(),
+                id,
+            }
+        };
+        let request = Arc::new(request);
+        loop {
+            let (commit, serial, color, capture_error) = {
+                let inner = self.state.inner.lock().await;
+                let surface = inner
+                    .sessions
+                    .values()
+                    .find_map(|session| {
+                        session.frame_tracker.surface_for_window(&request.window_id)
+                    })
+                    .ok_or("video target is not mapped")?;
+                if surface.buffer_kind != Some("dmabuf") {
+                    return Err("videoFrame requires a committed DMA-BUF window".into());
+                }
+                let error = inner
+                    .video_observations
+                    .get(&observation.id)
+                    .and_then(|observation| observation.error.clone());
+                (
+                    surface.commit_serial,
+                    surface.pixel_commit_serial,
+                    surface.color.clone(),
+                    error,
+                )
+            };
+            if request
+                .after_commit_serial
+                .is_some_and(|previous| commit <= previous)
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("videoFrame timed out waiting for a newer commit".into());
+                }
+                tokio::time::sleep(Duration::from_millis(8)).await;
+                continue;
+            }
+            let visual = self.state.visual.clone();
+            let request = request.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                let snapshot = visual.video_snapshot(&request.window_id, serial, &request, color.as_ref())?;
+                let (data, packet) = snapshot.encode(&request)?;
+                let color = serde_json::json!({
+                    "coordinate_space": "buffer", "commit_serial": commit,
+                    "source": color.as_ref().map(|description| description.source_metadata()),
+                    "source_assumption": color.is_none().then_some("sRGB / BT.709"),
+                    "video": crate::ssh_video::description(&request, &snapshot.options, &snapshot.selection),
+                });
+                Ok((data, packet, color))
+            })
+            .await
+            .map_err(|error| format!("H.265 capture worker failed: {error}"))?;
+            match result {
+                Err(ref error) if error.starts_with("snapshot_unavailable:") => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(capture_error.unwrap_or_else(|| error.clone()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(8)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub(crate) async fn visual_info(&self, window: &str) -> Result<serde_json::Value, String> {
         let inner = self.state.inner.lock().await;
         let session = inner
@@ -259,12 +367,15 @@ impl WaylandGuiBackend {
         } else {
             None
         };
+        let affinity = dma
+            .and_then(|buffer| buffer.render_affinity(session.dmabuf_main_device))
+            .or(session.dmabuf_main_device);
         Ok(
             serde_json::json!({"windowId":window,"coordinateSpace":"buffer","bufferWidth":buffer.width,"bufferHeight":buffer.height,
             "bufferScale":surface.buffer_scale,"bufferTransform":surface.buffer_transform,"viewportSource":surface.viewport_source,
             "viewportDestination":surface.viewport_destination,"windowGeometryOffset":surface.window_geometry_offset,
             "format":dma.map(|d|d.format),"modifiers":dma.map(|d|d.planes.iter().map(|p|format!("0x{:016x}",p.modifier)).collect::<Vec<_>>()),
-            "drmAffinity":session.dmabuf_main_device.map(|(major,minor)|serde_json::json!({"major":major,"minor":minor})),
+            "drmAffinity":affinity.map(|(major,minor)|serde_json::json!({"major":major,"minor":minor})),
             "sourceColor":surface.color.as_ref().map(|c|c.source_metadata()),"gpuImport":"not_tested","pixelsReadable":false,"bufferKind":buffer.kind_name(),"renderSurfaceId":tracked.wl_surface_id,"commitSerial":tracked.commit_serial,
             "subsurfaceCount":session.frame_tracker.subsurfaces_for_window(window).len(),
             "subsurfaces":session.frame_tracker.subsurfaces_for_window(window)}),
@@ -296,9 +407,11 @@ impl WaylandGuiBackend {
             .frame_tracker
             .surface_for_window(window)
             .ok_or("visual target has no committed surface")?;
-        if surface.buffer_kind != Some("dmabuf") {
+        let Some(TrackedBufferSource::Dmabuf(buffer)) =
+            surface.buffer_ref.as_ref().map(|buffer| &buffer.source)
+        else {
             return Err("visual observers require GPU DMA-BUF frames".into());
-        }
+        };
         if surface.color.is_none()
             && args
                 .get("sourceColor")
@@ -308,9 +421,9 @@ impl WaylandGuiBackend {
                 "untagged visual source requires an explicit sourceColor assumption".into(),
             );
         }
-        let affinity = session
-            .dmabuf_main_device
-            .ok_or("no DMA-BUF feedback DRM-device affinity; GPU observation unavailable")?;
+        let affinity = buffer
+            .render_affinity(session.dmabuf_main_device)
+            .ok_or("no DRM-device affinity; GPU observation unavailable")?;
         let visual = self.state.visual.clone();
         let args = args.clone();
         drop(inner);
@@ -430,6 +543,26 @@ impl WaylandGuiBackend {
             state: Arc::clone(&state),
             transport: Arc::new(StdMutex::new(transport)),
             transport_error: Arc::new(StdMutex::new(transport_error)),
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        let transport = self
+            .transport
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(transport) = transport {
+            transport.shutdown.cancel();
+        }
+        let inner = self.state.inner.lock().await;
+        for session in inner.sessions.values() {
+            if let Some(writer) = &session.client_event_writer {
+                writer.shutdown();
+            }
+            if let Some(backend) = &session.backend {
+                let _ = backend.stream.shutdown(Shutdown::Both);
+            }
         }
     }
 
@@ -563,9 +696,8 @@ fn resolve_backend_choice(display: &str, current_backend: &str) -> Result<PathBu
     if display.contains('/') || display == "." || display == ".." {
         return Err("selectBackend display name must be a single socket name".to_string());
     }
-    // The MCP proxy replaces XDG_RUNTIME_DIR in its own process with its
-    // client-facing socket directory. Resolve sibling compositors beside the
-    // currently selected backend instead.
+    // Resolve names beside the captured host socket, independently of the
+    // proxy environment handed to applications.
     let backend = PathBuf::from(current_backend);
     let runtime = if backend.is_absolute() {
         backend.parent().map(PathBuf::from)
@@ -729,7 +861,9 @@ impl Drop for ObservationGuard {
         let id = self.id;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                inner.lock().await.observations.remove(&id);
+                let mut server = inner.lock().await;
+                server.observations.remove(&id);
+                server.video_observations.remove(&id);
             });
         }
     }
@@ -839,21 +973,42 @@ impl WaylandProxyState {
                 .flat_map(|s| s.frame_tracker.list_windows())
                 .filter(|w| w.mapped)
                 .collect::<Vec<_>>();
-            select_window_for_screenshot(&windows, window_id)?.and_then(|window| {
-                inner.sessions.iter().find_map(|(client, session)| {
-                    let surface = session
-                        .frame_tracker
-                        .surface_for_window(&window.window_id)?;
-                    (surface.linear_rgba.is_empty() && surface.buffer_kind == Some("dmabuf"))
-                        .then(|| (*client, window.window_id.clone(), surface.clone()))
-                })
-            })
+            let mut retained = Vec::new();
+            if let Some(window) = select_window_for_screenshot(&windows, window_id)? {
+                for (client, session) in &inner.sessions {
+                    let tracker = &session.frame_tracker;
+                    for surface in tracker.surfaces.values() {
+                        if tracker.surface_to_window.get(&surface.id) != Some(&window.window_id)
+                            || !surface.has_committed_buffer
+                            || !surface.linear_rgba.is_empty()
+                        {
+                            continue;
+                        }
+                        let Some(TrackedBufferSource::Dmabuf(dmabuf)) =
+                            surface.buffer_ref.as_ref().map(|buffer| &buffer.source)
+                        else {
+                            continue;
+                        };
+                        let auxiliary =
+                            (surface.id != window.render_surface_id).then_some(surface.id);
+                        if auxiliary.is_none() || dmabuf.bridge_affinity.is_some() {
+                            retained.push((
+                                *client,
+                                window.window_id.clone(),
+                                auxiliary,
+                                surface.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            retained
         };
-        if let Some((client, window, surface)) = retained {
+        for (client, window, auxiliary, surface) in retained {
             let visual = self.visual.clone();
             let expected = surface.clone();
             let pixels = tokio::task::spawn_blocking(move || {
-                let snapshot = visual.read_snapshot(&window)?;
+                let snapshot = visual.read_snapshot(&window, auxiliary)?;
                 expected.retained_snapshot_pixels(&snapshot)
             })
             .await
@@ -1035,6 +1190,7 @@ impl WaylandProxyState {
         };
 
         let result = loop {
+            let expired = tokio::time::Instant::now() >= deadline;
             // A commit can arrive after observation starts. Recover its owned
             // GPU copy too, rather than checking only the initial snapshot.
             self.snapshot_current_gpu(request.window_id.as_deref())
@@ -1051,22 +1207,27 @@ impl WaylandProxyState {
                     select_window_for_screenshot(&windows, request.window_id.as_deref())?.cloned();
                 let maybe_frame = selected.as_ref().and_then(|window| {
                     inner.sessions.values().find_map(|session| {
-                        if buffer_coordinates {
-                            session.frame_tracker.capture_buffer_rgba(&window.window_id)
+                        let tracker = &session.frame_tracker;
+                        let serial = if buffer_coordinates {
+                            tracker
+                                .surface_for_window(&window.window_id)?
+                                .pixel_visible_serial
                         } else {
-                            session.frame_tracker.capture_window_rgba(&window.window_id)
+                            tracker.scene_pixel_commit_serial(&window.window_id)?
+                        };
+                        if !expired && serial <= baseline_serial {
+                            return None;
+                        }
+                        if buffer_coordinates {
+                            tracker.capture_buffer_rgba(&window.window_id)
+                        } else {
+                            tracker.capture_window_rgba(&window.window_id)
                         }
                     })
                 });
                 (selected, maybe_frame)
             };
-            let refreshed = selected
-                .as_ref()
-                .map(|window| window.commit_serial > baseline_serial)
-                .unwrap_or(false);
-            if refreshed && maybe_frame.as_ref().is_some_and(|frame| frame.is_ok())
-                || tokio::time::Instant::now() >= deadline
-            {
+            if expired || maybe_frame.as_ref().is_some_and(|frame| frame.is_ok()) {
                 if let Some(window) = selected
                     && !window.capturable
                     && !buffer_coordinates
@@ -1080,14 +1241,7 @@ impl WaylandProxyState {
                 }
                 break maybe_frame
                     .transpose()?
-                    .map(|frame| {
-                        encode_rgba_png(
-                            frame.width,
-                            frame.height,
-                            &frame.rgba,
-                            frame.color.as_ref(),
-                        )
-                    })
+                    .map(|frame| frame.encode_png(baseline_serial))
                     .transpose();
             }
             tokio::time::sleep(Duration::from_millis(16)).await;
@@ -1123,9 +1277,20 @@ impl WaylandProxyState {
                     .flat_map(|s| s.frame_tracker.list_windows())
                     .filter(|w| w.mapped)
                     .collect::<Vec<_>>();
-                select_window_for_screenshot(&windows, request.window_id.as_deref())?.is_some_and(
-                    |w| w.commit_serial > *after_commit_serial.get_or_insert(w.commit_serial),
-                )
+                let selected =
+                    select_window_for_screenshot(&windows, request.window_id.as_deref())?;
+                if selected.is_none() && request.window_id.is_some() {
+                    return Err("capture window disappeared".into());
+                }
+                selected.is_some_and(|window| {
+                    let after = *after_commit_serial.get_or_insert(window.commit_serial);
+                    inner.sessions.values().any(|session| {
+                        session
+                            .frame_tracker
+                            .scene_pixel_commit_serial(&window.window_id)
+                            .is_some_and(|serial| serial > after)
+                    })
+                })
             };
             if fresh {
                 self.snapshot_current_gpu(request.window_id.as_deref())
@@ -1150,10 +1315,14 @@ impl WaylandProxyState {
                 let mut selected_frame = None;
                 if let Some(window) = selected_window.as_ref() {
                     let after = *after_commit_serial.get_or_insert(window.commit_serial);
-                    if window.commit_serial > after {
+                    if fresh {
                         for session in inner.sessions.values() {
-                            if let Some(frame) =
-                                session.frame_tracker.capture_window_rgba(&window.window_id)
+                            if session
+                                .frame_tracker
+                                .scene_pixel_commit_serial(&window.window_id)
+                                .is_some_and(|serial| serial > after)
+                                && let Some(frame) =
+                                    session.frame_tracker.capture_window_rgba(&window.window_id)
                             {
                                 selected_frame = Some(frame);
                                 break;
@@ -1164,8 +1333,8 @@ impl WaylandProxyState {
                 (selected_window, selected_frame)
             };
 
-            if let Some(window) = selected_window
-                && window.commit_serial > after_commit_serial.unwrap_or(0)
+            if let Some(surface) = selected_frame
+                && let Some(window) = selected_window
             {
                 if !window.capturable {
                     break Err(window.capture_error.clone().unwrap_or_else(|| {
@@ -1175,23 +1344,9 @@ impl WaylandProxyState {
                         )
                     }));
                 }
-                let Some(surface) = selected_frame else {
-                    break Err(format!(
-                        "window `{}` produced commit_serial={} but its tracked surface is missing",
-                        window.window_id, window.commit_serial
-                    ));
-                };
-                let surface = match surface {
-                    Ok(surface) => surface,
-                    Err(err) => break Err(err),
-                };
-                break encode_rgba_png(
-                    surface.width,
-                    surface.height,
-                    &surface.rgba,
-                    surface.color.as_ref(),
-                )
-                .map(Some);
+                break surface?
+                    .encode_png(after_commit_serial.unwrap_or(0))
+                    .map(Some);
             }
 
             if tokio::time::Instant::now() >= deadline {
@@ -1270,10 +1425,9 @@ impl WaylandProxyState {
         .map(|_| ())
     }
 
-    async fn register_live_client_session(&self) -> WaylandClientId {
+    async fn register_live_client_session(&self) -> Result<WaylandClientId, String> {
         let mut inner = self.inner.lock().await;
-        let globals = inner.synthetic_backend_globals();
-        inner.register_client_session(globals)
+        inner.register_client_session()
     }
 
     async fn finish_client_session(&self, client_id: WaylandClientId, detail: String) {
@@ -1306,23 +1460,31 @@ impl WaylandProxyState {
             let inner = self.inner.lock().await;
             inner.sessions.get(&client_id).and_then(|session| {
                 let header = decode_wayland_header(&message.bytes).ok()?;
-                if header.opcode != 6
-                    || session
-                        .object_interfaces
-                        .get(&header.object_id)
-                        .map(String::as_str)
-                        != Some("wl_surface")
+                if session
+                    .object_interfaces
+                    .get(&header.object_id)
+                    .map(String::as_str)
+                    != Some("wl_surface")
                 {
                     return None;
                 }
                 let tracker = &session.frame_tracker;
                 let window = tracker.surface_to_window.get(&header.object_id)?;
-                self.visual.notice(window, "surfaceCommits");
-                // This API observes one selected render surface, not a composite.
-                // Decorative/auxiliary surfaces must not overwrite its history.
-                if tracker.windows.get(window).map(|w| w.wl_surface_id) != Some(header.object_id) {
-                    self.visual.notice(window, "auxiliarySurface");
+                if header.opcode == 0 {
+                    self.visual
+                        .remove_surface_snapshot(window, header.object_id);
+                }
+                if header.opcode != 6 {
                     return None;
+                }
+                self.visual.notice(window, "surfaceCommits");
+                // Scene screenshots also need the bridge's idle decoration buffers.
+                // Visual subscriptions keep their own render-buffer history.
+                let auxiliary = (tracker.windows.get(window).map(|w| w.wl_surface_id)
+                    != Some(header.object_id))
+                .then_some(header.object_id);
+                if auxiliary.is_some() {
+                    self.visual.notice(window, "auxiliarySurface");
                 }
                 let surface = tracker
                     .pending_surfaces
@@ -1330,21 +1492,33 @@ impl WaylandProxyState {
                     .or_else(|| tracker.cached_surfaces.get(&header.object_id))
                     .or_else(|| tracker.surfaces.get(&header.object_id))?;
                 if !surface.attach_pending && surface.damage.is_empty() {
-                    self.visual.notice(window, "unchangedCommit");
+                    if auxiliary.is_none() {
+                        self.visual.notice(window, "unchangedCommit");
+                    }
                     return None;
                 }
                 let Some(buffer) = surface.buffer_ref.clone() else {
-                    invalid_visual = Some((window.clone(), "visual target detached its buffer"));
+                    if auxiliary.is_none() {
+                        invalid_visual =
+                            Some((window.clone(), "visual target detached its buffer"));
+                    }
                     return None;
                 };
-                if !matches!(buffer.source, TrackedBufferSource::Dmabuf(_)) {
-                    invalid_visual = Some((
-                        window.clone(),
-                        "visual events require DMA-BUF; CPU/SHM fallback is forbidden",
-                    ));
+                let TrackedBufferSource::Dmabuf(dmabuf) = &buffer.source else {
+                    if auxiliary.is_none() {
+                        invalid_visual = Some((
+                            window.clone(),
+                            "visual events require DMA-BUF; CPU/SHM fallback is forbidden",
+                        ));
+                    }
+                    return None;
+                };
+                if auxiliary.is_some() && dmabuf.bridge_affinity.is_none() {
                     return None;
                 }
-                self.visual.notice(window, "eligibleCommits");
+                if auxiliary.is_none() {
+                    self.visual.notice(window, "eligibleCommits");
+                }
                 let invalid = if tracker.effectively_synchronized(header.object_id) {
                     Some(
                         "visual events require an independently committed render surface"
@@ -1368,9 +1542,15 @@ impl WaylandProxyState {
                             .ok_or_else(|| "missing acquire timeline".to_string())
                             .and_then(|timeline| duplicate_fd(&timeline.fd).map(|fd| (fd, point)))
                     });
+                let video = inner.video_observations.values().find(|observation| {
+                    observation.window == *window && observation.deadline > Instant::now()
+                });
                 Some((
                     window.clone(),
-                    session.dmabuf_main_device,
+                    auxiliary,
+                    session
+                        .dmabuf_main_device
+                        .or(video.and_then(|observation| observation.affinity)),
                     buffer,
                     acquire,
                     invalid,
@@ -1383,12 +1563,13 @@ impl WaylandProxyState {
             self.visual
                 .close_window(&window, &format!("visual_error: {error}"));
         }
-        if let Some((window, affinity, buffer, acquire, invalid, serial, color)) = visual_job {
+        if let Some((window, auxiliary, affinity, buffer, acquire, invalid, serial, color)) =
+            visual_job
+        {
             let visual = self.visual.clone();
             let failed_window = window.clone();
             let timestamp = visual.timestamp();
             let result = tokio::task::spawn_blocking(move || {
-                let affinity = affinity.ok_or("DRM affinity unavailable")?;
                 let TrackedBufferSource::Dmabuf(dmabuf) = &buffer.source else {
                     unreachable!()
                 };
@@ -1405,6 +1586,9 @@ impl WaylandProxyState {
                 if planes.is_empty() {
                     return Err("DMA-BUF has no planes".into());
                 }
+                let affinity = dmabuf
+                    .render_affinity(affinity)
+                    .ok_or("DRM affinity unavailable")?;
                 let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
                 if unsafe { libc::fstat(planes[0].fd, stat.as_mut_ptr()) } < 0 {
                     return Err("DMA-BUF identity unavailable".into());
@@ -1420,6 +1604,7 @@ impl WaylandProxyState {
                 };
                 visual.retain_snapshot(
                     &window,
+                    auxiliary,
                     affinity,
                     key,
                     dmabuf.width,
@@ -1429,7 +1614,7 @@ impl WaylandProxyState {
                     serial,
                     &mut wait_acquire,
                 )?;
-                if !visual.interested(&window) {
+                if auxiliary.is_some() || !visual.interested(&window) {
                     return Ok(None);
                 }
                 if let Some(error) = invalid {
@@ -1454,9 +1639,18 @@ impl WaylandProxyState {
             .and_then(|r| r);
             match result {
                 Ok(captured) => captured_visual = captured,
-                Err(error) => self
-                    .visual
-                    .close_window(&failed_window, &format!("visual_error: {error}")),
+                Err(error) if auxiliary.is_none() => {
+                    let mut inner = self.inner.lock().await;
+                    for observation in inner.video_observations.values_mut() {
+                        if observation.window == failed_window {
+                            observation.error = Some(error.clone());
+                        }
+                    }
+                    drop(inner);
+                    self.visual
+                        .close_window(&failed_window, &format!("visual_error: {error}"));
+                }
+                Err(error) => tracing::debug!("auxiliary GPU screenshot snapshot failed: {error}"),
             }
         }
         // The client request thread stays ordered while GPU acquisition runs
@@ -1834,7 +2028,7 @@ impl WaylandProxyState {
     async fn backend_reader_stream(
         &self,
         client_id: WaylandClientId,
-    ) -> Result<Option<StdUnixStream>, String> {
+    ) -> Result<StdUnixStream, String> {
         let inner = self.inner.lock().await;
         inner.backend_reader_stream(client_id)
     }
@@ -2031,10 +2225,21 @@ impl Drop for WaylandProxyTransport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct WaylandSessionSnapshot {
     pub(crate) client_id: u64,
+    pub(crate) backend_connected: bool,
     pub(crate) backend_globals: Vec<String>,
     pub(crate) mapped_resource_count: usize,
     pub(crate) tracked_surface_count: usize,
     pub(crate) latest_commit_serial: u64,
+    pub(crate) surfaces: Vec<WaylandSurfaceProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WaylandSurfaceProgress {
+    pub(crate) surface_id: u32,
+    pub(crate) commit_serial: u64,
+    pub(crate) xdg_configure_seen: bool,
+    pub(crate) xdg_configure_acked: bool,
+    pub(crate) has_committed_buffer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2053,23 +2258,44 @@ impl WaylandProxyConfig {
                 "invalid WAYLAND_MCP_DMABUF_MODE {value:?}: expected capture-compatible or transparent"
             ),
         };
+        let backend_socket = env::var(BACKEND_SOCKET_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("WAYLAND_DISPLAY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_default();
+        // Capture the host path once. The downstream proxy has a separate
+        // runtime directory returned explicitly to applications.
+        let backend_socket = if !backend_socket.is_empty()
+            && !PathBuf::from(&backend_socket).is_absolute()
+            && let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
+        {
+            PathBuf::from(runtime)
+                .join(backend_socket)
+                .display()
+                .to_string()
+        } else {
+            backend_socket
+        };
         Self {
             dmabuf_transparent,
             socket_name: env::var(SOCKET_ENV)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_PROXY_SOCKET.to_string()),
-            backend_socket: env::var(BACKEND_SOCKET_ENV)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| {
-                    env::var("WAYLAND_DISPLAY")
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                })
-                .unwrap_or_default(),
+            backend_socket,
         }
     }
+}
+
+struct VideoObservation {
+    window: String,
+    deadline: Instant,
+    affinity: Option<(u32, u32)>,
+    error: Option<String>,
 }
 
 struct WaylandProxyServer {
@@ -2081,6 +2307,7 @@ struct WaylandProxyServer {
     connection_history: VecDeque<WaylandConnectionHistoryEntry>,
     capture_tracking_deadline: Option<Instant>,
     observations: HashMap<u64, (Option<String>, Instant)>,
+    video_observations: HashMap<u64, VideoObservation>,
     input_render_deadlines: HashMap<String, Instant>,
     visual_windows: HashSet<String>,
     next_observation: u64,
@@ -2141,6 +2368,7 @@ impl WaylandProxyServer {
             connection_history: VecDeque::new(),
             capture_tracking_deadline: None,
             observations: HashMap::new(),
+            video_observations: HashMap::new(),
             input_render_deadlines: HashMap::new(),
             visual_windows: HashSet::new(),
             next_observation: 0,
@@ -2156,6 +2384,7 @@ impl WaylandProxyServer {
             .values()
             .map(|session| WaylandSessionSnapshot {
                 client_id: session.client_id.0,
+                backend_connected: session.backend.is_some(),
                 backend_globals: session
                     .backend_globals
                     .iter()
@@ -2164,6 +2393,22 @@ impl WaylandProxyServer {
                 mapped_resource_count: session.resource_map.len(),
                 tracked_surface_count: session.frame_tracker.surfaces.len(),
                 latest_commit_serial: session.frame_tracker.latest_commit_serial(),
+                surfaces: {
+                    let mut surfaces = session
+                        .frame_tracker
+                        .surfaces
+                        .iter()
+                        .map(|(id, surface)| WaylandSurfaceProgress {
+                            surface_id: *id,
+                            commit_serial: surface.commit_serial,
+                            xdg_configure_seen: surface.xdg_configure_seen,
+                            xdg_configure_acked: surface.xdg_configure_acked,
+                            has_committed_buffer: surface.has_committed_buffer,
+                        })
+                        .collect::<Vec<_>>();
+                    surfaces.sort_by_key(|surface| surface.surface_id);
+                    surfaces
+                },
             })
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session| session.client_id);
@@ -2198,34 +2443,45 @@ impl WaylandProxyServer {
         }
     }
 
-    fn register_client_session(&mut self, globals: Vec<WaylandGlobalInfo>) -> WaylandClientId {
-        // Diagnostics should describe the newest live client, not a prior
-        // short-lived connection which failed before this one was accepted.
-        self.last_runtime_error = None;
+    fn register_client_session(&mut self) -> Result<WaylandClientId, String> {
         self.next_client_id = self.next_client_id.saturating_add(1);
-        self.running = true;
         let client_id = WaylandClientId(self.next_client_id);
-        let (backend, backend_error) = match WaylandBackendSession::connect(&self.config) {
-            Ok(backend) => (Some(backend), None),
-            Err(err) => {
-                self.last_runtime_error = Some(err.clone());
-                (
-                    None,
-                    Some(format!("backend compositor connection failed: {err}")),
-                )
+        let backend = match WaylandBackendSession::connect(&self.config) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.note_runtime_error(error.clone());
+                self.record_connection_event(
+                    "backend_connect_failed",
+                    Some(client_id),
+                    "ready",
+                    Some(error.clone()),
+                );
+                return Err(error);
             }
         };
-        let backend_globals = backend
-            .as_ref()
-            .map(|session| filtered_backend_globals(&session.globals))
-            .filter(|globals| !globals.is_empty())
-            .unwrap_or(globals);
+        let backend_globals = filtered_backend_globals(&backend.globals);
+        if backend_globals.is_empty() {
+            let error = format!(
+                "Wayland backend {} exposes no supported globals",
+                self.config.backend_socket
+            );
+            self.note_runtime_error(error.clone());
+            self.record_connection_event(
+                "backend_connect_failed",
+                Some(client_id),
+                "ready",
+                Some(error.clone()),
+            );
+            return Err(error);
+        }
+        self.last_runtime_error = None;
+        self.running = true;
         self.sessions.insert(
             client_id,
-            WaylandClientSession::new(client_id, backend_globals, backend),
+            WaylandClientSession::new(client_id, backend_globals, Some(backend)),
         );
-        self.record_connection_event("accepted", Some(client_id), "ready", backend_error);
-        client_id
+        self.record_connection_event("accepted", Some(client_id), "ready", None);
+        Ok(client_id)
     }
 
     fn remove_client_session(&mut self, client_id: WaylandClientId) {
@@ -2273,7 +2529,7 @@ impl WaylandProxyServer {
 
     fn note_runtime_error(&mut self, error: impl Into<String>) {
         let error = error.into();
-        trace_wayland_proxy(format_args!("runtime error: {error}"));
+        tracing::error!("Wayland proxy: {error}");
         self.last_runtime_error = Some(error);
     }
 
@@ -2295,6 +2551,34 @@ impl WaylandProxyServer {
             .insert(self.next_observation, (window, Instant::now() + duration));
         Ok(self.next_observation)
     }
+    fn begin_video_observation(
+        &mut self,
+        window: String,
+        duration: Duration,
+        affinity: Option<(u32, u32)>,
+    ) -> Result<u64, String> {
+        self.video_observations
+            .retain(|_, observation| observation.deadline > Instant::now());
+        if self.video_observations.len() >= 8 {
+            return Err("video observation lease limit reached".into());
+        }
+        self.next_observation = self
+            .next_observation
+            .checked_add(1)
+            .ok_or("observation IDs exhausted")?;
+        let id = self.next_observation;
+        self.video_observations.insert(
+            id,
+            VideoObservation {
+                window,
+                deadline: Instant::now() + duration,
+                affinity,
+                error: None,
+            },
+        );
+        Ok(id)
+    }
+
     fn observing_surface(&self, client: WaylandClientId, surface: u32) -> bool {
         if self
             .capture_tracking_deadline
@@ -2318,6 +2602,8 @@ impl WaylandProxyServer {
         }
         self.observations.values().any(|(scope, deadline)| {
             *deadline > Instant::now() && (scope.is_none() || scope.as_ref() == window)
+        }) || self.video_observations.values().any(|observation| {
+            observation.deadline > Instant::now() && Some(&observation.window) == window
         })
     }
 
@@ -2355,14 +2641,14 @@ impl WaylandProxyServer {
                     callback_data: wayland_timestamp_ms_u32(),
                 },
             )?);
-            if callback.local {
+            if callback.local && session.take_released_frame_reservation(id) {
                 events.push(encode_local_event(
                     session,
                     1,
                     &GeneratedEvent::WlDisplayDeleteId { id },
                 )?);
                 session.remove_object(id);
-            } else {
+            } else if !callback.local {
                 // The host still owns this callback ID. Send done once, but let
                 // its real delete_id release the ID; early reuse would collide
                 // with an object that remains alive in the host compositor.
@@ -2711,6 +2997,7 @@ impl WaylandProxyServer {
                 keymap_text,
                 session.keyboard_layout_group,
                 &request.text,
+                request.allow_compose,
             )?;
             let strokes = keymap_plan
                 .strokes
@@ -2780,32 +3067,18 @@ impl WaylandProxyServer {
         decode_wayland_request(session, bytes)
     }
 
-    fn synthetic_backend_globals(&self) -> Vec<WaylandGlobalInfo> {
-        self.registry
-            .global_specs()
-            .into_iter()
-            .enumerate()
-            .map(|(index, global)| WaylandGlobalInfo {
-                name: index as u32 + 1,
-                interface: global.interface,
-                version: global.version,
-            })
-            .collect()
-    }
-
     fn ingest_request(
         &mut self,
         client_id: WaylandClientId,
         mut message: WaylandWireMessage,
     ) -> Result<IngestedWaylandRequest, String> {
-        let capture_tracking_active = self.capture_tracking_active();
-        let raw_forward_only = self
-            .sessions
+        self.capture_tracking_active();
+        self.sessions
             .get(&client_id)
             .ok_or_else(|| format!("missing Wayland client session {}", client_id.0))?
-            .raw_forward_only
-            .load(Ordering::Relaxed)
-            && !capture_tracking_active;
+            .backend
+            .as_ref()
+            .ok_or("Wayland client session has no upstream compositor connection")?;
 
         let request = match self.decode_request(client_id, &message.bytes) {
             Ok(request) => Some(request),
@@ -2909,20 +3182,13 @@ impl WaylandProxyServer {
                 }
             }
         }
-        let mut backend_events = if raw_forward_only {
-            Vec::new()
-        } else if let Some(request) = request.as_ref() {
-            local_protocol_response_events(session, request)?
-        } else {
-            Vec::new()
-        };
+        let mut backend_events = Vec::new();
         let mut backend_globals = session.backend_globals.clone();
-        if backend_events.is_empty()
-            && !synthetic_ack
-            && !clipboard_consumed
-            && !local_frame_callback
-            && let Some(backend) = session.backend.as_mut()
-        {
+        if !synthetic_ack && !clipboard_consumed {
+            let backend = session
+                .backend
+                .as_mut()
+                .ok_or("Wayland client session has no upstream compositor connection")?;
             if let Some(request) = request.as_ref() {
                 backend.track_request_objects(&self.registry.generated, request);
             }
@@ -2952,6 +3218,16 @@ impl WaylandProxyServer {
                 forwarded[..4]
                     .copy_from_slice(&session.resource_map.upstream_id(id)?.to_ne_bytes());
             }
+            if local_frame_callback
+                && let Some(GeneratedImplementedRequest::WlSurfaceFrame { callback }) = request
+                    .as_ref()
+                    .and_then(|request| request.implemented_request.as_ref())
+            {
+                // Client IDs share the upstream namespace. The sync reserves
+                // this ID there without requesting a compositor frame.
+                session.local_frame_reservations.insert(*callback, false);
+                forwarded = encode_u32_message(1, 0, &[*callback]);
+            }
             let message_upstream = WaylandWireMessage {
                 bytes: forwarded,
                 fds: duplicate_fds(&message.fds)?,
@@ -2962,7 +3238,7 @@ impl WaylandProxyServer {
                     .is_some_and(|(_, spec)| spec.destructor)
             {
                 let upstream = u32::from_ne_bytes(message_upstream.bytes[..4].try_into().unwrap());
-                backend.object_interfaces.remove(&upstream);
+                backend.retire_client_object(upstream);
             }
 
             if let Some(request) = request.as_ref()
@@ -2994,9 +3270,7 @@ impl WaylandProxyServer {
                 .collect::<Vec<_>>();
             for (id, local) in callbacks {
                 session.frame_callbacks.remove(&id);
-                if local {
-                    // The host never saw this resource, so only we can release
-                    // it when its surface is destroyed before the next commit.
+                if local && session.take_released_frame_reservation(id) {
                     backend_events.push(encode_local_event(
                         session,
                         1,
@@ -3033,9 +3307,10 @@ impl WaylandProxyServer {
                 .sessions
                 .get_mut(&client_id)
                 .ok_or_else(|| format!("missing Wayland client session {}", client_id.0))?;
-            let Some(backend) = session.backend.as_mut() else {
-                return Ok(Vec::new());
-            };
+            let backend = session
+                .backend
+                .as_mut()
+                .ok_or("Wayland client session has no upstream compositor connection")?;
             (
                 backend.drain_pending_events()?,
                 filtered_backend_globals(&backend.globals),
@@ -3044,6 +3319,9 @@ impl WaylandProxyServer {
 
         let mut forwarded = Vec::new();
         for mut event in backend_events {
+            if event.suppressed {
+                continue;
+            }
             if let Some(decoded) = event.decoded.as_ref()
                 && self
                     .clipboard
@@ -3061,14 +3339,8 @@ impl WaylandProxyServer {
                 .map(|decoded| translate_upstream_event(session, decoded, &mut event.encoded))
                 .transpose()?;
             if let Some(decoded) = event.decoded.as_ref() {
-                if matches!(
-                    decoded.generated_event,
-                    GeneratedEvent::WlCallbackDone { .. }
-                ) {
-                    session.frame_callbacks.remove(&decoded.object_id);
-                    if session.synthetic_frame_done.contains(&decoded.object_id) {
-                        continue;
-                    }
+                if session.suppress_backend_frame_event(decoded) {
+                    continue;
                 }
                 if !self.config.dmabuf_transparent {
                     if is_unsupported_dmabuf_advertisement(decoded) {
@@ -3090,10 +3362,7 @@ impl WaylandProxyServer {
         Ok(backend_events)
     }
 
-    fn backend_reader_stream(
-        &self,
-        client_id: WaylandClientId,
-    ) -> Result<Option<StdUnixStream>, String> {
+    fn backend_reader_stream(&self, client_id: WaylandClientId) -> Result<StdUnixStream, String> {
         let session = self
             .sessions
             .get(&client_id)
@@ -3101,13 +3370,10 @@ impl WaylandProxyServer {
         session
             .backend
             .as_ref()
-            .map(|backend| {
-                backend
-                    .stream
-                    .try_clone()
-                    .map_err(|err| format!("failed to clone Wayland backend stream: {err}"))
-            })
-            .transpose()
+            .ok_or("Wayland client session has no upstream compositor connection")?
+            .stream
+            .try_clone()
+            .map_err(|err| format!("failed to clone Wayland backend stream: {err}"))
     }
 
     fn raw_forward_only_flag(&self, client_id: WaylandClientId) -> Result<Arc<AtomicBool>, String> {
@@ -3121,38 +3387,28 @@ impl WaylandProxyServer {
     fn prepare_backend_event(
         &mut self,
         client_id: WaylandClientId,
-        mut message: WaylandWireMessage,
+        message: WaylandWireMessage,
     ) -> Result<WaylandBackendEvent, String> {
-        let (decoded, backend_globals) = {
+        let (event, backend_globals) = {
             let session = self
                 .sessions
                 .get_mut(&client_id)
                 .ok_or_else(|| format!("missing Wayland client session {}", client_id.0))?;
-            let Some(backend) = session.backend.as_mut() else {
-                return Ok(WaylandBackendEvent {
-                    suppressed: false,
-                    encoded: message,
-                    decoded: None,
-                });
-            };
-            let decoded = decode_wayland_event(&backend.object_interfaces, &message.bytes);
-            if let Ok(event) = decoded.as_ref() {
-                reassociate_backend_fds(backend, event, &mut message.fds);
-                trace_wayland_proxy(format_args!(
-                    "backend -> {}#{}.{} fds={}",
-                    event.interface,
-                    event.object_id,
-                    event.event_name,
-                    message.fds.len()
-                ));
-                backend.apply_event(event);
-            } else {
-                reassociate_undecoded_backend_fds(backend, &message.bytes, &mut message.fds)?;
-                trace_undecoded_wayland_message("backend", &message, decoded.as_ref().err());
-            }
-            let decoded = decoded.ok();
-            (decoded, filtered_backend_globals(&backend.globals))
+            let backend = session
+                .backend
+                .as_mut()
+                .ok_or("Wayland client session has no upstream compositor connection")?;
+            let event = backend.decode_message(message)?;
+            (event, filtered_backend_globals(&backend.globals))
         };
+        if event.suppressed {
+            return Ok(event);
+        }
+        let WaylandBackendEvent {
+            encoded: mut message,
+            decoded,
+            ..
+        } = event;
 
         if let Some(event) = decoded.as_ref() {
             if self
@@ -3165,13 +3421,24 @@ impl WaylandProxyServer {
                     decoded: None,
                 });
             }
-            if matches!(
-                event.interface.as_str(),
-                "wl_pointer" | "wl_keyboard" | "wl_touch" | "zwp_relative_pointer_v1"
-            ) && !matches!(
-                event.event_name.as_str(),
-                "wl_keyboard.keymap" | "wl_keyboard.repeat_info"
-            ) {
+            let focus = matches!(
+                event.generated_event,
+                GeneratedEvent::WlPointerEnter { .. } | GeneratedEvent::WlKeyboardEnter { .. }
+            );
+            let input = matches!(
+                event.generated_event,
+                GeneratedEvent::WlPointerMotion { .. }
+                    | GeneratedEvent::WlPointerButton { .. }
+                    | GeneratedEvent::WlPointerAxis { .. }
+                    | GeneratedEvent::WlKeyboardKey { .. }
+                    | GeneratedEvent::WlTouchDown { .. }
+                    | GeneratedEvent::WlTouchMotion { .. }
+                    | GeneratedEvent::WlTouchUp { .. }
+                    | GeneratedEvent::WlTouchShape { .. }
+                    | GeneratedEvent::WlTouchOrientation { .. }
+                    | GeneratedEvent::ZwpRelativePointerV1RelativeMotion { .. }
+            );
+            if focus || input {
                 let seat = self
                     .sessions
                     .get(&client_id)
@@ -3182,8 +3449,17 @@ impl WaylandProxyServer {
                     })
                     .copied();
                 if let Some(seat) = seat {
-                    self.clipboard
-                        .switch(&mut self.sessions, client_id, seat, Origin::Human)?;
+                    if focus {
+                        self.clipboard
+                            .host_focus(&mut self.sessions, client_id, seat)?;
+                    } else {
+                        self.clipboard.switch(
+                            &mut self.sessions,
+                            client_id,
+                            seat,
+                            Origin::Human,
+                        )?;
+                    }
                 }
             }
         }
@@ -3196,18 +3472,12 @@ impl WaylandProxyServer {
             .map(|decoded| translate_upstream_event(session, decoded, &mut message))
             .transpose()?;
         if let Some(decoded) = decoded.as_ref() {
-            if matches!(
-                decoded.generated_event,
-                GeneratedEvent::WlCallbackDone { .. }
-            ) {
-                session.frame_callbacks.remove(&decoded.object_id);
-                if session.synthetic_frame_done.contains(&decoded.object_id) {
-                    return Ok(WaylandBackendEvent {
-                        suppressed: true,
-                        encoded: message,
-                        decoded: None,
-                    });
-                }
+            if session.suppress_backend_frame_event(decoded) {
+                return Ok(WaylandBackendEvent {
+                    suppressed: true,
+                    encoded: message,
+                    decoded: None,
+                });
             }
             if matches!(decoded.generated_event, GeneratedEvent::WlBufferRelease) {
                 let id = decoded.object_id;
@@ -3314,64 +3584,6 @@ fn translate_upstream_event(
     event.generated_event = decode_generated_event_by_opcode(&event.interface, event.opcode, &args)
         .ok_or("translated event could not be decoded")?;
     Ok(event)
-}
-
-fn local_protocol_response_events(
-    session: &mut WaylandClientSession,
-    request: &DecodedWaylandRequest,
-) -> Result<Vec<WaylandBackendEvent>, String> {
-    match request.implemented_request.as_ref() {
-        Some(GeneratedImplementedRequest::WlDisplayGetRegistry { .. })
-            if session.backend.is_some() =>
-        {
-            Ok(Vec::new())
-        }
-        Some(GeneratedImplementedRequest::WlDisplayGetRegistry { registry }) => {
-            session.mark_local_registry(*registry);
-            session
-                .backend_globals
-                .iter()
-                .map(|global| {
-                    encode_local_event(
-                        session,
-                        *registry,
-                        &GeneratedEvent::WlRegistryGlobal {
-                            name: global.name,
-                            interface: Some(global.interface.clone()),
-                            version: global.version,
-                        },
-                    )
-                })
-                .collect()
-        }
-        Some(GeneratedImplementedRequest::WlDisplaySync { callback }) => {
-            if session.backend.is_some() {
-                Ok(Vec::new())
-            } else {
-                session.mark_local_callback(*callback);
-                Ok(vec![
-                    encode_local_event(
-                        session,
-                        *callback,
-                        &GeneratedEvent::WlCallbackDone { callback_data: 0 },
-                    )?,
-                    encode_local_event(
-                        session,
-                        1,
-                        &GeneratedEvent::WlDisplayDeleteId { id: *callback },
-                    )?,
-                ])
-            }
-        }
-        Some(GeneratedImplementedRequest::WlFixesDestroyRegistry {
-            registry: Some(registry_id),
-        }) if session.is_local_registry(*registry_id) => Ok(vec![encode_local_event(
-            session,
-            1,
-            &GeneratedEvent::WlDisplayDeleteId { id: *registry_id },
-        )?]),
-        _ => Ok(Vec::new()),
-    }
 }
 
 fn apply_client_event_tracking(
@@ -3525,7 +3737,7 @@ fn apply_undecoded_client_tracking(
                 .note_shm_pool_destroyed(header.object_id);
             session.remove_object(header.object_id);
             if let Some(backend) = session.backend.as_mut() {
-                backend.object_interfaces.remove(&header.object_id);
+                backend.retire_client_object(header.object_id);
             }
         }
         ("wl_shm_pool", 2) => {
@@ -3624,12 +3836,12 @@ fn reassociate_undecoded_backend_fds(
     bytes: &[u8],
     fds: &mut Vec<OwnedFd>,
 ) -> Result<(), String> {
-    if fds.is_empty() {
-        return Ok(());
-    }
     let header = decode_wayland_header(bytes)?;
     let interface = backend.object_interfaces.get(&header.object_id);
-    if interface.is_some_and(|interface| interface == "wl_shm") && header.opcode == 0 {
+    if interface.is_some_and(|interface| interface == "wl_shm")
+        && header.opcode == 0
+        && header.size == 12
+    {
         // wl_shm.format carries no FD, but libwayland may flush it in the same
         // sendmsg whose SCM_RIGHTS belongs to a following DMA-BUF feedback
         // format_table. Preserve that FD until the decoded FD-bearing event
@@ -3644,7 +3856,7 @@ fn reassociate_undecoded_backend_fds(
         return Ok(());
     }
     Err(format!(
-        "undecoded backend event {}#{} opcode {} unexpectedly carried {} fd(s)",
+        "cannot forward undecodable backend event {}#{} opcode {} ({} fd(s))",
         interface.map(String::as_str).unwrap_or("unknown"),
         header.object_id,
         header.opcode,
@@ -3801,9 +4013,8 @@ struct WaylandClientSession {
     touch_contacts: HashMap<(u32, bool, i32), u32>,
     touch_last_surface: HashMap<(u32, bool), u32>,
     seat_globals: HashMap<u32, u32>,
-    local_registry_ids: HashSet<u32>,
-    local_callback_ids: HashSet<u32>,
     frame_callbacks: HashMap<u32, TrackedFrameCallback>,
+    local_frame_reservations: HashMap<u32, bool>,
     synthetic_frame_done: HashSet<u32>,
     pending_client_fds: VecDeque<OwnedFd>,
     dmabuf_feedback_index_maps: HashMap<u32, Vec<Option<u16>>>,
@@ -3877,9 +4088,8 @@ impl WaylandClientSession {
             touch_contacts: HashMap::new(),
             touch_last_surface: HashMap::new(),
             seat_globals: HashMap::new(),
-            local_registry_ids: HashSet::new(),
-            local_callback_ids: HashSet::new(),
             frame_callbacks: HashMap::new(),
+            local_frame_reservations: HashMap::new(),
             synthetic_frame_done: HashSet::new(),
             pending_client_fds: VecDeque::new(),
             dmabuf_feedback_index_maps: HashMap::new(),
@@ -3894,6 +4104,37 @@ impl WaylandClientSession {
             keyboard_mods_depressed: 0,
             keyboard_mods_latched: 0,
             keyboard_mods_locked: 0,
+        }
+    }
+
+    fn take_released_frame_reservation(&mut self, id: u32) -> bool {
+        if self.local_frame_reservations.get(&id) == Some(&true) {
+            self.local_frame_reservations.remove(&id);
+            return true;
+        }
+        false
+    }
+
+    fn suppress_backend_frame_event(&mut self, event: &DecodedWaylandEvent) -> bool {
+        match event.generated_event {
+            GeneratedEvent::WlCallbackDone { .. } => {
+                if self.local_frame_reservations.contains_key(&event.object_id) {
+                    return true;
+                }
+                self.frame_callbacks.remove(&event.object_id);
+                self.synthetic_frame_done.contains(&event.object_id)
+            }
+            GeneratedEvent::WlDisplayDeleteId { id } => {
+                if let Some(released) = self.local_frame_reservations.get_mut(&id) {
+                    if self.frame_callbacks.contains_key(&id) {
+                        *released = true;
+                        return true;
+                    }
+                    self.local_frame_reservations.remove(&id);
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -4203,21 +4444,12 @@ impl WaylandClientSession {
         self.object_interfaces.get(&object_id).map(String::as_str)
     }
 
-    fn mark_local_registry(&mut self, object_id: u32) {
-        self.local_registry_ids.insert(object_id);
-    }
-
-    fn is_local_registry(&self, object_id: u32) -> bool {
-        self.local_registry_ids.contains(&object_id)
-    }
-
-    fn mark_local_callback(&mut self, object_id: u32) {
-        self.local_callback_ids.insert(object_id);
-    }
-
     fn remove_object(&mut self, object_id: u32) {
         self.frame_callbacks.remove(&object_id);
+        self.local_frame_reservations.remove(&object_id);
         self.synthetic_frame_done.remove(&object_id);
+        self.released_buffers.remove(&object_id);
+        self.deferred_releases.remove(&object_id);
         self.object_interfaces.remove(&object_id);
         self.object_versions.remove(&object_id);
         self.input_seats.remove(&object_id);
@@ -4234,8 +4466,6 @@ impl WaylandClientSession {
         self.seat_globals.remove(&object_id);
         self.delivered_focus
             .retain(|_, surface| *surface != object_id);
-        self.local_registry_ids.remove(&object_id);
-        self.local_callback_ids.remove(&object_id);
         self.resource_map.unmap_client(object_id);
     }
 
@@ -4933,12 +5163,32 @@ fn is_suppressed_registry_global_event(event: &DecodedWaylandEvent) -> bool {
 
 fn is_unsupported_dmabuf_advertisement(event: &DecodedWaylandEvent) -> bool {
     match &event.generated_event {
-        GeneratedEvent::ZwpLinuxDmabufV1Format { format }
-        | GeneratedEvent::ZwpLinuxDmabufV1Modifier { format, .. } => {
+        GeneratedEvent::ZwpLinuxDmabufV1Format { format } => {
             !crate::gui_vulkan_dmabuf::supports_screenshot_drm_format(*format)
         }
+        GeneratedEvent::ZwpLinuxDmabufV1Modifier {
+            format,
+            modifier_hi,
+            modifier_lo,
+        } => !supports_dmabuf_advertisement(
+            *format,
+            u64::from(*modifier_hi) << 32 | u64::from(*modifier_lo),
+        ),
         _ => false,
     }
+}
+
+fn supports_dmabuf_advertisement(format: u32, modifier: u64) -> bool {
+    unsafe extern "C" {
+        fn visual_capture_modifier_supported(format: u32, modifier: u64) -> bool;
+    }
+    if !crate::gui_vulkan_dmabuf::supports_screenshot_drm_format(format) {
+        return false;
+    }
+    // DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D uses bits 23..25 for compression.
+    // The compositor can advertise compressed images that Vulkan cannot copy.
+    let compressed_nvidia = modifier >> 56 == 0x03 && (modifier >> 23) & 0x7 != 0;
+    !compressed_nvidia || unsafe { visual_capture_modifier_supported(format, modifier) }
 }
 
 fn rewrite_dmabuf_feedback_event(
@@ -4972,8 +5222,9 @@ fn rewrite_dmabuf_feedback_event(
             let (entries, remainder) = table.as_chunks::<16>();
             debug_assert!(remainder.is_empty());
             for entry in entries {
-                let format = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                if crate::gui_vulkan_dmabuf::supports_screenshot_drm_format(format) {
+                let format = u32::from_ne_bytes(entry[..4].try_into().unwrap());
+                let modifier = u64::from_ne_bytes(entry[8..].try_into().unwrap());
+                if supports_dmabuf_advertisement(format, modifier) {
                     let new_index = u16::try_from(filtered.len() / 16).map_err(|_| {
                         "filtered DMA-BUF format table exceeds u16 indices".to_string()
                     })?;
@@ -5135,17 +5386,6 @@ struct WaylandProtocolRegistry {
 }
 
 impl WaylandProtocolRegistry {
-    fn global_specs(&self) -> Vec<WaylandGlobalBinding> {
-        self.generated
-            .globals()
-            .iter()
-            .map(|global| WaylandGlobalBinding {
-                interface: global.interface_name.to_string(),
-                version: global.version,
-            })
-            .collect()
-    }
-
     fn global_names(&self) -> Vec<String> {
         self.generated
             .globals()
@@ -5200,17 +5440,12 @@ impl Default for WaylandProtocolRegistry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WaylandGlobalBinding {
-    interface: String,
-    version: u32,
-}
-
 struct WaylandBackendSession {
     stream: StdUnixStream,
     globals: Vec<WaylandGlobalInfo>,
     object_interfaces: HashMap<u32, String>,
     pending_backend_fds: VecDeque<OwnedFd>,
+    retired_client_objects: HashSet<u32>,
 }
 
 impl WaylandBackendSession {
@@ -5235,6 +5470,7 @@ impl WaylandBackendSession {
             globals,
             object_interfaces: HashMap::from([(1, "wl_display".to_string())]),
             pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
         };
         session.set_runtime_timeouts()?;
         Ok(session)
@@ -5262,40 +5498,76 @@ impl WaylandBackendSession {
         send_wayland_wire_message(&self.stream, &message.bytes, &message.fds)
     }
 
-    fn drain_pending_events(&mut self) -> Result<Vec<WaylandBackendEvent>, String> {
-        let mut encoded_events = Vec::new();
-        while encoded_events.len() < MAX_BACKEND_EVENTS_PER_DRAIN {
-            let mut message = match read_wayland_wire_message_blocking(&self.stream, 16) {
-                Ok(message) => message,
-                Err(err) if is_timeout_error(&err) => break,
-                Err(err) => return Err(err),
-            };
-            let decoded = decode_wayland_event(&self.object_interfaces, &message.bytes);
-            if let Ok(event) = decoded.as_ref() {
-                reassociate_backend_fds(self, event, &mut message.fds);
+    fn retire_client_object(&mut self, id: u32) {
+        if id < 0xff00_0000 {
+            // The compositor may have sent an event before it saw the destroy
+            // request. Keep its signature until wl_display.delete_id so we can
+            // consume exactly that event's descriptors without dispatching it.
+            self.retired_client_objects.insert(id);
+        } else {
+            self.object_interfaces.remove(&id);
+        }
+    }
+
+    fn decode_message(
+        &mut self,
+        mut message: WaylandWireMessage,
+    ) -> Result<WaylandBackendEvent, String> {
+        match decode_wayland_event(&self.object_interfaces, &message.bytes) {
+            Ok(event) => {
+                reassociate_backend_fds(self, &event, &mut message.fds);
+                let suppressed = self.retired_client_objects.contains(&event.object_id);
                 trace_wayland_proxy(format_args!(
-                    "backend -> {}#{}.{} fds={}",
+                    "backend {} {}#{}.{} fds={}",
+                    if suppressed {
+                        "discarded late event"
+                    } else {
+                        "->"
+                    },
                     event.interface,
                     event.object_id,
                     event.event_name,
                     message.fds.len()
                 ));
-                self.apply_event(event);
-            } else {
-                reassociate_undecoded_backend_fds(self, &message.bytes, &mut message.fds)?;
-                trace_undecoded_wayland_message("backend", &message, decoded.as_ref().err());
+                if !suppressed {
+                    self.apply_event(&event);
+                }
+                Ok(WaylandBackendEvent {
+                    suppressed,
+                    encoded: message,
+                    decoded: (!suppressed).then_some(event),
+                })
             }
-            let decoded = decoded.ok();
-            encoded_events.push(WaylandBackendEvent {
-                suppressed: false,
-                encoded: message,
-                decoded,
-            });
+            Err(error) => {
+                reassociate_undecoded_backend_fds(self, &message.bytes, &mut message.fds)?;
+                trace_undecoded_wayland_message("backend", &message, Some(&error));
+                Ok(WaylandBackendEvent {
+                    suppressed: false,
+                    encoded: message,
+                    decoded: None,
+                })
+            }
+        }
+    }
+
+    fn drain_pending_events(&mut self) -> Result<Vec<WaylandBackendEvent>, String> {
+        let mut encoded_events = Vec::new();
+        while encoded_events.len() < MAX_BACKEND_EVENTS_PER_DRAIN {
+            let message = match read_wayland_wire_message_blocking(&self.stream, 16) {
+                Ok(message) => message,
+                Err(err) if is_timeout_error(&err) => break,
+                Err(err) => return Err(err),
+            };
+            encoded_events.push(self.decode_message(message)?);
         }
         Ok(encoded_events)
     }
 
     fn apply_event(&mut self, event: &DecodedWaylandEvent) {
+        if let GeneratedEvent::WlDisplayDeleteId { id } = event.generated_event {
+            self.retired_client_objects.remove(&id);
+            self.object_interfaces.remove(&id);
+        }
         apply_object_interfaces_from_event(&mut self.object_interfaces, event);
         if let GeneratedEvent::WlRegistryGlobal {
             name,
@@ -5309,6 +5581,23 @@ impl WaylandBackendSession {
 }
 
 fn discover_backend_globals(socket_path: &PathBuf) -> Result<Vec<WaylandGlobalInfo>, String> {
+    discover_backend_globals_with_timeout(socket_path, Duration::from_secs(5))
+}
+
+pub(crate) fn probe_compositor(socket_path: &PathBuf) -> Result<(), String> {
+    if !discover_backend_globals(socket_path)?
+        .iter()
+        .any(|global| global.interface == "wl_compositor")
+    {
+        return Err("Wayland connection did not advertise wl_compositor".into());
+    }
+    Ok(())
+}
+
+fn discover_backend_globals_with_timeout(
+    socket_path: &PathBuf,
+    timeout: Duration,
+) -> Result<Vec<WaylandGlobalInfo>, String> {
     let mut stream = StdUnixStream::connect(socket_path).map_err(|err| {
         format!(
             "failed to connect to Wayland backend {} for global discovery: {err}",
@@ -5316,10 +5605,10 @@ fn discover_backend_globals(socket_path: &PathBuf) -> Result<Vec<WaylandGlobalIn
         )
     })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(timeout))
         .map_err(|err| format!("failed to set Wayland backend discovery read timeout: {err}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(timeout))
         .map_err(|err| format!("failed to set Wayland backend discovery write timeout: {err}"))?;
     stream
         .write_all(&encode_u32_message(1, 1, &[BACKEND_BOOTSTRAP_REGISTRY_ID]))
@@ -5337,13 +5626,29 @@ fn discover_backend_globals(socket_path: &PathBuf) -> Result<Vec<WaylandGlobalIn
         (BACKEND_BOOTSTRAP_CALLBACK_ID, "wl_callback".to_string()),
     ]);
     let mut globals = Vec::new();
+    let deadline = Instant::now() + timeout;
     loop {
-        let bytes = match read_wayland_message(&mut stream) {
-            Ok(bytes) => bytes,
-            Err(err) if is_timeout_error(&err) => break,
-            Err(err) => return Err(err),
-        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "Wayland backend {} registry discovery timed out before wl_display.sync completed",
+                socket_path.display()
+            ));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|err| err.to_string())?;
+        let bytes = read_wayland_message(&mut stream).map_err(|err| {
+            format!("Wayland backend {} registry discovery failed before wl_display.sync completed: {err}", socket_path.display())
+        })?;
         let event = decode_wayland_event(&object_interfaces, &bytes)?;
+        if let GeneratedEvent::WlDisplayError { code, message, .. } = &event.generated_event {
+            return Err(format!(
+                "Wayland backend {} rejected registry discovery (code {code}): {}",
+                socket_path.display(),
+                message.as_deref().unwrap_or("no error detail")
+            ));
+        }
         apply_object_interfaces_from_event(&mut object_interfaces, &event);
         if let GeneratedEvent::WlRegistryGlobal {
             name,
@@ -5360,10 +5665,9 @@ fn discover_backend_globals(socket_path: &PathBuf) -> Result<Vec<WaylandGlobalIn
         if event.object_id == BACKEND_BOOTSTRAP_CALLBACK_ID
             && event.event_name == "wl_callback.done"
         {
-            break;
+            return Ok(globals);
         }
     }
-    Ok(globals)
 }
 
 #[derive(Clone)]
@@ -5792,6 +6096,9 @@ impl WaylandFrameTracker {
                     height,
                     format,
                     flags,
+                    bridge_affinity: planes
+                        .first()
+                        .and_then(|p| bridge::display_buffer_affinity(p.fd.as_raw_fd())),
                     planes,
                 }),
             }),
@@ -5867,6 +6174,9 @@ impl WaylandFrameTracker {
                     height: pending_create.height,
                     format: pending_create.format,
                     flags: pending_create.flags,
+                    bridge_affinity: planes
+                        .first()
+                        .and_then(|p| bridge::display_buffer_affinity(p.fd.as_raw_fd())),
                     planes,
                 }),
             }),
@@ -6016,6 +6326,15 @@ impl WaylandFrameTracker {
     fn latch_surface(&mut self, id: u32, mut surface: TrackedSurface) {
         self.next_commit_serial = self.next_commit_serial.saturating_add(1);
         surface.commit_serial = self.next_commit_serial;
+        // Cached subsurface pixels become visible only when their parent latches.
+        if surface.pixel_commit_serial != 0
+            && self
+                .surfaces
+                .get(&id)
+                .is_none_or(|previous| previous.pixel_commit_serial != surface.pixel_commit_serial)
+        {
+            surface.pixel_visible_serial = surface.commit_serial;
+        }
         if surface.buffer_id.is_some() {
             surface.has_committed_buffer = true;
         }
@@ -6206,6 +6525,7 @@ impl WaylandFrameTracker {
                 damage: Vec::new(),
                 commit_serial: 0,
                 pixel_commit_serial: 0,
+                pixel_visible_serial: 0,
                 has_committed_buffer: false,
                 attach_pending: false,
                 xdg_configure_seen: false,
@@ -6570,8 +6890,9 @@ impl WaylandFrameTracker {
             width: surface.width,
             height: surface.height,
             rgba,
+            pixel_commit_serial: surface.pixel_visible_serial,
             color: Some(
-                serde_json::json!({"coordinate_space":"buffer","surface_id":surface.id,"commit_serial":surface.commit_serial,"tone_mapped":hdr,
+                serde_json::json!({"coordinate_space":"buffer","surface_id":surface.id,"tone_mapped":hdr,
                 "source":surface.color.as_ref().map(|color|color.metadata())}),
             ),
         })
@@ -6793,6 +7114,7 @@ impl TrackedBuffer {
                     width: surface.width,
                     height: surface.height,
                     rgba,
+                    pixel_commit_serial: surface.pixel_visible_serial,
                     color: color.map(crate::gui_color::ColorDescription::metadata),
                 })
             }
@@ -6909,6 +7231,7 @@ impl TrackedShmBuffer {
             width: self.width,
             height: self.height,
             rgba,
+            pixel_commit_serial: 0,
             color: None,
         })
     }
@@ -6920,12 +7243,20 @@ struct TrackedDmabufBuffer {
     height: u32,
     format: u32,
     flags: u32,
+    bridge_affinity: Option<(u32, u32)>,
     planes: Vec<TrackedDmabufPlane>,
 }
 
 impl TrackedDmabufBuffer {
     fn capture_error(&self) -> Option<String> {
         crate::gui_vulkan_dmabuf::screenshot_support_error(self.format)
+    }
+
+    fn render_affinity(&self, affinity: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        self.bridge_affinity.or(affinity).or_else(|| {
+            let fd = self.planes.first()?.fd.as_raw_fd();
+            dmabuf_render_affinity(fd)
+        })
     }
 }
 
@@ -6944,6 +7275,17 @@ struct CapturedRgbaFrame {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    pixel_commit_serial: u64,
+}
+
+impl CapturedRgbaFrame {
+    fn encode_png(mut self, baseline: u64) -> Result<Vec<u8>, String> {
+        let color = self.color.get_or_insert_with(|| serde_json::json!({}));
+        color["commit_serial"] = self.pixel_commit_serial.into();
+        color["baseline_commit_serial"] = baseline.into();
+        color["fresh"] = (self.pixel_commit_serial > baseline).into();
+        encode_rgba_png(self.width, self.height, &self.rgba, Some(color))
+    }
 }
 
 #[derive(Debug)]
@@ -6992,6 +7334,7 @@ struct TrackedSurface {
     commit_serial: u64,
     // Last commit that changed pixels; empty commits keep the owned GPU copy.
     pixel_commit_serial: u64,
+    pixel_visible_serial: u64,
     has_committed_buffer: bool,
     attach_pending: bool,
     xdg_configure_seen: bool,
@@ -7169,6 +7512,7 @@ async fn run_proxy_accept_loop(
                     }
                 };
                 let state = Arc::clone(&state);
+                let client_shutdown = shutdown.clone();
                 tokio::task::spawn_blocking(move || {
                     let runtime = tokio::runtime::Handle::current();
                     let std_stream = match stream.into_std() {
@@ -7180,7 +7524,7 @@ async fn run_proxy_accept_loop(
                             return;
                         }
                     };
-                    if let Err(err) = handle_proxy_client_blocking(std_stream, Arc::clone(&state))
+                    if let Err(err) = handle_proxy_client_blocking(std_stream, Arc::clone(&state), client_shutdown)
                         && !is_normal_client_disconnect(&err)
                     {
                         runtime.block_on(state.note_runtime_error(format!(
@@ -7199,10 +7543,47 @@ fn is_normal_client_disconnect(error: &str) -> bool {
         || error.contains("Wayland stream reached EOF")
 }
 
+fn report_client_failure(
+    client_id: WaylandClientId,
+    writer: &ClientWriter,
+    state: &WaylandProxyState,
+    runtime: &tokio::runtime::Handle,
+    error: String,
+) {
+    runtime.block_on(state.note_runtime_error(error.clone()));
+    let deliver = || -> Result<(), String> {
+        let bytes = encode_generated_event(
+            1,
+            &GeneratedEvent::WlDisplayError {
+                object_id: Some(1),
+                code: 3,
+                message: Some(error.clone()),
+            },
+        )?;
+        writer.send_origin(&bytes, &[], Origin::Local)?;
+        let sequence = writer.sequence();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), writer.wait(sequence))
+                .await
+                .map_err(|_| "error delivery timed out".to_string())?
+        })
+    };
+    if let Err(delivery_error) = deliver() {
+        runtime.block_on(state.note_runtime_error(format!(
+            "{error}; client {} could not receive wl_display.error: {delivery_error}",
+            client_id.0,
+        )));
+    }
+}
+
 fn handle_proxy_client_blocking(
     stream: StdUnixStream,
     state: Arc<WaylandProxyState>,
+    shutdown: CancellationToken,
 ) -> Result<(), String> {
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
     let runtime = tokio::runtime::Handle::current();
     stream
         .set_nonblocking(false)
@@ -7214,7 +7595,25 @@ fn handle_proxy_client_blocking(
         .set_write_timeout(Some(Duration::from_millis(200)))
         .map_err(|err| format!("failed to set proxy client write timeout: {err}"))?;
 
-    let client_id = runtime.block_on(state.register_live_client_session());
+    let client_id = match runtime.block_on(state.register_live_client_session()) {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            let bytes = encode_generated_event(
+                1,
+                &GeneratedEvent::WlDisplayError {
+                    object_id: Some(1),
+                    code: 3,
+                    message: Some(error.clone()),
+                },
+            )?;
+            if let Err(delivery_error) = send_wayland_wire_message(&stream, &bytes, &[]) {
+                return Err(format!(
+                    "{error}; could not deliver wl_display.error: {delivery_error}"
+                ));
+            }
+            return Err(error);
+        }
+    };
     runtime.block_on(state.track_object_interface(client_id, 1, "wl_display"))?;
     let backend_reader = runtime.block_on(state.backend_reader_stream(client_id))?;
     let raw_forward_only = runtime.block_on(state.raw_forward_only_flag(client_id))?;
@@ -7223,12 +7622,10 @@ fn handle_proxy_client_blocking(
         client_id,
         stream.try_clone().map_err(|err| err.to_string())?,
     ))?;
-    let mut backend_shutdown = None;
-    let mut backend_relay = if let Some(backend_reader) = backend_reader {
-        backend_shutdown =
-            Some(backend_reader.try_clone().map_err(|err| {
-                format!("failed to clone Wayland backend shutdown stream: {err}")
-            })?);
+    let backend_shutdown = backend_reader
+        .try_clone()
+        .map_err(|err| format!("failed to clone Wayland backend shutdown stream: {err}"))?;
+    let backend_relay = {
         let relay_client_writer = client_writer.clone();
         backend_reader
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -7237,7 +7634,7 @@ fn handle_proxy_client_blocking(
         let state = Arc::clone(&state);
         let relay_should_stop = Arc::clone(&relay_should_stop);
         let relay_raw_forward_only = Arc::clone(&raw_forward_only);
-        Some(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             relay_backend_events_blocking(
                 client_id,
                 backend_reader,
@@ -7247,22 +7644,26 @@ fn handle_proxy_client_blocking(
                 relay_should_stop,
                 relay_raw_forward_only,
             )
-        }))
-    } else {
-        None
+        })
     };
 
     let mut close_detail = "client closed its Wayland connection".to_string();
     let result = 'client_loop: loop {
+        if shutdown.is_cancelled() {
+            break Ok(());
+        }
         match read_wayland_wire_message_blocking(&stream, 16) {
             Ok(message) => {
                 let ingested = match runtime.block_on(state.ingest_request(client_id, message)) {
                     Ok(ingested) => ingested,
                     Err(err) => {
-                        runtime.block_on(state.note_runtime_error(format!(
-                            "client {} request ingest failed: {err}",
-                            client_id.0
-                        )));
+                        report_client_failure(
+                            client_id,
+                            &client_writer,
+                            &state,
+                            &runtime,
+                            format!("client {} request ingest failed: {err}", client_id.0),
+                        );
                         break 'client_loop Err(err);
                     }
                 };
@@ -7290,8 +7691,12 @@ fn handle_proxy_client_blocking(
                 break Ok(());
             }
             Err(err) => {
-                runtime.block_on(
-                    state.note_runtime_error(format!("client {} read failed: {err}", client_id.0)),
+                report_client_failure(
+                    client_id,
+                    &client_writer,
+                    &state,
+                    &runtime,
+                    format!("client {} read failed: {err}", client_id.0),
                 );
                 break 'client_loop Err(err);
             }
@@ -7300,12 +7705,8 @@ fn handle_proxy_client_blocking(
 
     relay_should_stop.store(true, Ordering::Relaxed);
     let _ = stream.shutdown(Shutdown::Both);
-    if let Some(backend_shutdown) = backend_shutdown {
-        let _ = backend_shutdown.shutdown(Shutdown::Both);
-    }
-    if let Some(backend_relay) = backend_relay.take()
-        && backend_relay.join().is_err()
-    {
+    let _ = backend_shutdown.shutdown(Shutdown::Both);
+    if backend_relay.join().is_err() {
         runtime.block_on(state.note_runtime_error(format!(
             "client {} backend relay thread panicked during shutdown",
             client_id.0
@@ -7338,22 +7739,35 @@ fn relay_backend_events_blocking(
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
-            Err(err) if err.contains("backend Wayland stream reached EOF") => break,
+            Err(err)
+                if is_normal_client_disconnect(&err) && should_stop.load(Ordering::Relaxed) =>
+            {
+                break;
+            }
             Err(err) => {
-                runtime.block_on(state.note_runtime_error(format!(
-                    "client {} backend read failed: {err}",
-                    client_id.0
-                )));
+                report_client_failure(
+                    client_id,
+                    &client_writer,
+                    &state,
+                    &runtime,
+                    format!("client {} backend read failed: {err}", client_id.0),
+                );
                 break;
             }
         };
         let event = match runtime.block_on(state.prepare_backend_event(client_id, message)) {
             Ok(event) => event,
             Err(err) => {
-                runtime.block_on(state.note_runtime_error(format!(
-                    "client {} backend event tracking failed: {err}",
-                    client_id.0
-                )));
+                report_client_failure(
+                    client_id,
+                    &client_writer,
+                    &state,
+                    &runtime,
+                    format!(
+                        "client {} backend event tracking failed: {err}",
+                        client_id.0
+                    ),
+                );
                 break;
             }
         };
@@ -8873,10 +9287,6 @@ fn apply_window_tracking(
             session
                 .frame_tracker
                 .note_surface_destroyed(request.object_id);
-            session.remove_object(request.object_id);
-            if let Some(backend) = session.backend.as_mut() {
-                backend.object_interfaces.remove(&request.object_id);
-            }
         }
         Some(GeneratedTrackedRequest::WlSurfaceSetBufferScale { scale }) => {
             session
@@ -9127,12 +9537,21 @@ struct DrmSyncobjDestroy {
     pad: u32,
 }
 
+#[repr(C)]
+struct DrmSyncobjTimelineArray {
+    handles: u64,
+    points: u64,
+    count_handles: u32,
+    flags: u32,
+}
+
 const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE: u32 = 1 << 1;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
 const DRM_IOCTL_SYNCOBJ_DESTROY: libc::c_ulong = drm_iowr::<DrmSyncobjDestroy>(0xC0);
 const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: libc::c_ulong = drm_iowr::<DrmSyncobjHandle>(0xC2);
 const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: libc::c_ulong = drm_iowr::<DrmSyncobjTimelineWait>(0xCA);
+const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: libc::c_ulong = drm_iowr::<DrmSyncobjTimelineArray>(0xCD);
 
 const fn drm_iowr<T>(nr: u8) -> libc::c_ulong {
     const IOC_WRITE: libc::c_ulong = 1;
@@ -9176,11 +9595,17 @@ fn wait_drm_syncobj_timeline_on_node(
     point: u64,
     timeout_nsec: i64,
 ) -> Result<(), String> {
-    let imported_fd = duplicate_fd(timeline_fd)?;
+    let handle = import_drm_syncobj(render_node, timeline_fd)?;
+    let wait_result = wait_drm_syncobj_handle(render_node, handle, point, timeout_nsec);
+    let destroy_result = destroy_drm_syncobj(render_node, handle);
+    wait_result.and(destroy_result)
+}
+
+fn import_drm_syncobj(render_node: &std::fs::File, timeline_fd: &OwnedFd) -> Result<u32, String> {
     let mut handle = DrmSyncobjHandle {
         handle: 0,
         flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE,
-        fd: imported_fd.as_raw_fd(),
+        fd: timeline_fd.as_raw_fd(),
         pad: 0,
         point: 0,
     };
@@ -9191,19 +9616,17 @@ fn wait_drm_syncobj_timeline_on_node(
             &mut handle,
         )
     };
-    drop(imported_fd);
     if import_result < 0 {
         return Err(format!(
             "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE failed: {}",
             std::io::Error::last_os_error()
         ));
     }
+    Ok(handle.handle)
+}
 
-    let wait_result = wait_drm_syncobj_handle(render_node, handle.handle, point, timeout_nsec);
-    let mut destroy = DrmSyncobjDestroy {
-        handle: handle.handle,
-        pad: 0,
-    };
+fn destroy_drm_syncobj(render_node: &std::fs::File, handle: u32) -> Result<(), String> {
+    let mut destroy = DrmSyncobjDestroy { handle, pad: 0 };
     let destroy_result = unsafe {
         libc::ioctl(
             render_node.as_raw_fd(),
@@ -9211,13 +9634,40 @@ fn wait_drm_syncobj_timeline_on_node(
             &mut destroy,
         )
     };
-    if destroy_result < 0 && wait_result.is_ok() {
+    if destroy_result < 0 {
         return Err(format!(
             "DRM_IOCTL_SYNCOBJ_DESTROY failed: {}",
             std::io::Error::last_os_error()
         ));
     }
-    wait_result
+    Ok(())
+}
+
+fn signal_drm_syncobj_handle(
+    render_node: &std::fs::File,
+    mut handle: u32,
+    mut point: u64,
+) -> Result<(), String> {
+    let mut signal = DrmSyncobjTimelineArray {
+        handles: (&mut handle as *mut u32) as u64,
+        points: (&mut point as *mut u64) as u64,
+        count_handles: 1,
+        flags: 0,
+    };
+    if unsafe {
+        libc::ioctl(
+            render_node.as_raw_fd(),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+            &mut signal,
+        )
+    } < 0
+    {
+        return Err(format!(
+            "DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn wait_drm_syncobj_handle(
@@ -9320,8 +9770,11 @@ fn read_vulkan_dmabuf_linear(
             modifier: plane.modifier,
         })
         .collect::<Vec<_>>();
+    let affinity = buffer
+        .render_affinity(affinity)
+        .ok_or("screenshot DRM affinity unavailable")?;
     let raw = visual.screenshot_raw(
-        affinity.ok_or("screenshot DRM affinity unavailable")?,
+        affinity,
         buffer.width,
         buffer.height,
         buffer.format,
@@ -9334,6 +9787,16 @@ fn read_vulkan_dmabuf_linear(
         buffer.format,
         color,
     )
+}
+
+fn dmabuf_render_affinity(fd: RawFd) -> Option<(u32, u32)> {
+    let exporter = crate::ssh_video::dma_buf_gpu(fd);
+    let node = match (exporter.as_deref(), crate::ssh_video::bridge_render_nodes()) {
+        (Some(node), _) => node,
+        (None, [node]) => node,
+        _ => return None,
+    };
+    crate::ssh_video::render_affinity(node).ok()
 }
 
 pub(crate) fn encode_rgba_png(
@@ -9376,6 +9839,7 @@ mod tests {
             globals: vec![],
             object_interfaces: HashMap::from([(1, "wl_display".into()), (10, "wl_surface".into())]),
             pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
         };
         let mut session = WaylandClientSession::new(client, vec![], Some(backend));
         session.track_object_interface_version(1, "wl_display", 1);
@@ -9411,6 +9875,119 @@ mod tests {
                 fds: vec![],
             },
         )?;
+        Ok(())
+    }
+
+    fn reply_to_frame_id_reservation(
+        server: &mut WaylandProxyServer,
+        client: WaylandClientId,
+        id: u32,
+    ) -> Result<WaylandBackendEvent, String> {
+        let done = server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: encode_generated_event(
+                    id,
+                    &GeneratedEvent::WlCallbackDone { callback_data: 1 },
+                )?,
+                fds: vec![],
+            },
+        )?;
+        assert!(done.suppressed);
+        server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: encode_generated_event(1, &GeneratedEvent::WlDisplayDeleteId { id })?,
+                fds: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn late_buffer_release_between_destroy_and_delete_id_is_discarded() -> Result<(), String> {
+        let (mut server, client, host, _) = frame_clock_fixture()?;
+        let buffer = 36;
+        let session = server.sessions.get_mut(&client).unwrap();
+        session.track_object_interface(buffer, "wl_buffer");
+        session
+            .backend
+            .as_mut()
+            .unwrap()
+            .object_interfaces
+            .insert(buffer, "wl_buffer".into());
+
+        let destroy = encode_u32_message(buffer, 0, &[]);
+        server.ingest_request(
+            client,
+            WaylandWireMessage {
+                bytes: destroy.clone(),
+                fds: vec![],
+            },
+        )?;
+        assert_eq!(
+            read_wayland_wire_message_from_fd(host.as_raw_fd(), 16, 0)?.bytes,
+            destroy
+        );
+        assert!(
+            server.sessions[&client]
+                .interface_for_object(buffer)
+                .is_none()
+        );
+
+        let release = encode_generated_event(buffer, &GeneratedEvent::WlBufferRelease)?;
+        let event = server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: release.clone(),
+                fds: vec![],
+            },
+        )?;
+        assert!(event.suppressed);
+        assert!(!server.sessions[&client].released_buffers.contains(&buffer));
+
+        let event = server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: encode_generated_event(
+                    1,
+                    &GeneratedEvent::WlDisplayDeleteId { id: buffer },
+                )?,
+                fds: vec![],
+            },
+        )?;
+        assert!(!event.suppressed);
+        let backend = server.sessions[&client].backend.as_ref().unwrap();
+        assert!(!backend.object_interfaces.contains_key(&buffer));
+        assert!(!backend.retired_client_objects.contains(&buffer));
+        assert!(
+            server
+                .prepare_backend_event(
+                    client,
+                    WaylandWireMessage {
+                        bytes: release.clone(),
+                        fds: vec![]
+                    },
+                )
+                .is_err()
+        );
+
+        let session = server.sessions.get_mut(&client).unwrap();
+        session.track_object_interface(buffer, "wl_buffer");
+        session
+            .backend
+            .as_mut()
+            .unwrap()
+            .object_interfaces
+            .insert(buffer, "wl_buffer".into());
+        let event = server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: release,
+                fds: vec![],
+            },
+        )?;
+        assert!(!event.suppressed);
+        assert!(server.sessions[&client].released_buffers.contains(&buffer));
         Ok(())
     }
 
@@ -9487,12 +10064,14 @@ mod tests {
     }
 
     #[test]
-    fn observed_frame_clock_completes_committed_callbacks_without_host_events() -> Result<(), String>
-    {
+    fn observed_frame_clock_reserves_upstream_ids_and_completes_locally() -> Result<(), String> {
         let (mut server, client, host, window) = frame_clock_fixture()?;
         let lease = server.begin_observation(Some(window), Duration::from_secs(1))?;
         frame_clock_request(&mut server, client, 3, &[20])?;
-        assert!(read_wayland_wire_message_from_fd(host.as_raw_fd(), 16, 0).is_err());
+        assert_eq!(
+            read_wayland_wire_message_from_fd(host.as_raw_fd(), 16, 0)?.bytes,
+            encode_u32_message(1, 0, &[20])
+        );
         assert!(
             server
                 .observed_frame_events(client, Instant::now() + Duration::from_secs(1))?
@@ -9507,15 +10086,14 @@ mod tests {
         server.observations.remove(&lease);
         let events =
             server.observed_frame_events(client, Instant::now() + Duration::from_secs(1))?;
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0].decoded.as_ref().unwrap().generated_event,
             GeneratedEvent::WlCallbackDone { .. }
         ));
-        assert!(matches!(
-            events[1].decoded.as_ref().unwrap().generated_event,
-            GeneratedEvent::WlDisplayDeleteId { id: 20 }
-        ));
+        assert!(server.sessions[&client].object_interfaces.contains_key(&20));
+        let deleted = reply_to_frame_id_reservation(&mut server, client, 20)?;
+        assert!(!deleted.suppressed);
         assert!(!server.sessions[&client].object_interfaces.contains_key(&20));
         assert!(
             !server.sessions[&client]
@@ -9533,6 +10111,7 @@ mod tests {
         // A released local ID can safely be reused in a subsequent request.
         server.begin_observation(None, Duration::from_secs(1))?;
         frame_clock_request(&mut server, client, 3, &[20])?;
+        assert!(reply_to_frame_id_reservation(&mut server, client, 20)?.suppressed);
         frame_clock_request(&mut server, client, 6, &[])?;
         assert_eq!(
             server
@@ -9600,6 +10179,11 @@ mod tests {
         server.mark_model_origin(&window)?;
         assert!(server.observing_surface(client, 10));
         frame_clock_request(&mut server, client, 3, &[20])?;
+        assert_eq!(
+            read_wayland_wire_message_from_fd(host.as_raw_fd(), 16, 0)?.bytes,
+            encode_u32_message(1, 0, &[20])
+        );
+        assert!(reply_to_frame_id_reservation(&mut server, client, 20)?.suppressed);
         frame_clock_request(&mut server, client, 6, &[])?;
         assert_eq!(
             read_wayland_wire_message_from_fd(host.as_raw_fd(), 16, 0)?.bytes,
@@ -9624,6 +10208,8 @@ mod tests {
         server.begin_observation(Some(window), Duration::from_secs(1))?;
         frame_clock_request(&mut server, client, 3, &[20])?;
         frame_clock_request(&mut server, client, 3, &[19])?;
+        assert!(reply_to_frame_id_reservation(&mut server, client, 20)?.suppressed);
+        assert!(reply_to_frame_id_reservation(&mut server, client, 19)?.suppressed);
         frame_clock_request(&mut server, client, 6, &[])?;
         let events =
             server.observed_frame_events(client, Instant::now() + Duration::from_secs(1))?;
@@ -9639,6 +10225,11 @@ mod tests {
         let (mut server, client, host, window) = frame_clock_fixture()?;
         server.begin_observation(Some(window), Duration::from_secs(1))?;
         frame_clock_request(&mut server, client, 3, &[20])?;
+        assert_eq!(
+            read_wayland_wire_message_from_fd(host.as_raw_fd(), 16, 0)?.bytes,
+            encode_u32_message(1, 0, &[20])
+        );
+        assert!(reply_to_frame_id_reservation(&mut server, client, 20)?.suppressed);
         let ingested = server.ingest_request(
             client,
             WaylandWireMessage {
@@ -9678,6 +10269,7 @@ mod tests {
         assert!(server.observing_surface(client, 10));
         assert!(!server.capture_tracking_active());
         frame_clock_request(&mut server, client, 3, &[20])?;
+        assert!(reply_to_frame_id_reservation(&mut server, client, 20)?.suppressed);
         frame_clock_request(&mut server, client, 6, &[])?;
         assert_eq!(
             server
@@ -9765,6 +10357,7 @@ mod tests {
             globals: vec![],
             object_interfaces: HashMap::from([(9, "zwp_linux_buffer_params_v1".into())]),
             pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
         };
         let mut session = WaylandClientSession::new(client, vec![], Some(backend));
         session.track_object_interface_version(9, "zwp_linux_buffer_params_v1", 3);
@@ -10062,6 +10655,7 @@ mod tests {
             globals: Vec::new(),
             object_interfaces: HashMap::from([(6, "wl_seat".to_string())]),
             pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
         };
         let client = WaylandClientId(2);
         let mut server = WaylandProxyServer::new(WaylandProxyConfig {
@@ -10261,6 +10855,7 @@ mod tests {
                 height: 4,
                 format: DRM_FORMAT_NV12,
                 flags: 0,
+                bridge_affinity: None,
                 planes: vec![TrackedDmabufPlane {
                     fd: duplicate_file_fd(&dmabuf_file)?,
                     plane_idx: 0,
@@ -10418,8 +11013,9 @@ mod tests {
         let tracker = &mut session.frame_tracker;
         tracker.note_xdg_surface_created(30, 10);
         let window = tracker.note_xdg_toplevel_created(30, 31)?;
-        let surface = tracker.surface_mut(10);
+        let surface = tracker.pending_surface_mut(10);
         surface.has_committed_buffer = true;
+        surface.pixel_commit_serial = 1;
         surface.rgba = vec![255, 0, 0, 255];
         tracker.commit_surface(10);
         server.sessions.insert(client, session);
@@ -10446,8 +11042,9 @@ mod tests {
                 .frame_tracker;
             tracker.note_subsurface_created(40, 11, 10);
             tracker.note_subsurface_sync(40, false);
-            let child = tracker.surface_mut(11);
+            let child = tracker.pending_surface_mut(11);
             child.has_committed_buffer = true;
+            child.pixel_commit_serial = 2;
             child.buffer_kind = Some("dmabuf");
             child.rgba = vec![0, 0, 255, 255];
             tracker.commit_surface(11);
@@ -10479,7 +11076,10 @@ mod tests {
                 .get_mut(&WaylandClientId(1))
                 .unwrap()
                 .frame_tracker;
-            tracker.surface_mut(11).rgba = vec![0, 255, 0, 255];
+            let serial = tracker.next_commit_serial + 1;
+            let child = tracker.pending_surface_mut(11);
+            child.pixel_commit_serial = serial;
+            child.rgba = vec![0, 255, 0, 255];
             tracker.commit_surface(11);
         });
         let png = backend.screenshot_surface(window.clone(), 11).await?;
@@ -10542,7 +11142,10 @@ mod tests {
                     .get_mut(&WaylandClientId(1))
                     .unwrap()
                     .frame_tracker;
-                tracker.surface_mut(10).rgba.clear();
+                let serial = tracker.next_commit_serial + 1;
+                let surface = tracker.pending_surface_mut(10);
+                surface.pixel_commit_serial = serial;
+                surface.rgba.clear();
                 tracker.commit_surface(10);
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -10590,10 +11193,46 @@ mod tests {
             .await?
             .ok_or("missing screenshot")?;
         assert!(started.elapsed() >= Duration::from_millis(250));
+        let png_info = png::Decoder::new(std::io::Cursor::new(&png))
+            .read_info()
+            .map_err(|e| e.to_string())?;
+        let metadata = &png_info.info().uncompressed_latin1_text[0];
+        assert_eq!(metadata.keyword, "wayland-mcp-color");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata.text).map_err(|e| e.to_string())?;
+        assert_eq!(metadata["fresh"], false);
+        assert_eq!(
+            metadata["commit_serial"],
+            metadata["baseline_commit_serial"]
+        );
         let pixels = image::load_from_memory(&png)
             .map_err(|e| e.to_string())?
             .to_rgba8();
         assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_next_frame_ignores_commits_without_new_pixels() -> Result<(), String> {
+        let (state, window) = screenshot_refresh_fixture()?;
+        state
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get_mut(&WaylandClientId(1))
+            .unwrap()
+            .frame_tracker
+            .commit_surface(10);
+        let error = state
+            .capture_next_frame_png(GuiCaptureNextFrameRequest {
+                window_id: Some(window),
+                after_commit_serial: Some(1),
+                timeout_ms: Some(20),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"));
         Ok(())
     }
 
@@ -10976,6 +11615,7 @@ mod tests {
             globals: Vec::new(),
             object_interfaces: HashMap::from([(22, "wl_shm".to_string())]),
             pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
         };
         let bytes = encode_u32_message(22, 0, &[0]);
         let mut fds = vec![duplicate_file_fd(&file)?];
@@ -11200,6 +11840,132 @@ mod tests {
 
         assert!(!server.capture_tracking_active());
         assert_eq!(server.capture_tracking_deadline, None);
+    }
+
+    #[test]
+    fn undecodable_backend_event_without_fds_is_not_silently_forwarded() {
+        let (stream, _peer) = StdUnixStream::pair().unwrap();
+        let mut backend = WaylandBackendSession {
+            stream,
+            globals: vec![],
+            object_interfaces: HashMap::new(),
+            pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
+        };
+        let error = reassociate_undecoded_backend_fds(
+            &mut backend,
+            &encode_u32_message(1000, 0, &[]),
+            &mut vec![],
+        )
+        .unwrap_err();
+        assert!(error.contains("1000"));
+    }
+
+    #[test]
+    fn failed_backend_connection_creates_no_client_or_synthetic_globals() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("missing-host");
+        let mut server = WaylandProxyServer::new(WaylandProxyConfig {
+            dmabuf_transparent: false,
+            socket_name: "test".into(),
+            backend_socket: socket.display().to_string(),
+        });
+        let error = server.register_client_session().unwrap_err();
+        assert!(error.contains(&socket.display().to_string()));
+        assert!(error.contains("failed to connect"));
+        assert!(server.sessions.is_empty());
+        assert!(!server.running);
+        assert_eq!(server.last_runtime_error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            server.connection_history.back().unwrap().event,
+            "backend_connect_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_backend_connection_sends_the_cause_as_a_display_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = WaylandGuiBackend::new();
+        let host = directory.path().join("missing-host").display().to_string();
+        backend.state.inner.lock().await.config.backend_socket = host.clone();
+        let socket = backend.launch_environment().unwrap().socket_path;
+        tokio::task::spawn_blocking(move || {
+            let client = StdUnixStream::connect(socket).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let message = read_wayland_wire_message_blocking(&client, 0).unwrap();
+            let event =
+                decode_wayland_event(&HashMap::from([(1, "wl_display".into())]), &message.bytes)
+                    .unwrap();
+            assert!(
+                matches!(event.generated_event, GeneratedEvent::WlDisplayError {
+                object_id: Some(1), code: 3, message: Some(message),
+            } if message.contains(&host) && message.contains("failed to connect"))
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(backend.snapshot().await.session_count, 0);
+    }
+
+    #[test]
+    fn registry_timeout_rejects_partial_globals() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("host");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            read_wayland_wire_message_blocking(&stream, 0).unwrap();
+            read_wayland_wire_message_blocking(&stream, 0).unwrap();
+            let global = encode_generated_event(
+                2,
+                &GeneratedEvent::WlRegistryGlobal {
+                    name: 1,
+                    interface: Some("wl_compositor".into()),
+                    version: 4,
+                },
+            )
+            .unwrap();
+            send_wayland_wire_message(&stream, &global, &[]).unwrap();
+            // Keep the connection open without completing the requested sync.
+            let _ = stream.read(&mut [0]);
+        });
+        let error =
+            discover_backend_globals_with_timeout(&socket, Duration::from_millis(50)).unwrap_err();
+        assert!(error.contains("before wl_display.sync completed"));
+        assert!(error.contains(&socket.display().to_string()));
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn missing_backend_cannot_serve_or_forward_requests() -> Result<(), String> {
+        let client = WaylandClientId(1);
+        let mut server = WaylandProxyServer::new(WaylandProxyConfig {
+            dmabuf_transparent: false,
+            socket_name: "test".into(),
+            backend_socket: "missing".into(),
+        });
+        let mut session = WaylandClientSession::new(client, vec![], None);
+        session.track_object_interface_version(1, "wl_display", 1);
+        server.sessions.insert(client, session);
+        assert!(server.backend_reader_stream(client).is_err());
+        assert!(server.poll_backend_events(client).is_err());
+        let error = server
+            .ingest_request(
+                client,
+                WaylandWireMessage {
+                    bytes: encode_u32_message(1, 1, &[2]),
+                    fds: vec![],
+                },
+            )
+            .err()
+            .ok_or("missing backend accepted a registry request")?;
+        assert!(error.contains("no upstream compositor connection"));
+        Ok(())
     }
 
     #[test]

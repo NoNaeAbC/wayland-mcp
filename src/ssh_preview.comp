@@ -1,0 +1,121 @@
+#version 450
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) readonly buffer Picture { uint pixels[]; } source;
+layout(set = 0, binding = 1, std430) writeonly buffer Compressed { uint words[]; } outputBlocks;
+layout(set = 0, binding = 2, std430) writeonly buffer BlockInfo { uvec4 entries[]; } outputInfo;
+layout(set = 0, binding = 3, std430) readonly buffer Extent { uint width, height; } image;
+
+const uint blockBytes = 2048u;
+// Fixed Huffman literals require at most nine bits per input byte.
+const uint slotWords = (blockBytes * 9u / 8u + 12u) / 4u;
+const uint adlerPrime = 65521u;
+const uint lengthBases[29] = uint[](3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258);
+const uint lengthExtra[29] = uint[](0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0);
+
+uint wordOffset;
+uint accumulator;
+uint bitsInWord;
+uint writtenBits;
+
+void writeBits(uint bits, uint count) {
+    accumulator |= bits << bitsInWord;
+    writtenBits += count;
+    bitsInWord += count;
+    if (bitsInWord >= 32u) {
+        outputBlocks.words[wordOffset++] = accumulator;
+        bitsInWord -= 32u;
+        accumulator = bitsInWord == 0u ? 0u : bits >> (count - bitsInWord);
+    }
+}
+
+void fixedCode(uint symbol) {
+    uint code;
+    uint size;
+    if (symbol < 144u) {
+        code = 48u + symbol;
+        size = 8u;
+    } else if (symbol < 256u) {
+        code = 400u + symbol - 144u;
+        size = 9u;
+    } else if (symbol < 280u) {
+        code = symbol - 256u;
+        size = 7u;
+    } else {
+        code = 192u + symbol - 280u;
+        size = 8u;
+    }
+    writeBits(bitfieldReverse(code) >> (32u - size), size);
+}
+
+uint filteredByte(uint offset) {
+    uint stride = image.width * 3u + 1u;
+    uint column = offset % stride;
+    if (column == 0u) {
+        return 1u; // PNG Sub filter
+    }
+    uint sampleIndex = column - 1u;
+    uint x = sampleIndex / 3u;
+    uint shift = (sampleIndex % 3u) * 8u;
+    uint index = (offset / stride) * image.width + x;
+    uint current = (source.pixels[index] >> shift) & 255u;
+    uint previous = x == 0u ? 0u : (source.pixels[index - 1u] >> shift) & 255u;
+    return (current - previous) & 255u;
+}
+
+void main() {
+    uint block = gl_GlobalInvocationID.x;
+    uint start = block * blockBytes;
+    uint total = (image.width * 3u + 1u) * image.height;
+    if (start >= total) {
+        return;
+    }
+    uint end = min(total, start + blockBytes);
+    wordOffset = block * slotWords;
+    accumulator = 0u;
+    bitsInWord = 0u;
+    writtenBits = 0u;
+    writeBits(2u, 3u); // non-final fixed Huffman block
+
+    uint sum = 1u;
+    uint weighted = 0u;
+    uint previous = 256u;
+    for (uint offset = start; offset < end;) {
+        uint value = filteredByte(offset);
+        uint run = 1u;
+        if (value == previous) {
+            uint limit = min(258u, end - offset);
+            while (run < limit && filteredByte(offset + run) == value) {
+                ++run;
+            }
+        }
+        if (run >= 3u) {
+            uint length = 28u;
+            while (run < lengthBases[length]) {
+                --length;
+            }
+            fixedCode(257u + length);
+            writeBits(run - lengthBases[length], lengthExtra[length]);
+            writeBits(0u, 5u); // repeat the preceding byte
+        } else {
+            fixedCode(value);
+            if (run == 2u) {
+                fixedCode(value);
+            }
+        }
+        weighted += run * sum + value * run * (run + 1u) / 2u;
+        sum += value * run;
+        offset += run;
+        previous = value;
+    }
+    fixedCode(256u);
+    // An empty stored block aligns the next independently encoded block to a byte.
+    writeBits(0u, 3u);
+    writeBits(0u, (8u - writtenBits % 8u) % 8u);
+    writeBits(0u, 16u);
+    writeBits(65535u, 16u);
+    if (bitsInWord != 0u) {
+        outputBlocks.words[wordOffset] = accumulator;
+    }
+    outputInfo.entries[block] = uvec4(writtenBits / 8u, end - start, sum % adlerPrime, weighted % adlerPrime);
+}

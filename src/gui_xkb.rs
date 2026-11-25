@@ -100,6 +100,7 @@ pub(crate) fn plan_text(
     keymap_text: &str,
     layout_group: u32,
     text: &str,
+    allow_compose: bool,
 ) -> Result<TextPlan, String> {
     let keymap_text = CString::new(keymap_text.trim_end_matches('\0'))
         .map_err(|_| "the client XKB keymap contains an interior NUL byte".to_string())?;
@@ -115,17 +116,28 @@ pub(crate) fn plan_text(
         );
     }
 
-    let strokes = text
-        .chars()
-        .map(|character| {
-            find_stroke(keymap.0, layout_group, character).ok_or_else(|| {
-                format!(
-                    "character {} is not directly representable by the target client's active XKB layout group {layout_group}",
-                    quoted_character(character)
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut strokes = Vec::with_capacity(text.chars().count());
+    let find = |symbol| find_stroke(keymap.0, layout_group, symbol);
+    for character in text.chars() {
+        if let Some(stroke) = find(character_keysym(character)) {
+            strokes.push(stroke);
+        } else if allow_compose
+            && let Some(dead_key) = spacing_accent_keysym(character).and_then(find)
+            && let Some(space) = find(character_keysym(' '))
+        {
+            strokes.extend([dead_key, space]);
+        } else {
+            let hint = if allow_compose {
+                r#". Apps that support Unicode hex input can use typeText with inputMethod "unicode-hex"."#
+            } else {
+                ""
+            };
+            return Err(format!(
+                "character {} is not directly representable by the target client's active XKB layout group {layout_group}{hint}",
+                quoted_character(character)
+            ));
+        }
+    }
     Ok(TextPlan {
         strokes,
         shift_modifier: modifier_mask(keymap.0, b"Shift\0"),
@@ -140,14 +152,30 @@ fn modifier_mask(keymap: *mut XkbKeymap, name: &'static [u8]) -> Option<u32> {
     (index < u32::BITS).then(|| 1u32 << index)
 }
 
-fn find_stroke(keymap: *mut XkbKeymap, layout_group: u32, character: char) -> Option<TextStroke> {
+fn character_keysym(character: char) -> u32 {
     // Newline and tab are control characters whose keyboard keysyms do not
     // round-trip through xkb_utf32_to_keysym in the same form.
-    let target_keysym = match character {
+    match character {
         '\n' | '\r' => 0xff0d, // XKB_KEY_Return
         '\t' => 0xff09,        // XKB_KEY_Tab
         character => unsafe { xkb_utf32_to_keysym(u32::from(character)) },
-    };
+    }
+}
+
+fn spacing_accent_keysym(character: char) -> Option<u32> {
+    Some(match character {
+        '`' => 0xfe50, // XKB_KEY_dead_grave
+        '^' => 0xfe52, // XKB_KEY_dead_circumflex
+        '~' => 0xfe53, // XKB_KEY_dead_tilde
+        _ => return None,
+    })
+}
+
+fn find_stroke(
+    keymap: *mut XkbKeymap,
+    layout_group: u32,
+    target_keysym: u32,
+) -> Option<TextStroke> {
     if target_keysym == 0 {
         return None;
     }
@@ -246,7 +274,7 @@ mod tests {
     fn text_plan_uses_the_target_keymap_instead_of_us_positions() {
         let german = keymap_for_layout("de");
 
-        let plan = plan_text(&german, 0, "Az 0!?").unwrap();
+        let plan = plan_text(&german, 0, "Az 0!?", false).unwrap();
 
         assert_eq!(
             plan.strokes,
@@ -293,8 +321,8 @@ mod tests {
     fn text_plan_honors_the_active_layout_group() {
         let layouts = keymap_for_layout("us,de");
 
-        let us = plan_text(&layouts, 0, "z?").unwrap();
-        let german = plan_text(&layouts, 1, "z?").unwrap();
+        let us = plan_text(&layouts, 0, "z?", false).unwrap();
+        let german = plan_text(&layouts, 1, "z?", false).unwrap();
 
         assert_eq!(
             us.strokes
@@ -314,11 +342,26 @@ mod tests {
     }
 
     #[test]
+    fn text_plan_can_enter_a_literal_caret_with_the_german_dead_key() {
+        let german = keymap_for_layout("de");
+        assert!(plan_text(&german, 0, "^", false).is_err());
+        let plan = plan_text(&german, 0, "^", true).unwrap();
+        assert_eq!(
+            plan.strokes
+                .iter()
+                .map(|stroke| (stroke.key, stroke.modifiers))
+                .collect::<Vec<_>>(),
+            [(41, 0), (57, 0)]
+        );
+    }
+
+    #[test]
     fn text_plan_rejects_characters_absent_from_the_active_keymap() {
         let german = keymap_for_layout("de");
 
-        let error = plan_text(&german, 0, "🙂").unwrap_err();
+        let error = plan_text(&german, 0, "🙂", true).unwrap_err();
 
         assert!(error.contains("not directly representable"));
+        assert!(error.contains("unicode-hex"));
     }
 }

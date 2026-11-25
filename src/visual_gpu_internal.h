@@ -4,8 +4,10 @@
 #include "visual_gpu.h"
 #include "visual_result.h"
 #include "visual_spirv.h"
+#include "vulkan_instance.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -118,7 +120,7 @@ inline bool same_color(const Visual_Color_Profile &a, const Visual_Color_Profile
 	return std::ranges::equal(a._weights, b._weights);
 }
 struct Context : visual::Non_Copyable {
-	VkInstance                       _instance{};
+	std::shared_ptr<visual::Vulkan_Instance> _instance;
 	VkPhysicalDevice                 _physical{};
 	VkDevice                         _device{};
 	VkQueue                          _queue{};
@@ -127,16 +129,20 @@ struct Context : visual::Non_Copyable {
 	VkDescriptorSetLayout            _layout{};
 	VkPipelineLayout                 _pipeline_layout{};
 	VkPipeline                       _pipeline{};
+	VkPipeline                       _video_pipeline{};
+	VkPipeline                       _preview_pipeline{};
+	VkDeviceSize                     _host_pointer_alignment{};
+	std::shared_ptr<void>             _snapshot_converter;
 	~Context() {
 		if (_device) {
 			vkDeviceWaitIdle(_device);
+			_snapshot_converter.reset();
+			vkDestroyPipeline(_device, _video_pipeline, nullptr);
+			vkDestroyPipeline(_device, _preview_pipeline, nullptr);
 			vkDestroyPipeline(_device, _pipeline, nullptr);
 			vkDestroyPipelineLayout(_device, _pipeline_layout, nullptr);
 			vkDestroyDescriptorSetLayout(_device, _layout, nullptr);
 			vkDestroyDevice(_device, nullptr);
-		}
-		if (_instance) {
-			vkDestroyInstance(_instance, nullptr);
 		}
 	}
 	[[nodiscard]] visual::Result<uint32_t> memory_type(uint32_t bits, VkMemoryPropertyFlags flags) {
@@ -148,30 +154,13 @@ struct Context : visual::Non_Copyable {
 		return std::unexpected("no compatible Vulkan memory type");
 	}
 	[[nodiscard]] visual::Status init(uint32_t major, uint32_t minor) {
-		VkApplicationInfo const app = {
-				.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-				.pNext              = {},
-				.pApplicationName   = "wayland-mcp-events",
-				.applicationVersion = {},
-				.pEngineName        = {},
-				.engineVersion      = {},
-				.apiVersion         = VK_API_VERSION_1_1,
-		};
-		VkInstanceCreateInfo const ci = {
-				.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-				.pNext                   = {},
-				.flags                   = {},
-				.pApplicationInfo        = &app,
-				.enabledLayerCount       = {},
-				.ppEnabledLayerNames     = {},
-				.enabledExtensionCount   = {},
-				.ppEnabledExtensionNames = {},
-		};
-		VISUAL_TRY(vk_status(vkCreateInstance(&ci, nullptr, &_instance), "vkCreateInstance"));
+		auto instance = visual::vulkan_instance(visual::Vulkan_Version::Compute);
+		if (!instance) { return vk_status(instance.error(), "vkCreateInstance"); }
+		_instance = std::move(*instance);
 		uint32_t count = 0;
-		VISUAL_TRY(vk_status(vkEnumeratePhysicalDevices(_instance, &count, nullptr), "enumerate devices"));
+		VISUAL_TRY(vk_status(vkEnumeratePhysicalDevices(_instance->_handle, &count, nullptr), "enumerate devices"));
 		std::vector<VkPhysicalDevice> devices(count);
-		VISUAL_TRY(vk_status(vkEnumeratePhysicalDevices(_instance, &count, devices.data()), "enumerate devices"));
+		VISUAL_TRY(vk_status(vkEnumeratePhysicalDevices(_instance->_handle, &count, devices.data()), "enumerate devices"));
 		// Never try imports on arbitrary GPUs. Match the compositor's DRM affinity
 		// first.
 		for (auto candidate: devices) {
@@ -226,7 +215,7 @@ struct Context : visual::Non_Copyable {
 				.queueCount       = 1,
 				.pQueuePriorities = &priority,
 		};
-		std::array<const char *, 7> exts{
+		std::vector<const char *> exts{
 				{
 						"VK_KHR_external_memory_fd",
 						"VK_EXT_external_memory_dma_buf",
@@ -237,6 +226,26 @@ struct Context : visual::Non_Copyable {
 						"VK_KHR_image_format_list",
 				},
 		};
+		uint32_t extension_count{};
+		VISUAL_TRY(vk_status(vkEnumerateDeviceExtensionProperties(_physical, nullptr, &extension_count, nullptr),
+			"query Vulkan device extensions"));
+		std::vector<VkExtensionProperties> extensions(extension_count);
+		VISUAL_TRY(vk_status(vkEnumerateDeviceExtensionProperties(_physical, nullptr, &extension_count, extensions.data()),
+			"enumerate Vulkan device extensions"));
+		if (std::ranges::any_of(extensions, [](const auto &extension) {
+			return std::string_view(extension.extensionName) == VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+		})) {
+			auto host = VkPhysicalDeviceExternalMemoryHostPropertiesEXT{
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT, .pNext = nullptr,
+				.minImportedHostPointerAlignment = 0,
+			};
+			auto properties = VkPhysicalDeviceProperties2{
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &host, .properties = {},
+			};
+			vkGetPhysicalDeviceProperties2(_physical, &properties);
+			_host_pointer_alignment = host.minImportedHostPointerAlignment;
+			exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		}
 		VkPhysicalDeviceFeatures supported{};
 		vkGetPhysicalDeviceFeatures(_physical, &supported);
 		VkPhysicalDeviceFeatures const enabled = {
@@ -305,7 +314,7 @@ struct Context : visual::Non_Copyable {
 				.pQueueCreateInfos       = &qi,
 				.enabledLayerCount       = {},
 				.ppEnabledLayerNames     = {},
-				.enabledExtensionCount   = 7,
+				.enabledExtensionCount   = static_cast<uint32_t>(exts.size()),
 				.ppEnabledExtensionNames = exts.data(),
 				.pEnabledFeatures        = &enabled,
 		};
@@ -394,7 +403,8 @@ struct Buffer : visual::Non_Copyable {
 		vkDestroyBuffer(_c->_device, _buffer, nullptr);
 		vkFreeMemory(_c->_device, _memory, nullptr);
 	}
-	[[nodiscard]] visual::Status init(Context *ctx, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false) {
+	[[nodiscard]] visual::Status init(Context *ctx, VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false,
+									 VkMemoryPropertyFlags preferred = 0) {
 		_c                          = ctx;
 		_size                       = bytes;
 		VkBufferCreateInfo const bi = {
@@ -410,10 +420,13 @@ struct Buffer : visual::Non_Copyable {
 		VISUAL_TRY(vk_status(vkCreateBuffer(_c->_device, &bi, nullptr, &_buffer), "create buffer"));
 		VkMemoryRequirements req{};
 		vkGetBufferMemoryRequirements(_c->_device, _buffer, &req);
-		auto memory_type_result =
-				_c->memory_type(req.memoryTypeBits, host ? VkFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT} |
-																	VkFlags{VK_MEMORY_PROPERTY_HOST_COHERENT_BIT}
-														 : VkFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT});
+		const auto required = host ? VkFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT} |
+									 VkFlags{VK_MEMORY_PROPERTY_HOST_COHERENT_BIT}
+								   : VkFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+		auto memory_type_result = _c->memory_type(req.memoryTypeBits, required | preferred);
+		if (!memory_type_result && preferred != 0) {
+			memory_type_result = _c->memory_type(req.memoryTypeBits, required);
+		}
 		if (!memory_type_result) {
 			return std::unexpected(std::move(memory_type_result.error()));
 		}
@@ -434,6 +447,47 @@ struct Buffer : visual::Non_Copyable {
 		return {};
 	}
 };
+inline VkFormat visual_capture_format(uint32_t fourcc) {
+	switch (fourcc) {
+		case 0x34325258u:
+		case 0x34325241u: return VK_FORMAT_B8G8R8A8_UNORM;
+		case 0x34324258u:
+		case 0x34324241u: return VK_FORMAT_R8G8B8A8_UNORM;
+		case 0x30335258u:
+		case 0x30335241u: return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+		case 0x30334258u:
+		case 0x30334241u: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+		case 0x48344258u:
+		case 0x48344241u: return VK_FORMAT_R16G16B16A16_SFLOAT;
+		default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
+inline bool visual_can_import_transfer(VkPhysicalDevice physical, VkFormat format, uint64_t modifier, VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+	const VkPhysicalDeviceExternalImageFormatInfo external{
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, .pNext = nullptr,
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+	};
+	const VkPhysicalDeviceImageDrmFormatModifierInfoEXT drm{
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, .pNext = &external,
+		.drmFormatModifier = modifier, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 0, .pQueueFamilyIndices = nullptr,
+	};
+	const VkPhysicalDeviceImageFormatInfo2 query{
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &drm,
+		.format = format, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+		.usage = usage, .flags = 0,
+	};
+	VkExternalImageFormatProperties memory{
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES, .pNext = nullptr, .externalMemoryProperties = {},
+	};
+	VkImageFormatProperties2 result{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &memory, .imageFormatProperties = {},
+	};
+	return vkGetPhysicalDeviceImageFormatProperties2(physical, &query, &result) == VK_SUCCESS &&
+		(memory.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
 struct Imported : visual::Non_Copyable {
 	Context                  *_c;
 	VkImage                   _image{};
@@ -473,7 +527,8 @@ struct Imported : visual::Non_Copyable {
 		return true;
 	}
 	[[nodiscard]] visual::Status init(uint64_t k, uint32_t w, uint32_t h, uint32_t fmt,
-									  std::span<const Visual_Plane> planes, bool /*screenshot*/ = false) {
+									  std::span<const Visual_Plane> planes, bool /*screenshot*/ = false,
+									  VkFormat format_override = VK_FORMAT_UNDEFINED, VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
 		const auto count = planes.size();
 		_key             = k;
 		_width           = w;
@@ -501,22 +556,12 @@ struct Imported : visual::Non_Copyable {
 		if (_sync_fd < 0) {
 			return std::unexpected("dup DMA-BUF sync fd failed");
 		}
-		VkFormat vf;
-		if (fmt == 0x34325258u || fmt == 0x34325241u) {
-			vf = VK_FORMAT_B8G8R8A8_UNORM;
-		} else if (fmt == 0x34324258u || fmt == 0x34324241u) {
-			vf = VK_FORMAT_R8G8B8A8_UNORM;
-		} else if ((fmt == 0x30335258u || fmt == 0x30335241u)) {
-			vf = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-		} else if ((fmt == 0x30334258u || fmt == 0x30334241u)) {
-			vf = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-		} else if ((fmt == 0x48344258u || fmt == 0x48344241u)) {
-			vf = VK_FORMAT_R16G16B16A16_SFLOAT;
-		} else {
-			return std::unexpected("unsupported RGB DMA-BUF format");
+		const auto vf = format_override == VK_FORMAT_UNDEFINED ? visual_capture_format(fmt) : format_override;
+		if (vf == VK_FORMAT_UNDEFINED) { return std::unexpected("unsupported RGB DMA-BUF format"); }
+		if (!visual_can_import_transfer(_c->_physical, vf, planes[0]._modifier, usage)) {
+			return std::unexpected("the capture GPU cannot import this DMA-BUF format and modifier for transfer");
 		}
 		std::vector<VkSubresourceLayout> layouts;
-		layouts.reserve(count);
 		layouts.reserve(count);
 		for (uint32_t i = 0; i < count; i++) {
 			layouts.push_back({
@@ -555,13 +600,24 @@ struct Imported : visual::Non_Copyable {
 				.arrayLayers           = 1,
 				.samples               = VK_SAMPLE_COUNT_1_BIT,
 				.tiling                = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-				.usage                 = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+				.usage                 = usage,
 				.sharingMode           = {},
 				.queueFamilyIndexCount = {},
 				.pQueueFamilyIndices   = {},
 				.initialLayout         = {},
 		};
 		VISUAL_TRY(vk_status(vkCreateImage(_c->_device, &ii, nullptr, &_image), "import image on affinity device"));
+		if (planes[0]._modifier == 0 && count == 1 && format_override == VK_FORMAT_UNDEFINED) {
+			// A driver can accept the import while substituting its own aligned row pitch.
+			constexpr VkImageSubresource PLANE{
+				.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, .mipLevel = 0, .arrayLayer = 0,
+			};
+			VkSubresourceLayout actual{};
+			vkGetImageSubresourceLayout(_c->_device, _image, &PLANE, &actual);
+			if (actual.rowPitch != layouts[0].rowPitch || actual.offset != layouts[0].offset) {
+				return std::unexpected("linear RGB DMA-BUF import changed the row pitch or offset");
+			}
+		}
 		VkMemoryRequirements req{};
 		vkGetImageMemoryRequirements(_c->_device, _image, &req);
 		Unique_Fd owned_fd(fcntl(planes[0]._fd, F_DUPFD_CLOEXEC, 3));
@@ -800,7 +856,15 @@ struct Program : visual::Non_Copyable {
 		VISUAL_TRY(vk_status(vkBeginCommandBuffer(_cmd, &begin), "begin commands"));
 		return {};
 	}
-	[[nodiscard]] visual::Status submit_wait(bool producer) {
+	struct Submission_Timing {
+		double finish_ms{};
+		double submit_ms{};
+		double wait_ms{};
+	};
+
+	[[nodiscard]] visual::Status submit_wait(bool producer, Submission_Timing *timing = nullptr) {
+		using Clock = std::chrono::steady_clock;
+		const auto before_finish = timing ? Clock::now() : Clock::time_point{};
 		VISUAL_TRY(vk_status(vkEndCommandBuffer(_cmd), "end commands"));
 		VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 		VkSubmitInfo const   submit     = {
@@ -814,42 +878,57 @@ struct Program : visual::Non_Copyable {
 				.signalSemaphoreCount = {},
 				.pSignalSemaphores    = {},
 		};
+		const auto before_submit = timing ? Clock::now() : Clock::time_point{};
 		VISUAL_TRY(vk_status(vkQueueSubmit(_c->_queue, 1, &submit, _fence), "submit visual work"));
+		const auto before_wait = timing ? Clock::now() : Clock::time_point{};
 		VkResult const completed = vkWaitForFences(_c->_device, 1, &_fence, VK_TRUE, 5'000'000'000ull);
+		if (timing) {
+			using Milliseconds = std::chrono::duration<double, std::milli>;
+			*timing = {
+				.finish_ms = Milliseconds(before_submit - before_finish).count(),
+				.submit_ms = Milliseconds(before_wait - before_submit).count(),
+				.wait_ms = Milliseconds(Clock::now() - before_wait).count(),
+			};
+		}
 		if (completed != VK_SUCCESS) {
 			vkDeviceWaitIdle(_c->_device);
 			VISUAL_TRY(vk_status(completed, "visual fence"));
 		}
 		return {};
 	}
-	[[nodiscard]] visual::Status capture(Imported *image, uint32_t pattern) {
+	[[nodiscard]] visual::Status import_producer_fence(const Imported &image) {
+		dma_buf_export_sync_file sync{
+				.flags = DMA_BUF_SYNC_READ,
+				.fd    = {},
+		};
+		if (ioctl(image._sync_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync) < 0) {
+			return std::unexpected("cannot export DMA-BUF producer fence");
+		}
+		VkImportSemaphoreFdInfoKHR const info = {
+				.sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+				.pNext      = {},
+				.semaphore  = _acquire,
+				.flags      = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+				.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+				.fd         = sync.fd,
+		};
+		auto import = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
+				vkGetDeviceProcAddr(_c->_device, "vkImportSemaphoreFdKHR"));
+		Unique_Fd owned_sync(sync.fd);
+		if (!import) {
+			return std::unexpected("producer fence import entry point unavailable");
+		}
+		VISUAL_TRY(vk_status(import(_c->_device, &info), "import producer fence"));
+		owned_sync.release();
+		return {};
+	}
+	[[nodiscard]] visual::Result<bool> record_capture(Imported *image, uint32_t pattern, bool implicit_sync) {
 		if (_captured) {
 			return std::unexpected("visual acquisition is already pending analysis");
 		}
-		if (image) {
-			dma_buf_export_sync_file sync{
-					.flags = DMA_BUF_SYNC_READ,
-					.fd    = {},
-			};
-			if (ioctl(image->_sync_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync) < 0) {
-				return std::unexpected("cannot export DMA-BUF producer fence");
-			}
-			VkImportSemaphoreFdInfoKHR const info = {
-					.sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
-					.pNext      = {},
-					.semaphore  = _acquire,
-					.flags      = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
-					.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-					.fd         = sync.fd,
-			};
-			auto import = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
-					vkGetDeviceProcAddr(_c->_device, "vkImportSemaphoreFdKHR"));
-			Unique_Fd owned_sync(sync.fd);
-			if (!import) {
-				return std::unexpected("producer fence import entry point unavailable");
-			}
-			VISUAL_TRY(vk_status(import(_c->_device, &info), "import producer fence"));
-			owned_sync.release();
+		const bool wait_for_producer = image && implicit_sync;
+		if (wait_for_producer) {
+			VISUAL_TRY(import_producer_fence(*image));
 		}
 		VISUAL_TRY(begin_commands());
 		barrier(VkFlags{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT} | VkFlags{VK_PIPELINE_STAGE_TRANSFER_BIT},
@@ -940,11 +1019,19 @@ struct Program : visual::Non_Copyable {
 		} else {
 			vkCmdFillBuffer(_cmd, _pixels._buffer, 0, _pixels._size, pattern);
 		}
-		// Only source acquisition delays forwarding. No agent computation or
-		// GPU-derived CPU readback runs while foreign ownership is held.
-		VISUAL_TRY(submit_wait(image != nullptr));
+		return wait_for_producer;
+	}
+	[[nodiscard]] visual::Status finish_capture(visual::Result<bool> recorded) {
+		if (!recorded) {
+			return std::unexpected(std::move(recorded.error()));
+		}
+		const auto wait_for_producer = *recorded;
+		VISUAL_TRY(submit_wait(wait_for_producer));
 		_captured = true;
 		return {};
+	}
+	[[nodiscard]] visual::Status capture(Imported *image, uint32_t pattern) {
+		return finish_capture(record_capture(image, pattern, true));
 	}
 	[[nodiscard]] visual::Result<int> analyze(Visual_Event *output) {
 		if (!_captured) {
@@ -981,8 +1068,8 @@ struct Program : visual::Non_Copyable {
 		std::memcpy(output, static_cast<char *>(_events._mapped) + 16, n * sizeof(Visual_Event));
 		return static_cast<int>(n);
 	}
-	[[nodiscard]] visual::Status capture_buffer(uint64_t key, uint32_t w, uint32_t h, uint32_t fmt,
-												const Visual_Plane *p, uint32_t n, bool screenshot = false) {
+	[[nodiscard]] visual::Result<Imported *> import_buffer(uint64_t key, uint32_t w, uint32_t h, uint32_t fmt,
+														const Visual_Plane *p, uint32_t n, bool screenshot) {
 		if (!p || !n || n > 4) {
 			return std::unexpected("invalid DMA-BUF planes");
 		}
@@ -1002,8 +1089,18 @@ struct Program : visual::Non_Copyable {
 			image = entry.get();
 			_imports.push_back(std::move(entry));
 		}
-		VISUAL_TRY(capture(image, 0));
-		return {};
+		return image;
+	}
+	[[nodiscard]] visual::Result<bool> record_capture_buffer(uint64_t key, uint32_t w, uint32_t h, uint32_t fmt,
+														const Visual_Plane *p, uint32_t n, bool screenshot,
+														bool implicit_sync) {
+		const auto image = import_buffer(key, w, h, fmt, p, n, screenshot);
+		if (!image) { return std::unexpected(image.error()); }
+		return record_capture(*image, 0, implicit_sync);
+	}
+	[[nodiscard]] visual::Status capture_buffer(uint64_t key, uint32_t w, uint32_t h, uint32_t fmt,
+												const Visual_Plane *p, uint32_t n, bool screenshot = false) {
+		return finish_capture(record_capture_buffer(key, w, h, fmt, p, n, screenshot, true));
 	}
 	void set_color(const Visual_Color_Profile &next) {
 		if (!same_color(_profile, next)) {

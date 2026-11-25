@@ -64,7 +64,13 @@ struct ProgramConfig {
     alpha_mode: u32,
     pass_count: u32,
 }
+pub(crate) fn cache_vulkan_instances(enabled: bool) {
+    // The native cache serializes access. Each context retains its own reference.
+    unsafe { visual_cache_vulkan_instances(enabled) }
+}
+
 unsafe extern "C" {
+    fn visual_cache_vulkan_instances(enabled: bool);
     fn visual_snapshot_create(
         context: *mut c_void,
         width: u32,
@@ -187,11 +193,15 @@ struct Device {
     context: Context,
     submission: Mutex<()>,
 }
-struct SnapshotNative(*mut c_void, u64);
+struct SnapshotNative {
+    handle: *mut c_void,
+    serial: u64,
+    staging: Option<(String, crate::gui_backend_wayland::bridge::DisplayBuffer)>,
+}
 unsafe impl Send for SnapshotNative {}
 impl Drop for SnapshotNative {
     fn drop(&mut self) {
-        unsafe { visual_snapshot_destroy(self.0) }
+        unsafe { visual_snapshot_destroy(self.handle) }
     }
 }
 struct SnapshotSlot {
@@ -526,6 +536,12 @@ fn canonical_drm_device(affinity: (u32, u32)) -> (u32, u32) {
     }
     affinity
 }
+fn snapshot_key(window: &str, surface: Option<u32>) -> std::borrow::Cow<'_, str> {
+    match surface {
+        Some(id) => format!("{window}/{id}").into(),
+        None => window.into(),
+    }
+}
 impl VisualHub {
     fn device(&self, affinity: (u32, u32)) -> Result<Arc<Device>, String> {
         let mut state = self.inner.lock().unwrap();
@@ -551,6 +567,7 @@ impl VisualHub {
     pub(crate) fn retain_snapshot(
         &self,
         window: &str,
+        surface: Option<u32>,
         affinity: (u32, u32),
         key: u64,
         width: u32,
@@ -563,15 +580,16 @@ impl VisualHub {
         if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 8_388_608 {
             return Err("invalid GPU snapshot extent".into());
         }
+        let snapshot_key = snapshot_key(window, surface);
         let device = self.device(affinity)?;
         let existing = {
             let mut state = self.inner.lock().unwrap();
-            if state.snapshots.get(window).is_some_and(|s| {
+            if state.snapshots.get(snapshot_key.as_ref()).is_some_and(|s| {
                 s.affinity != affinity || s.extent_format != (width, height, format)
             }) {
-                state.snapshots.remove(window);
+                state.snapshots.remove(snapshot_key.as_ref());
             }
-            state.snapshots.get(window).cloned()
+            state.snapshots.get(snapshot_key.as_ref()).cloned()
         };
         let snapshot = if let Some(snapshot) = existing {
             snapshot
@@ -589,17 +607,38 @@ impl VisualHub {
                 return Err(error_text(&error));
             }
             let snapshot = Arc::new(SnapshotSlot {
-                native: Mutex::new(SnapshotNative(pointer, 0)),
+                native: Mutex::new(SnapshotNative {
+                    handle: pointer,
+                    serial: 0,
+                    staging: None,
+                }),
                 device: device.clone(),
                 affinity,
                 extent_format: (width, height, format),
             });
             drop(creation);
             let mut state = self.inner.lock().unwrap();
-            if state.snapshots.len() >= 8 {
+            if surface.is_some() {
+                let auxiliary = state.snapshots.iter().filter(|(key, _)| key.contains('/'));
+                let (count, pixels) = auxiliary.fold((0, 0), |(count, pixels), (_, snapshot)| {
+                    let (width, height, _) = snapshot.extent_format;
+                    (count + 1, pixels + u64::from(width) * u64::from(height))
+                });
+                if count >= 32 || pixels + u64::from(width) * u64::from(height) > 8_388_608 {
+                    return Ok(false);
+                }
+            } else if state
+                .snapshots
+                .keys()
+                .filter(|key| !key.contains('/'))
+                .count()
+                >= 8
+            {
                 return Ok(false);
             }
-            state.snapshots.insert(window.into(), snapshot.clone());
+            state
+                .snapshots
+                .insert(snapshot_key.into_owned(), snapshot.clone());
             snapshot
         };
         // Cache acquisition is bounded and skips busy devices before waiting
@@ -620,7 +659,7 @@ impl VisualHub {
         let mut error = [0 as c_char; 512];
         let result = unsafe {
             visual_snapshot_capture(
-                native.0,
+                native.handle,
                 key,
                 planes.as_ptr(),
                 planes.len() as u32,
@@ -629,13 +668,19 @@ impl VisualHub {
         };
         drop(submission);
         if result < 0 {
-            native.1 = 0;
+            native.serial = 0;
             return Err(error_text(&error));
         }
-        native.1 = serial;
+        native.serial = serial;
         Ok(true)
     }
-    pub(crate) fn read_snapshot(&self, window: &str) -> Result<SnapshotPixels, String> {
+    pub(crate) fn video_snapshot(
+        &self,
+        window: &str,
+        serial: u64,
+        request: &crate::ssh_video::FrameRequest,
+        color: Option<&ColorDescription>,
+    ) -> Result<crate::ssh_video::VideoSnapshot, String> {
         let snapshot = self
             .inner
             .lock()
@@ -644,9 +689,52 @@ impl VisualHub {
             .get(window)
             .cloned()
             .ok_or("snapshot_unavailable: no GPU-owned render buffer yet")?;
+        if serial == 0 || snapshot.native.lock().unwrap().serial != serial {
+            return Err("snapshot_unavailable: retained GPU frame is stale".into());
+        }
+        crate::ssh_video::prepare_snapshot_video(
+            request,
+            snapshot.affinity,
+            snapshot.extent_format,
+            color,
+            |capture, options, profile, encode, stream| {
+                let _submission = snapshot.device.submission.lock().unwrap();
+                let mut native = snapshot.native.lock().unwrap();
+                if native.serial != serial {
+                    return Err("snapshot_unavailable: retained GPU frame is stale".into());
+                }
+                // The snapshot and its Vulkan queue are pinned by these guards.
+                unsafe {
+                    crate::ssh_video::convert_video_snapshot(
+                        native.handle,
+                        options,
+                        profile,
+                        stream,
+                        capture,
+                        encode,
+                        &mut native.staging,
+                    )
+                }
+            },
+        )
+    }
+
+    pub(crate) fn read_snapshot(
+        &self,
+        window: &str,
+        surface: Option<u32>,
+    ) -> Result<SnapshotPixels, String> {
+        let snapshot = self
+            .inner
+            .lock()
+            .unwrap()
+            .snapshots
+            .get(snapshot_key(window, surface).as_ref())
+            .cloned()
+            .ok_or("snapshot_unavailable: no GPU-owned render buffer yet")?;
         let _submission = snapshot.device.submission.lock().unwrap();
         let native = snapshot.native.lock().unwrap();
-        if native.1 == 0 {
+        if native.serial == 0 {
             return Err("snapshot_unavailable: no completed GPU snapshot".into());
         }
         let (width, height, format) = snapshot.extent_format;
@@ -659,7 +747,7 @@ impl VisualHub {
         let mut error = [0 as c_char; 512];
         let result = unsafe {
             visual_snapshot_read(
-                native.0,
+                native.handle,
                 raw.as_mut_ptr(),
                 raw.len() as u32,
                 error.as_mut_ptr(),
@@ -673,7 +761,7 @@ impl VisualHub {
             width,
             height,
             format,
-            serial: native.1,
+            serial: native.serial,
         })
     }
     // Explicit screenshot bootstrap uses the SAME DRM-affine context/queue as
@@ -989,7 +1077,12 @@ impl VisualHub {
     }
     pub(crate) fn close_window(&self, window: &str, reason: &str) {
         if matches!(reason, "window_destroyed" | "client_disconnected") {
-            self.inner.lock().unwrap().snapshots.remove(window);
+            self.inner.lock().unwrap().snapshots.retain(|key, _| {
+                key != window
+                    && !key
+                        .strip_prefix(window)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            });
         }
         let ids = self
             .inner
@@ -1002,6 +1095,14 @@ impl VisualHub {
         for id in ids {
             let _ = self.stop(id, reason);
         }
+    }
+
+    pub(crate) fn remove_surface_snapshot(&self, window: &str, surface_id: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .snapshots
+            .remove(snapshot_key(window, Some(surface_id)).as_ref());
     }
     pub(crate) fn expire(&self) {
         let ids = self

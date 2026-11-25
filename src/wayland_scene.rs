@@ -155,6 +155,40 @@ impl WaylandFrameTracker {
             scale,
         })
     }
+    pub(super) fn scene_pixel_commit_serial(&self, window: &str) -> Option<u64> {
+        self.observation_scene(window)
+            .ok()?
+            .layers
+            .iter()
+            .map(|layer| layer.surface.pixel_visible_serial)
+            .max()
+    }
+
+    fn missing_scene_pixels(&self, window: &str, surface: &TrackedSurface) -> String {
+        let detail = surface.capture_error.clone().unwrap_or_else(|| {
+            format!(
+                "snapshot_unavailable: surface {} has no owned committed pixels",
+                surface.id
+            )
+        });
+        if self
+            .surface_for_window(window)
+            .is_some_and(|root| root.id != surface.id && root.buffer_kind == Some("dmabuf"))
+        {
+            format!(
+                r#"{detail}. Surface {} blocked window capture. Capture the render buffer alone with screenshot({{windowId: {window:?}, coordinateSpace: "buffer"}})"#,
+                surface.id
+            )
+        } else if surface.buffer_kind == Some("shm") {
+            format!(
+                "{detail}. Surface {} needs DMA-BUF backing for capture",
+                surface.id
+            )
+        } else {
+            detail
+        }
+    }
+
     pub(super) fn scene_capture_error(&self, window: &str) -> Option<String> {
         let scene = match self.observation_scene(window) {
             Ok(scene) => scene,
@@ -170,12 +204,7 @@ impl WaylandFrameTracker {
             if surface.rgba.len() != surface.width as usize * surface.height as usize * 4
                 && surface.linear_rgba.len() != surface.width as usize * surface.height as usize
             {
-                return Some(surface.capture_error.clone().unwrap_or_else(|| {
-                    format!(
-                        "snapshot_unavailable: surface {} has no owned committed pixels",
-                        surface.id
-                    )
-                }));
+                return Some(self.missing_scene_pixels(window, surface));
             }
         }
         None
@@ -196,12 +225,7 @@ impl WaylandFrameTracker {
             if surface.rgba.len() != surface.width as usize * surface.height as usize * 4
                 && surface.linear_rgba.len() != surface.width as usize * surface.height as usize
             {
-                return Err(surface.capture_error.clone().unwrap_or_else(|| {
-                    format!(
-                        "snapshot_unavailable: surface {} has no owned committed pixels",
-                        surface.id
-                    )
-                }));
+                return Err(self.missing_scene_pixels(window, surface));
             }
             let x0 = ((layer.x - scene.origin.0) * scene.scale).floor().max(0.0) as u32;
             let y0 = ((layer.y - scene.origin.1) * scene.scale).floor().max(0.0) as u32;
@@ -260,6 +284,12 @@ impl WaylandFrameTracker {
             height: scene.size.1,
             rgba,
             color,
+            pixel_commit_serial: scene
+                .layers
+                .iter()
+                .map(|layer| layer.surface.pixel_visible_serial)
+                .max()
+                .unwrap_or_default(),
         })
     }
     pub(super) fn surface_pointer_target(

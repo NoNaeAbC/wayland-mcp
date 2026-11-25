@@ -1,0 +1,290 @@
+#version 450
+#define COLOR_BINDING 2
+#define VIDEO_TRANSFER_TABLE
+layout(constant_id=0) const uint SPECIAL_MODE = 0xffffffffu;
+layout(constant_id=1) const uint SPECIAL_FORMAT = 0xffffffffu;
+layout(constant_id=2) const uint SPECIAL_DEPTH = 0xffffffffu;
+layout(constant_id=3) const uint SPECIAL_CHROMA = 0xffffffffu;
+#define FRAME_MODE (SPECIAL_MODE == 0xffffffffu ? opts.mode : SPECIAL_MODE)
+#define FRAME_FORMAT (SPECIAL_FORMAT == 0xffffffffu ? opts.format : SPECIAL_FORMAT)
+#define FRAME_DEPTH (SPECIAL_DEPTH == 0xffffffffu ? opts.depth : SPECIAL_DEPTH)
+#define FRAME_CHROMA (SPECIAL_CHROMA == 0xffffffffu ? opts.chroma : SPECIAL_CHROMA)
+#define VIDEO_TRANSFER_TABLE_ENABLED ((FRAME_MODE & 16384u) != 0u)
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputWords { uint rgba[]; } raw;
+layout(set = 0, binding = 1, std430) writeonly buffer OutputWords { uint pixel[]; } outputFrame;
+layout(set = 0, binding = 3, std430) readonly buffer Options {
+    uint width, height, codedWidth, codedHeight;
+    uint format, depth, chroma, mode;
+    uint toneMap;
+    float exposure;
+    uint background, tonePoints;
+    vec2 curve[16];
+    uint sourceStride, sourceOffset, outputOffset, reserved;
+} opts;
+layout(set = 0, binding = 4, std430) buffer AlphaPicture { uint words[]; } alphaFrame;
+uint sourceWord(uint index) {
+    if (opts.sourceStride == 0u) {
+        return raw.rgba[index];
+    }
+    uint offset = opts.sourceOffset + (index / opts.width) * opts.sourceStride + (index % opts.width) * 4u;
+    uint shift = (offset & 3u) * 8u;
+    uint first = raw.rgba[offset / 4u];
+    return shift == 0u ? first : (first >> shift) | (raw.rgba[offset / 4u + 1u] << (32u - shift));
+}
+#define VISUAL_SOURCE_WORD(index) sourceWord(index)
+layout(set = 0, binding = 5, std430) buffer AlphaStatus { uint flags; } alphaStatus;
+// VISUAL_COLOR_GLSL
+
+const uint DECODE = 1u;
+const uint WITH_ALPHA = 2u;
+const uint ALPHA_ONLY = 1024u;
+const uint IDENTITY_SDR = 4096u;
+const uint COMPARE_ALPHA = 8192u;
+const uint COLLECT_ALPHA = 32768u;
+shared uint groupAlphaFlags;
+const vec3 coefficients = vec3(0.2126, 0.7152, 0.0722);
+vec3 srgb(vec3 p) {
+    if (VIDEO_TRANSFER_TABLE_ENABLED) {
+        return vec3(lookupVideoTransfer(p.r, 4097u), lookupVideoTransfer(p.g, 4097u), lookupVideoTransfer(p.b, 4097u));
+    }
+    return mix(1.055 * pow(p, vec3(1.0 / 2.4)) - 0.055, 12.92 * p, lessThanEqual(p, vec3(0.0031308)));
+}
+
+float curveAt(float peak) {
+    for (uint i = 1u; i < opts.tonePoints; ++i) {
+        if (peak <= opts.curve[i].x) {
+            vec2 first = opts.curve[i - 1u];
+            vec2 next = opts.curve[i];
+            return mix(first.y, next.y, (peak - first.x) / (next.x - first.x));
+        }
+    }
+    return opts.curve[opts.tonePoints - 1u].y;
+}
+
+
+vec4 toYuv(uvec2 pos, bool withAlpha) {
+    uint stride = (FRAME_FORMAT == 0x48344258u || FRAME_FORMAT == 0x48344241u) ? 2u : 1u;
+    vec4 source = unpackSource((pos.y * opts.width + pos.x) * stride, FRAME_FORMAT);
+    source.a = isnan(source.a) ? 0.0 : source.a;
+    if ((FRAME_MODE & ALPHA_ONLY) != 0u) {
+        return vec4(0.0, clamp(source.a, 0.0, 1.0), 0.0, 1.0);
+    }
+    if ((FRAME_MODE & IDENTITY_SDR) != 0u) {
+        vec3 rgb = withAlpha && source.a > 0.0 ? clamp(source.rgb / source.a, 0.0, 1.0) : source.rgb;
+        float y = dot(coefficients, rgb);
+        return vec4((rgb.b - y) / (2.0 * (1.0 - coefficients.b)), y,
+                    (rgb.r - y) / (2.0 * (1.0 - coefficients.r)), source.a);
+    }
+    vec4 inputColor = normalizeSource(source);
+    vec3 foreground = inputColor.rgb;
+    foreground = mix(mix(foreground, vec3(0.0), isnan(foreground)), vec3(0.0), isinf(foreground));
+    vec3 linear = withAlpha ? foreground : foreground * inputColor.a;
+    if (!withAlpha && opts.background == 1u && (((pos.x / 16u) ^ (pos.y / 16u)) & 1u) != 0u) {
+        linear += vec3(0.18) * (1.0 - inputColor.a);
+    }
+    linear *= opts.exposure;
+    float peak = max(max(linear.r, linear.g), linear.b);
+    if (opts.toneMap == 1u) {
+        // Knee preserves SDR values below 0.75 and compresses highlights.
+        float over = max(peak - 0.75, 0.0);
+        if (over > 0.0) {
+            linear *= (0.75 + 0.25 * over / (0.25 + over)) / peak;
+        }
+    } else if (opts.toneMap == 2u) {
+        linear /= 1.0 + max(peak, 0.0);
+    } else if (opts.toneMap == 3u && peak > 0.0) {
+        linear *= curveAt(peak) / peak;
+    }
+    vec3 rgb = srgb(clamp(linear, 0.0, 1.0));
+    float y = dot(coefficients, rgb);
+    return vec4((rgb.b - y) / (2.0 * (1.0 - coefficients.b)), y,
+                (rgb.r - y) / (2.0 * (1.0 - coefficients.r)), inputColor.a);
+}
+
+uint planeSample(uint index) {
+    if (FRAME_DEPTH == 8u) {
+        return (raw.rgba[index / 4u] >> ((index % 4u) * 8u)) & 255u;
+    }
+    return (raw.rgba[index / 2u] >> ((index % 2u) * 16u + 6u)) & 1023u;
+}
+
+uint packBytes(uvec4 value) {
+    return value.x | (value.y << 8u) | (value.z << 16u) | (value.w << 24u);
+}
+
+void updateAlpha(uint topIndex, uint bottomIndex, uint top, uint bottom) {
+    uint flags = top != 0xffffffffu || bottom != 0xffffffffu ? 1u : 0u;
+    if ((FRAME_MODE & COMPARE_ALPHA) == 0u ||
+        top != alphaFrame.words[topIndex] || bottom != alphaFrame.words[bottomIndex]) {
+        flags |= 2u;
+        alphaFrame.words[topIndex] = top;
+        alphaFrame.words[bottomIndex] = bottom;
+    }
+    if (flags != 0u) {
+        atomicOr(groupAlphaFlags, flags);
+    }
+}
+
+uvec2 sampleBlock(uvec2 origin, uvec2 block, bool withAlpha, float full, float center, out vec4 colors[4]) {
+    vec2 chroma = vec2(0.0);
+    float weights = 0.0;
+    for (uint j = 0u; j < block.y; ++j) {
+        for (uint i = 0u; i < block.x; ++i) {
+            vec4 color = toYuv(min(origin + uvec2(i, j), uvec2(opts.width, opts.height) - 1u), withAlpha);
+            colors[j * block.x + i] = color;
+            float weight = withAlpha ? color.a : 1.0;
+            chroma += color.xz * weight;
+            weights += weight;
+        }
+    }
+    return uvec2(roundEven(clamp(chroma * (weights > 0.0 ? full / weights : 0.0) + center, 0.0, full)));
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    bool withAlpha = (FRAME_MODE & WITH_ALPHA) != 0u;
+    if ((FRAME_MODE & DECODE) != 0u) {
+        if (p.x >= opts.width || p.y >= opts.height) {
+            return;
+        }
+        uvec2 samplePos = p;
+        if (opts.sourceStride != 0u) {
+            samplePos = ((p * 2u + 1u) * uvec2(opts.sourceStride, opts.sourceOffset)) /
+                        (2u * uvec2(opts.width, opts.height));
+        }
+        uint index = samplePos.y * opts.codedWidth + samplePos.x;
+        uint packed;
+        if (FRAME_CHROMA == 420u) {
+            uint chromaIndex = opts.codedHeight * opts.codedWidth + samplePos.y / 2u * opts.codedWidth + (samplePos.x & ~1u);
+            packed = planeSample(chromaIndex) | (planeSample(index) << 10) | (planeSample(chromaIndex + 1u) << 20);
+        } else if (FRAME_CHROMA == 422u) {
+            uint y = (raw.rgba[index] >> 6u) & 1023u;
+            uint cb = raw.rgba[index & ~1u] >> 22u;
+            uint cr = raw.rgba[index | 1u] >> 22u;
+            packed = cb | (y << 10u) | (cr << 20u);
+        } else if (FRAME_DEPTH == 8u) {
+            uint word = raw.rgba[index];
+            packed = ((word >> 8u) & 255u) | (((word >> 16u) & 255u) << 10u) | ((word & 255u) << 20u);
+        } else {
+            packed = raw.rgba[index];
+        }
+        float full = float((1u << FRAME_DEPTH) - 1u);
+        float center = float(1u << (FRAME_DEPTH - 1u));
+        float cb = (float(packed & 1023u) - center) / full;
+        float y = float((packed >> 10) & 1023u) / full;
+        float cr = (float((packed >> 20) & 1023u) - center) / full;
+        float r = y + 2.0 * (1.0 - coefficients.r) * cr;
+        float b = y + 2.0 * (1.0 - coefficients.b) * cb;
+        float g = (y - coefficients.r * r - coefficients.b * b) / coefficients.g;
+        bool bgr = FRAME_FORMAT == 0x34325258u || FRAME_FORMAT == 0x34325241u ||
+                   FRAME_FORMAT == 0x30335258u || FRAME_FORMAT == 0x30335241u;
+        vec3 rgb = bgr ? vec3(b, g, r) : vec3(r, g, b);
+        float alpha = 1.0;
+        if (withAlpha) {
+            uint alphaValue = (alphaFrame.words[index / 4u] >> ((index % 4u) * 8u)) & 255u;
+            alpha = float(alphaValue) / 255.0;
+        }
+        // Wayland destination buffers carry premultiplied sRGB.
+        rgb = clamp(rgb, 0.0, 1.0) * alpha;
+        uint result;
+        if (FRAME_FORMAT == 0x30335258u || FRAME_FORMAT == 0x30335241u ||
+            FRAME_FORMAT == 0x30334258u || FRAME_FORMAT == 0x30334241u) {
+            uvec3 c = uvec3(roundEven(rgb * 1023.0));
+            result = c.x | (c.y << 10u) | (c.z << 20u) | (uint(roundEven(alpha * 3.0)) << 30u);
+        } else {
+            result = packUnorm4x8(vec4(rgb, alpha));
+        }
+        outputFrame.pixel[opts.outputOffset + p.y * opts.width + p.x] = result;
+        return;
+    }
+    uvec2 block = uvec2(FRAME_CHROMA == 444u ? 1u : 2u, FRAME_CHROMA == 420u ? 2u : 1u);
+    bool nv12 = FRAME_DEPTH == 8u && FRAME_CHROMA == 420u;
+    bool alphaOnly = (FRAME_MODE & ALPHA_ONLY) != 0u;
+    bool collectAlpha = (FRAME_MODE & COLLECT_ALPHA) != 0u;
+    bool updateMask = alphaOnly || collectAlpha;
+    uvec2 origin = p * block * uvec2(nv12 ? 2u : 1u, 1u);
+    bool inside = origin.x < opts.codedWidth && origin.y < opts.codedHeight;
+    if (updateMask) {
+        if (gl_LocalInvocationIndex == 0u) {
+            groupAlphaFlags = 0u;
+        }
+        barrier();
+    } else if (!inside) {
+        return;
+    }
+    float full = float((1u << FRAME_DEPTH) - 1u);
+    float center = float(1u << (FRAME_DEPTH - 1u));
+    if (nv12) {
+        if (inside) {
+            uvec4 top = uvec4(0u), bottom = uvec4(0u), uv = uvec4(0u);
+            uvec4 alphaTop = uvec4(0u), alphaBottom = uvec4(0u);
+            for (uint pair = 0u; pair < 2u; ++pair) {
+                vec4 direct[4];
+                uvec2 codes = sampleBlock(origin + uvec2(pair * 2u, 0u), block, withAlpha, full, center, direct);
+                top[pair * 2u] = uint(roundEven(direct[0].y * full));
+                top[pair * 2u + 1u] = uint(roundEven(direct[1].y * full));
+                bottom[pair * 2u] = uint(roundEven(direct[2].y * full));
+                bottom[pair * 2u + 1u] = uint(roundEven(direct[3].y * full));
+                uv[pair * 2u] = codes.x;
+                uv[pair * 2u + 1u] = codes.y;
+                if (collectAlpha) {
+                    uvec4 a = uvec4(roundEven(vec4(direct[0].a, direct[1].a, direct[2].a, direct[3].a) * 255.0));
+                    alphaTop[pair * 2u] = a.x;
+                    alphaTop[pair * 2u + 1u] = a.y;
+                    alphaBottom[pair * 2u] = a.z;
+                    alphaBottom[pair * 2u + 1u] = a.w;
+                }
+            }
+            uint first = origin.y * opts.codedWidth + origin.x;
+            uint chromaIndex = opts.codedWidth * opts.codedHeight + p.y * opts.codedWidth + origin.x;
+            uint topIndex = first / 4u;
+            uint bottomIndex = (first + opts.codedWidth) / 4u;
+            uint packedTop = packBytes(top);
+            uint packedBottom = packBytes(bottom);
+            if (alphaOnly) {
+                updateAlpha(topIndex, bottomIndex, packedTop, packedBottom);
+            } else if (collectAlpha) {
+                updateAlpha(topIndex, bottomIndex, packBytes(alphaTop), packBytes(alphaBottom));
+                alphaFrame.words[chromaIndex / 4u] = 0x80808080u;
+            }
+            outputFrame.pixel[topIndex] = packedTop;
+            outputFrame.pixel[bottomIndex] = packedBottom;
+            outputFrame.pixel[chromaIndex / 4u] = packBytes(uv);
+        }
+        if (updateMask) {
+            barrier();
+            if (gl_LocalInvocationIndex == 0u && groupAlphaFlags != 0u) {
+                atomicOr(alphaStatus.flags, groupAlphaFlags);
+            }
+        }
+        return;
+    }
+    vec4 colors[4];
+    uvec2 uv = sampleBlock(origin, block, withAlpha, full, center, colors);
+    if (FRAME_CHROMA == 420u) {
+        uint index = origin.y * opts.codedWidth + origin.x;
+        uint second = index + opts.codedWidth;
+        uvec4 y = uvec4(roundEven(vec4(colors[0].y, colors[1].y, colors[2].y, colors[3].y) * full));
+        outputFrame.pixel[index / 2u] = (y.x << 6u) | (y.y << 22u);
+        outputFrame.pixel[second / 2u] = (y.z << 6u) | (y.w << 22u);
+        uint chromaIndex = (opts.codedWidth * opts.codedHeight + p.y * opts.codedWidth + origin.x) / 2u;
+        outputFrame.pixel[chromaIndex] = (uv.x << 6u) | (uv.y << 22u);
+        return;
+    }
+    for (uint j = 0; j < block.y; ++j) {
+        for (uint i = 0; i < block.x; ++i) {
+            vec4 value = colors[j * block.x + i];
+            uint index = (origin.y + j) * opts.codedWidth + origin.x + i;
+            uint y = uint(roundEven(value.y * full));
+            if (FRAME_CHROMA == 422u) {
+                outputFrame.pixel[index] = (y << 6u) | (uv[i] << 22u);
+            } else if (FRAME_DEPTH == 8u) {
+                outputFrame.pixel[index] = uv.y | (uv.x << 8u) | (y << 16u) | 0xff000000u;
+            } else {
+                outputFrame.pixel[index] = uv.x | (y << 10u) | (uv.y << 20u) |
+                                           0xc0000000u;
+            }
+        }
+    }
+}

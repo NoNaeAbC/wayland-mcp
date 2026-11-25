@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ArtifactStore;
@@ -14,7 +14,7 @@ use crate::gui_backend::{
     GuiWaylandKeyboardEventRequest, GuiWaylandPointerEvent, GuiWaylandPointerEventRequest,
 };
 
-const NODE_RUNTIME: &str = include_str!("wayland_console_runtime.mjs");
+pub(crate) const NODE_RUNTIME: &str = include_str!("wayland_console_runtime.mjs");
 const MAX_EVAL_CODE_BYTES: usize = 1_048_576;
 const DEFAULT_EVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_EVAL_TIMEOUT_MS: u64 = 1_000;
@@ -69,6 +69,7 @@ pub(crate) struct JsEvalOutput {
 pub(crate) struct JsConsoleImage {
     pub(crate) color: Option<Value>,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) encoded: Option<crate::ssh_video::PacketInfo>,
 }
 
 enum ActorCommand {
@@ -198,16 +199,52 @@ impl Drop for SubscriptionCompletion {
     }
 }
 
+static CONSOLE_SOCKET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub(crate) fn use_console_socket(path: std::path::PathBuf) {
+    let _ = CONSOLE_SOCKET.set(path);
+}
+
+struct RuntimeIo {
+    stdin: Box<dyn AsyncWrite + Send + Unpin>,
+    stdout: Box<dyn AsyncRead + Send + Unpin>,
+    child: Option<tokio::process::Child>,
+}
+
+async fn open_runtime() -> Result<RuntimeIo, String> {
+    if let Some(path) = CONSOLE_SOCKET.get() {
+        let console = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|error| format!("connect to local SSH JavaScript runtime: {error}"))?;
+        let (stdout, stdin) = console.into_split();
+        return Ok(RuntimeIo {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            child: None,
+        });
+    }
+    let mut child = crate::console_runtime::command(NODE_RUNTIME)?
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(RuntimeIo {
+        stdin: Box::new(child.stdin.take().expect("piped stdin")),
+        stdout: Box::new(child.stdout.take().expect("piped stdout")),
+        child: Some(child),
+    })
+}
+
 async fn run_node_session(
     commands: &mut mpsc::Receiver<ActorCommand>,
     backend: &GuiBackendHandle,
     artifacts: &Arc<ArtifactStore>,
     evaluation_timeout: Duration,
 ) -> SessionOutcome {
-    let child = crate::console_runtime::command(NODE_RUNTIME)
-        .and_then(|mut command| command.spawn().map_err(|error| error.to_string()));
-    let mut child = match child {
-        Ok(child) => child,
+    let RuntimeIo {
+        mut stdin,
+        stdout,
+        mut child,
+    } = match open_runtime().await {
+        Ok(runtime) => runtime,
         Err(error) => {
             let Some(ActorCommand::Eval { response, .. }) = commands.recv().await else {
                 return SessionOutcome::CommandsClosed;
@@ -216,12 +253,13 @@ async fn run_node_session(
             return SessionOutcome::Restart;
         }
     };
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stderr = child.as_mut().and_then(|child| child.stderr.take());
     let stderr_text = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let stderr_buffer = stderr_text.clone();
     let stderr_task = tokio::spawn(async move {
+        let Some(mut stderr) = stderr else {
+            return;
+        };
         let mut buffer = [0; 1024];
         while let Ok(count) = stderr.read(&mut buffer).await {
             if count == 0 {
@@ -256,13 +294,30 @@ async fn run_node_session(
     let worker_artifacts = artifacts.clone();
     let completion_queue = completion_sender.clone();
     let worker = tokio::spawn(async move {
+        let mut ssh: Option<crate::ssh_wayland::ConsoleBridge> = None;
         while let Some(job) = jobs.recv().await {
             if job.cancellation.is_cancelled() {
                 continue;
             }
             let result = tokio::select! {
                 _ = job.cancellation.cancelled() => continue,
-                result = handle_native_call(&job.method, job.args, &worker_backend, &worker_artifacts) => result,
+                result = async {
+                    match job.method.as_str() {
+                        "ssh_connect" => {
+                            let (bridge, connection) = connect_ssh(job.args, &worker_backend).await?;
+                            ssh = Some(bridge);
+                            Ok((connection, None))
+                        }
+                        "ssh_disconnect" => {
+                            let closed = ssh.take().is_some();
+                            Ok((json!({"closed": closed}), None))
+                        }
+                        "configure_ssh_video" if let Some(bridge) = &ssh => {
+                            Ok((bridge.configure(job.args).await?, None))
+                        }
+                        _ => handle_native_call(&job.method, job.args, &worker_backend, &worker_artifacts).await,
+                    }
+                } => result,
             };
             if completion_queue
                 .send(NativeCompletion {
@@ -475,7 +530,7 @@ async fn run_node_session(
                             active_calls.remove(&call_id); if outgoing.try_send(reply).is_err() { break "console output queue is full".into(); } continue;
                         }
                         let job = NativeJob { call_id, eval_id, subscription_id, method, args, cancellation: context_token.unwrap_or_else(|| cancellation.clone()) };
-                        if matches!(job.method.as_str(), "capture_next_frame" | "screenshot" | "windows" | "diagnostics") {
+                        if matches!(job.method.as_str(), "capture_next_frame" | "screenshot" | "video_frame" | "windows" | "diagnostics") {
                             let backend = backend.clone(); let artifacts = artifacts.clone(); let completions = completion_sender.clone();
                             observations.spawn(async move {
                                 let result = tokio::select! {
@@ -523,7 +578,9 @@ async fn run_node_session(
     worker.abort();
     writer.abort();
     reader.abort();
-    let _ = child.kill().await;
+    if let Some(child) = &mut child {
+        let _ = child.kill().await;
+    }
     match tokio::time::timeout(Duration::from_secs(2), backend.cleanup_model_input()).await {
         Ok(Ok(())) => {}
         result => {
@@ -577,6 +634,32 @@ async fn read_bounded_json<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+async fn connect_ssh(
+    args: Value,
+    backend: &GuiBackendHandle,
+) -> Result<(crate::ssh_wayland::ConsoleBridge, Value), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Destination {
+        host: String,
+    }
+
+    let destination: Destination =
+        serde_json::from_value(args).map_err(|error| format!("connectSsh: {error}"))?;
+    let GuiBackendHandle::Wayland(backend) = backend else {
+        return Err("connectSsh requires this MCP server to have a Wayland compositor".into());
+    };
+    let local = backend.launch_environment()?;
+    let (bridge, environment) =
+        crate::ssh_wayland::ConsoleBridge::connect(&destination.host, local.socket_path)
+            .await
+            .map_err(|error| format!("SSH Wayland connection to {}: {error}", destination.host))?;
+    Ok((
+        bridge,
+        json!({"host": destination.host, "connected": true, "environment": environment}),
+    ))
+}
+
 async fn handle_native_call(
     method: &str,
     args: Value,
@@ -601,15 +684,9 @@ async fn handle_native_call(
                 GuiBackendHandle::Wayland(backend) => {
                     serde_json::to_value(backend.snapshot().await).map_err(|err| err.to_string())?
                 }
-                GuiBackendHandle::Command(_) => json!({
-                    "running": false,
-                    "last_runtime_error": "Wayland proxy backend is not active"
-                }),
+                GuiBackendHandle::Command(_) => json!({"running": false}),
                 #[cfg(test)]
-                GuiBackendHandle::Test(_) => json!({
-                    "running": true,
-                    "last_runtime_error": null
-                }),
+                GuiBackendHandle::Test(_) => json!({"running": true}),
             };
             let mut diagnostics = diagnostics;
             if let Some(object) = diagnostics.as_object_mut() {
@@ -676,6 +753,34 @@ async fn handle_native_call(
                 json!({"window_id":window_id,"width":width,"height":height,"detail":detail}),
             );
             Ok((json!({"delivered":true,"detail":detail}), None))
+        }
+        "configure_ssh_video" => Ok((crate::ssh_wayland::configure(args).await?, None)),
+        "video_frame" => {
+            let GuiBackendHandle::Wayland(backend) = backend else {
+                return Err("videoFrame requires a Wayland backend".into());
+            };
+            let request: crate::ssh_video::FrameRequest = serde_json::from_value(args)
+                .map_err(|error| format!("videoFrame options: {error}"))?;
+            let (data, packet, color) = backend.video_frame(request).await?;
+            if crate::ssh_video::is_ssh_worker() {
+                return Ok((
+                    json!({
+                        "storage": "memory", "width": packet.width, "height": packet.height,
+                        "coordinateSpace": "buffer", "color": color,
+                    }),
+                    Some(JsConsoleImage {
+                        color: Some(color),
+                        bytes: data,
+                        encoded: Some(packet),
+                    }),
+                ));
+            }
+            let bytes = tokio::task::spawn_blocking(move || {
+                crate::ssh_video::decode(&data, packet, &mut { color })
+            })
+            .await
+            .map_err(|error| format!("H.265 decode worker failed: {error}"))??;
+            retained_image(bytes)
         }
         "screenshot" => {
             let window_id = Some(
@@ -849,7 +954,14 @@ async fn handle_native_call(
                 .ok_or_else(|| "typeText requires text".to_string())?
                 .to_string();
             let plan = backend
-                .keyboard_text_plan(GuiKeyboardTextPlanRequest { window_id, text })
+                .keyboard_text_plan(GuiKeyboardTextPlanRequest {
+                    window_id,
+                    text,
+                    allow_compose: args
+                        .get("allowCompose")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
                 .await?;
             Ok((
                 serde_json::to_value(plan).map_err(|err| err.to_string())?,
@@ -861,9 +973,6 @@ async fn handle_native_call(
 }
 
 fn retained_image(bytes: Vec<u8>) -> Result<(Value, Option<JsConsoleImage>), String> {
-    let dimensions = image::load_from_memory(&bytes)
-        .map(|image| (image.width(), image.height()))
-        .map_err(|err| format!("captured invalid PNG: {err}"))?;
     let reader = png::Decoder::new(std::io::Cursor::new(&bytes))
         .read_info()
         .map_err(|err| err.to_string())?;
@@ -875,10 +984,25 @@ fn retained_image(bytes: Vec<u8>) -> Result<(Value, Option<JsConsoleImage>), Str
         .map(|chunk| serde_json::from_str::<Value>(&chunk.text))
         .transpose()
         .map_err(|err| err.to_string())?;
+    let dimensions =
+        if let Some([width, height, _, _]) = color.as_ref().and_then(crate::video_preview_extent) {
+            (width, height)
+        } else {
+            image::load_from_memory(&bytes)
+                .map(|image| (image.width(), image.height()))
+                .map_err(|error| format!("captured invalid PNG: {error}"))?
+        };
     Ok((
         json!({"storage":"memory", "width":dimensions.0, "height":dimensions.1,
-            "coordinateSpace":color.as_ref().and_then(|color|color.get("coordinate_space")).and_then(Value::as_str).unwrap_or("window"), "color": color}),
-        Some(JsConsoleImage { bytes, color }),
+            "coordinateSpace":color.as_ref().and_then(|color|color.get("coordinate_space")).and_then(Value::as_str).unwrap_or("window"),
+            "commitSerial":color.as_ref().and_then(|color|color.get("commit_serial")),
+            "baselineCommitSerial":color.as_ref().and_then(|color|color.get("baseline_commit_serial")),
+            "fresh":color.as_ref().and_then(|color|color.get("fresh")), "color": color}),
+        Some(JsConsoleImage {
+            bytes,
+            color,
+            encoded: None,
+        }),
     ))
 }
 
@@ -887,7 +1011,7 @@ fn optional_string(value: &Value, key: &str) -> Option<String> {
 }
 
 async fn write_message(
-    stdin: &mut tokio::process::ChildStdin,
+    stdin: &mut (impl AsyncWrite + Unpin),
     message: &Value,
 ) -> Result<(), String> {
     let mut encoded = serde_json::to_vec(message).map_err(|err| err.to_string())?;
@@ -1381,6 +1505,7 @@ mod tests {
     fn retained_images_evict_by_bytes_and_disposal_reclaims_capacity() {
         let mut cache = RetainedImages::default();
         let image = |size| JsConsoleImage {
+            encoded: None,
             color: None,
             bytes: vec![0; size],
         };
@@ -1485,6 +1610,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_wayland_backend_preserves_empty_discovery_results() {
+        let backend = GuiBackendHandle::Command(Arc::new(CommandGuiBackend));
+        let artifacts = ArtifactStore::new();
+        for (method, expected) in [("environment", json!({})), ("windows", json!([]))] {
+            let (value, _) = handle_native_call(method, json!({}), &backend, &artifacts)
+                .await
+                .expect("headless discovery succeeds");
+            assert_eq!(value, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_omit_private_backend_details() {
+        let backend = GuiBackendHandle::Wayland(Arc::new(
+            crate::gui_backend_wayland::WaylandGuiBackend::new(),
+        ));
+        let artifacts = ArtifactStore::new();
+        let (value, _) = handle_native_call("diagnostics", json!({}), &backend, &artifacts)
+            .await
+            .unwrap();
+        for key in [
+            "backend_socket",
+            "last_runtime_error",
+            "sessions",
+            "connection_history",
+        ] {
+            assert!(value.get(key).is_none(), "unexpected {key}: {value}");
+        }
+        assert!(value["running"].is_boolean());
+        assert!(value["launch_preflight"]["endpoint_state"].is_string());
+        assert_eq!(value["console_isolation"]["filesystem"], "denied");
+    }
+
+    #[tokio::test]
     async fn javascript_definitions_persist_across_console_calls() {
         let backend = GuiBackendHandle::Command(Arc::new(CommandGuiBackend));
         let artifacts = Arc::new(ArtifactStore::new());
@@ -1499,6 +1658,19 @@ mod tests {
         assert!(help.value.as_str().unwrap().contains("typeText"));
         assert!(help.value.as_str().unwrap().contains("onVisual"));
         assert!(help.value.as_str().unwrap().contains("wayland.keyNames"));
+        assert!(help.value.as_str().unwrap().contains("wayland.connectSsh"));
+        assert!(
+            help.value
+                .as_str()
+                .unwrap()
+                .contains("--ssh-wayland user@host")
+        );
+        assert!(
+            help.value
+                .as_str()
+                .unwrap()
+                .contains("return await wayland.windows()")
+        );
 
         console
             .eval("globalThis.twice = async function(value) { await wayland.sleep(1); return value * 2; }; return 'defined';".to_string())

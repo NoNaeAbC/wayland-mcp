@@ -8,11 +8,9 @@ mod drag;
 use drag::{Drag, Offer};
 
 type Object = (WaylandClientId, u32);
-#[derive(Clone)]
 struct Source {
-    manager: u32,
     mimes: Vec<String>,
-    upstream: bool,
+    published: bool,
     actions: Option<u32>,
 }
 #[derive(Clone)]
@@ -73,6 +71,22 @@ impl Clipboard {
         }
         Ok(())
     }
+    pub(super) fn host_focus(
+        &mut self,
+        sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
+        client: WaylandClientId,
+        seat: u32,
+    ) -> Result<(), String> {
+        // Mapping and desktop focus changes can occur between injected input
+        // and the client's selection request. Seed focus without changing the
+        // actor that performed the last input.
+        let origin = self
+            .origins
+            .get(&(client, seat))
+            .copied()
+            .unwrap_or(Origin::Human);
+        self.switch(sessions, client, seat, origin)
+    }
     fn emit(
         sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
         object: Object,
@@ -106,6 +120,28 @@ impl Clipboard {
             bytes,
             fds: duplicate_fds(fds)?,
         })
+    }
+    fn publish_host_source(
+        &mut self,
+        sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
+        source: Object,
+    ) -> Result<(), String> {
+        let info = self.sources.get_mut(&source).ok_or("unknown data source")?;
+        if !info.published {
+            for mime in &info.mimes {
+                Self::upstream(sessions, source.0, string_request(source.1, 0, mime), &[])?;
+            }
+            if let Some(actions) = info.actions {
+                Self::upstream(
+                    sessions,
+                    source.0,
+                    encode_u32_message(source.1, 2, &[actions]),
+                    &[],
+                )?;
+            }
+            info.published = true;
+        }
+        Ok(())
     }
     fn notify(
         &mut self,
@@ -216,13 +252,14 @@ impl Clipboard {
                 self.sources.insert(
                     (client, *id),
                     Source {
-                        manager: request.object_id,
                         mimes: Vec::new(),
-                        upstream: false,
+                        published: false,
                         actions: None,
                     },
                 );
-                Ok(true)
+                // Both connections use the client's object IDs. Allocate the
+                // empty source upstream so later new IDs do not leave a gap.
+                Ok(false)
             }
             Some(GeneratedHookRequest::WlDataDeviceManagerGetDataDevice {
                 id,
@@ -281,20 +318,7 @@ impl Clipboard {
                 Ok(true)
             }
             Some(GeneratedHookRequest::WlDataSourceDestroy) => {
-                if let Some(source) = self.sources.remove(&object) {
-                    if source.upstream {
-                        Self::upstream(sessions, client, message.bytes.clone(), &[])?;
-                    } else {
-                        Self::emit(
-                            sessions,
-                            (client, 1),
-                            GeneratedEvent::WlDisplayDeleteId {
-                                id: request.object_id,
-                            },
-                            &[],
-                        )?;
-                    }
-                }
+                self.sources.remove(&object);
                 let seats = self
                     .private
                     .iter()
@@ -305,7 +329,7 @@ impl Clipboard {
                     self.private.remove(&seat);
                     self.notify_private(sessions, seat)?;
                 }
-                Ok(true)
+                Ok(false)
             }
             Some(GeneratedHookRequest::WlDataDeviceSetSelection { source, .. }) => {
                 let device = self
@@ -316,33 +340,7 @@ impl Clipboard {
                 let origin = self.origin(client, device.seat);
                 if origin == Origin::Human {
                     if let Some(id) = source {
-                        let source = self
-                            .sources
-                            .get_mut(&(client, *id))
-                            .ok_or("unknown selection source")?;
-                        if !source.upstream {
-                            Self::upstream(
-                                sessions,
-                                client,
-                                encode_u32_message(source.manager, 0, &[*id]),
-                                &[],
-                            )?;
-                            for mime in &source.mimes {
-                                Self::upstream(
-                                    sessions,
-                                    client,
-                                    string_request(*id, 0, mime),
-                                    &[],
-                                )?;
-                            }
-                            sessions
-                                .get_mut(&client)
-                                .and_then(|s| s.backend.as_mut())
-                                .ok_or("host compositor unavailable")?
-                                .object_interfaces
-                                .insert(*id, "wl_data_source".into());
-                            source.upstream = true;
-                        }
+                        self.publish_host_source(sessions, (client, *id))?;
                     }
                     Self::upstream(sessions, client, message.bytes.clone(), &[])?;
                 } else {
@@ -655,6 +653,7 @@ mod tests {
             globals: vec![],
             object_interfaces: interfaces.clone(),
             pending_backend_fds: VecDeque::new(),
+            retired_client_objects: HashSet::new(),
         };
         let mut session = WaylandClientSession::new(client, vec![], Some(backend));
         for (id, interface) in interfaces {
@@ -707,6 +706,22 @@ mod tests {
         Ok(())
     }
 
+    fn keyboard_event(
+        server: &mut WaylandProxyServer,
+        client: WaylandClientId,
+        event: &GeneratedEvent,
+    ) -> Result<(), String> {
+        let event = server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: encode_generated_event(19, event)?,
+                fds: vec![],
+            },
+        )?;
+        assert!(!event.suppressed);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_clipboards_route_real_fd_transfers_by_latest_source() -> Result<(), String> {
         let mut server = WaylandProxyServer::new(WaylandProxyConfig {
@@ -748,6 +763,7 @@ mod tests {
             assert_eq!(next(events).bytes, encode_u32_message(4, 5, &[0]));
         }
         request(&mut server, owner, encode_u32_message(2, 0, &[5]), vec![])?;
+        assert_eq!(next(&host_owner).bytes, encode_u32_message(2, 0, &[5]));
         request(
             &mut server,
             owner,
@@ -849,7 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn human_copy_only_creates_host_source_when_human_is_current() -> Result<(), String> {
+    async fn private_source_keeps_ids_in_sync_without_publishing_selection() -> Result<(), String> {
         let mut server = WaylandProxyServer::new(WaylandProxyConfig {
             dmabuf_transparent: false,
             socket_name: "test".into(),
@@ -864,10 +880,31 @@ mod tests {
             vec![],
         )?;
         let _ = next(&host);
+        let session = server.sessions.get_mut(&client).unwrap();
+        for (id, interface) in [(19, "wl_keyboard"), (20, "wl_surface")] {
+            session.track_object_interface_version(id, interface, 3);
+            session
+                .backend
+                .as_mut()
+                .unwrap()
+                .object_interfaces
+                .insert(id, interface.into());
+        }
+        session.input_seats.insert(19, 3);
+        let focus = GeneratedEvent::WlKeyboardEnter {
+            serial: 120,
+            surface: Some(20),
+            keys: vec![],
+        };
+        keyboard_event(&mut server, client, &focus)?;
+        assert_eq!(server.clipboard.origin(client, 7), Origin::Human);
+        let _ = next(&events);
         server
             .clipboard
             .switch(&mut server.sessions, client, 7, Origin::Model)?;
         let _ = next(&events);
+        keyboard_event(&mut server, client, &focus)?;
+        assert_eq!(server.clipboard.origin(client, 7), Origin::Model);
         request(&mut server, client, encode_u32_message(2, 0, &[5]), vec![])?;
         request(
             &mut server,
@@ -882,29 +919,50 @@ mod tests {
             vec![],
         )?;
         let _ = selection(&events);
-        server
-            .clipboard
-            .switch(&mut server.sessions, client, 7, Origin::Human)?;
+        request(&mut server, client, encode_u32_message(1, 0, &[6]), vec![])?;
+        assert_eq!(next(&host).bytes, encode_u32_message(2, 0, &[5]));
+        assert_eq!(next(&host).bytes, encode_u32_message(1, 0, &[6]));
+        keyboard_event(
+            &mut server,
+            client,
+            &GeneratedEvent::WlKeyboardKey {
+                serial: 121,
+                time: 10,
+                key: 30,
+                state: 1,
+            },
+        )?;
+        assert_eq!(server.clipboard.origin(client, 7), Origin::Human);
         let _ = next(&events);
-        request(&mut server, client, encode_u32_message(2, 0, &[6]), vec![])?;
+        request(&mut server, client, encode_u32_message(2, 0, &[7]), vec![])?;
         request(
             &mut server,
             client,
-            string_request(6, 0, "text/plain"),
+            string_request(7, 0, "text/plain"),
             vec![],
         )?;
         request(
             &mut server,
             client,
-            encode_u32_message(4, 1, &[6, 456]),
+            encode_u32_message(4, 1, &[7, 456]),
             vec![],
         )?;
-        assert_eq!(next(&host).bytes, encode_u32_message(2, 0, &[6]));
-        assert_eq!(next(&host).bytes, string_request(6, 0, "text/plain"));
-        assert_eq!(next(&host).bytes, encode_u32_message(4, 1, &[6, 456]));
+        assert_eq!(next(&host).bytes, encode_u32_message(2, 0, &[7]));
+        assert_eq!(next(&host).bytes, string_request(7, 0, "text/plain"));
+        assert_eq!(next(&host).bytes, encode_u32_message(4, 1, &[7, 456]));
         assert_eq!(server.clipboard.private.get(&7), Some(&(client, 5)));
         request(&mut server, client, encode_u32_message(5, 1, &[]), vec![])?;
-        assert_eq!(next(&events).bytes, encode_u32_message(1, 1, &[5]));
+        assert_eq!(next(&host).bytes, encode_u32_message(5, 1, &[]));
+        let deletion = encode_u32_message(1, 1, &[5]);
+        let event = server.prepare_backend_event(
+            client,
+            WaylandWireMessage {
+                bytes: deletion.clone(),
+                fds: vec![],
+            },
+        )?;
+        assert!(!event.suppressed);
+        assert_eq!(event.encoded.bytes, deletion);
         assert!(!server.sessions[&client].object_interfaces.contains_key(&5));
         Ok(())
     }

@@ -45,8 +45,10 @@ static_assert(sizeof(Visual_Program_Config) == 40 && alignof(Visual_Program_Conf
 static_assert(std::is_standard_layout_v<Visual_Color_Profile> && std::is_trivially_copyable_v<Visual_Color_Profile>);
 
 extern "C" {
+void  visual_cache_vulkan_instances(bool enabled);
 void *visual_context_create(uint32_t major, uint32_t minor, char *error);
 void  visual_context_destroy(void *);
+bool  visual_capture_modifier_supported(uint32_t format, uint64_t modifier);
 void *visual_snapshot_create(void *, uint32_t width, uint32_t height, uint32_t format, char *error);
 void  visual_snapshot_destroy(void *);
 int   visual_snapshot_capture(void *, uint64_t key, const Visual_Plane *, uint32_t plane_count, char *error);

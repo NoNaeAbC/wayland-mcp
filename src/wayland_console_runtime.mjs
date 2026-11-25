@@ -391,7 +391,7 @@ async function typeText({ windowId, text, intervalMs = 0, inputMethod = "keymap"
     }
     return { delivered: true, text, inputMethod };
   }
-  const plan = await native("keyboard_text_plan", { windowId, text });
+  const plan = await native("keyboard_text_plan", { windowId, text, allowCompose: true });
   const events = [];
   await enterKeyboardTarget(windowId, events);
   let depressed = null;
@@ -517,15 +517,22 @@ async function actAndCapture({ windowId, action, afterCommitSerial, timeoutMs = 
   const lease = await native("begin_observation", { windowId, durationMs: 120000 });
   try {
     const actionResult = await action();
+    const mappedWindow = async () => (await native("windows"))
+      .find((window) => window.window_id === windowId && window.mapped !== false);
     let capture = null;
     let captureError = null;
-    try {
-      capture = await native("capture_next_frame", { windowId, afterCommitSerial: baselineCommitSerial, timeoutMs });
-    } catch (error) {
-      captureError = error instanceof Error ? error.message : String(error);
+    let after = await mappedWindow();
+    if (after) {
+      try {
+        capture = await native("capture_next_frame", { windowId, afterCommitSerial: baselineCommitSerial, timeoutMs });
+      } catch (error) {
+        captureError = error instanceof Error ? error.message : String(error);
+      }
+      after = await mappedWindow();
+      if (!after && (captureError?.startsWith("unknown windowId") || captureError === "capture window disappeared")) {
+        captureError = null;
+      }
     }
-    const afterWindows = await native("windows");
-    const after = afterWindows.find((window) => window.window_id === windowId && window.mapped !== false);
     return {
       actionResult,
       baselineCommitSerial,
@@ -547,6 +554,21 @@ function resetInputState() {
 }
 
 const apiHelp = `Persistent JavaScript console. State survives calls.
+
+Open a Wayland connection over SSH from this console.
+  return await wayland.connectSsh({host:"user@host"})
+The result says connected after a Wayland check makes the round trip over SSH.
+It includes the environment to use when starting the app on the SSH host.
+For example, if connectSsh for user@host returns
+environment.WAYLAND_DISPLAY = "/tmp/wmc-app-EXAMPLE/wayland", run this in your terminal:
+  ssh -t user@host 'env -u WAYLAND_SOCKET WAYLAND_DISPLAY=/tmp/wmc-app-EXAMPLE/wayland vkcube --wsi wayland'
+Use the actual WAYLAND_DISPLAY from the result. Leave the app running while you use this console.
+Use return await wayland.windows() to see the app after it opens. Use the same
+wayland.screenshot(), wayland.click() and other commands you use for local apps.
+This MCP captures frames and sends input. The bridge carries the app's Wayland
+traffic over SSH. Use return await wayland.disconnectSsh() to close the bridge.
+Connecting to a new host closes the previous bridge after the new one is ready.
+
 Input helpers explicitly target windowId on every operation, independently of desktop focus.
 Call environment() for the native Wayland launch environment and socket/access requirements;
 Pass its WAYLAND_DISPLAY and XDG_RUNTIME_DIR to the application, unset DISPLAY, and
@@ -561,7 +583,10 @@ subsurfaces lists each role/surface/parent ID, position, effective synchronizati
 committed buffer type/dimensions and capture diagnostics, including unbuffered children.
 buffer_kind/capture_details at window level describe render_surface_id only; they do
 not classify the entire window. Protocol IDs are local to each client connection.
-it has no desktop focus flag. diagnostics() reports proxy/client errors.
+windows() has no desktop focus flag. diagnostics() reports sanitized proxy listener,
+launch preflight and console permission status.
+An upstream connection or registry-discovery failure rejects the client with
+wl_display.error and is reported on stderr. There is no local compositor.
 Explicit screenshot({windowId}) and captureNextFrame({windowId}) return memory-only imageHandle,
 width/height/color metadata and attach the image to the foreground MCP response.
 No image files are written. presentImage(imageHandle) presents a retained image;
@@ -577,12 +602,39 @@ live surface in that window's subsurface tree. surfaceId is a positive protocol 
 from windows(). It requires DMA-BUF and waits up to 1 second for a fresh producer
 commit under an observation lease. It excludes the parent and other subsurfaces.
 Window-coordinate composition is not accepted together with surfaceId.
-screenshot waits up to 250 ms for an update, then returns the readable current frame.
-captureNextFrame({windowId,afterCommitSerial,timeoutMs:5000}) requires a newer commit;
+videoFrame({windowId}) captures a root DMA-BUF as a verified H.265 IDR picture. It prefers
+10-bit 4:4:4 SCC and falls back to 8-bit 4:2:0 Main based on both codec devices.
+Set chroma and bitDepth to choose sampling and depth. For 4:4:4, omit screenContent
+to prefer SCC with a range-extension fallback, or set it to pin the profile. Options include
+encodeGpu and decodeGpu (DRM render-node
+paths), qp (0..51), toneMap ("auto", "clip", "knee", "reinhard", "curve"),
+exposure, and background ("black", "checkerboard"). Tone maps apply to FP16 input. A custom curve accepts
+toneCurve: [[0,0],[1,0.8],[4,1]] in linear reference-white units. The Vulkan
+shader evaluates it. Set afterCommitSerial to require a newer commit, with an
+optional timeoutMs. When the producer omits DRM feedback, captureGpu selects
+the render node used to import its buffer. Each call can change the options.
+configureSshVideo(options) changes video settings for the connected bridge.
+For terminal testing, start the bridge with --ssh-wayland user@host -- bash.
+A bridge started from a terminal uses WAYLAND_MCP_SSH_VIDEO_SOCKET for video
+settings. See Wayland over SSH in the README. configureSshVideo accepts
+chroma, bitDepth, screenContent, captureGpu, encodeGpu, decodeGpu, rateControl, toneMap,
+toneCurve, exposure, background and sourceColor. The bridge preserves alpha by default.
+rateControl defaults to {mode:"auto"}, which prefers constant quality and uses
+VBR when no compatible configuration supports constant quality. Set
+{mode:"constantQuality",quality:24,frameRate:120} or
+{mode:"vbr",targetBitrate:6000000,frameRate:120} to choose a mode explicitly.
+Set background to "black" or "checkerboard" to composite it on the GPU.
+Newly encoded buffers use the settings.
+screenshot in window coordinates waits up to 250 ms for new pixels, then returns
+the readable current frame. Each screenshot reports commitSerial, baselineCommitSerial,
+and fresh. fresh is true when the captured pixels were updated after the baseline.
+A new frame can still show an app partway through processing input.
+captureNextFrame({windowId,afterCommitSerial,timeoutMs:5000}) requires newer pixels;
 timeoutMs is 1..10000. Omitting afterCommitSerial uses the current commit as baseline.
 Prefer actAndCapture({windowId,action:()=>wayland.click({windowId,x,y}),timeoutMs:5000});
 it starts observation BEFORE action, captures relative to the prior commit, and returns
 actionResult, frameObserved, surfaceDisappeared, capture, captureError and commit serials.
+If the action closes the window, surfaceDisappeared is true and capture can be null.
 Delivered input or a newer commit does not prove the application accepted the action.
 beginObservation({windowId,durationMs:5000}) returns {id,durationMs}; duration is 1..120000.
 endObservation({id}) ends that lease. Leases expire automatically (at most 32 active).
@@ -666,7 +718,9 @@ pressShortcut({windowId,keys:["CTRL","+"],holdMs:40}); keys has 2..8 entries, na
 modifiers CTRL/SHIFT/ALT/META first, primary key last. Character keys use the target
 keymap; required character modifiers (for example Shift for +) are added automatically.
 typeText({windowId,text,intervalMs:0,inputMethod:"keymap"}); max 512 characters,
-intervalMs/holdMs 0..60000. "unicode-hex" is an opt-in application convention.
+intervalMs/holdMs 0..60000. For spacing accents such as ^ on German keyboards,
+typeText can send the dead key followed by Space. This uses the app's compose support.
+"unicode-hex" is an opt-in application convention.
 resizeWindow({windowId,width,height}) requests 1..8192 logical surface units; wait for
 a subsequent commit and reread dimensions/preview scale before using coordinates.
 resetInputState() clears helper pointer routing state, not delivered pressed keys.
@@ -795,12 +849,16 @@ const wayland = Object.freeze({
   presentImage: (imageHandle) => native("present_image", {imageHandle}),
   disposeImage: (imageHandle) => native("dispose_image", {imageHandle}),
   keyNames: namedKeyNames,
+  connectSsh: (options) => native("ssh_connect", options),
+  disconnectSsh: () => native("ssh_disconnect"),
   environment: () => native("environment"),
   diagnostics: () => native("diagnostics"),
   windows: () => native("windows"),
   visualInfo: (args) => native("visual_info",args),
   resizeWindow: (args) => native("resize_window", args),
   screenshot: (args = {}) => native("screenshot", args),
+  videoFrame: (args = {}) => native("video_frame", args),
+  configureSshVideo: (options = {}) => native("configure_ssh_video", options),
   captureNextFrame: (args = {}) => native("capture_next_frame", args),
   pointerEvent: async (args) => {
     pointerTarget.windowId = null;

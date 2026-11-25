@@ -21,6 +21,8 @@ Build requirements:
 - installed Wayland core and `wayland-protocols` XML files under `/usr/share`;
 - libxkbcommon development files providing the `xkbcommon` linker library;
 - Vulkan loader development files providing the `vulkan` linker library;
+- libva development files with DRM support, libdrm headers, and OpenSSL development files;
+- GBM and Zstandard development files providing the `gbm` and `zstd` linker libraries;
 - a C++26 compiler (GCC or Clang) and `ar`;
   project C++ is built with `-fno-rtti -fno-exceptions` and strict warnings;
   set `CXX` to select the compiler;
@@ -33,6 +35,8 @@ Runtime requirements:
 - Node.js 26 or newer available as `node` on `PATH`;
 - an active Wayland session with `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` set;
 - a Vulkan 1.1 loader and a compatible graphics driver for DMA-BUF capture;
+- the OpenSSH client (`ssh`) on the launcher host for SSH workflows;
+- the libva, libva-drm, OpenSSL libcrypto, GBM, and Zstandard shared libraries;
 - permission to connect to the compositor socket and, for GPU clients, the
   applicable `/dev/dri/renderD*` device.
 
@@ -40,13 +44,282 @@ Distribution package names vary. Common packages are `libxkbcommon-dev` and
 `libvulkan-dev` on Debian-family systems, `libxkbcommon-devel` and
 `vulkan-loader-devel` on Fedora, and `libxkbcommon`, `vulkan-headers`, and
 `vulkan-loader` on Arch Linux. On Arch, install `shaderc`, `cmake`, and `ninja`
-alongside the other build dependencies. Compiler/runtime commands are resolved
-on PATH. Cargo builds the compiler dependencies from the versions pinned in
-Cargo.lock and statically links them; distribution-provided compiler archives
-and private workspace files are not required. The first build takes longer
-because it also compiles these dependencies.
+alongside the other build dependencies. Compiler and runtime commands are
+resolved on `PATH`. The first build compiles and statically links the compiler
+dependencies pinned in `Cargo.lock`.
 The project limits Cargo's default build concurrency to two jobs to keep the
 native compiler build within a reasonable memory budget.
+
+## Wayland over SSH
+
+Connect from the `gui_console` you already use for local apps. Enter the SSH
+login for the host that will run the app.
+
+```js
+return await wayland.connectSsh({host: "user@compute.example"});
+```
+
+The result says `connected: true` after a Wayland check makes the round trip
+over SSH. Copy the path from `environment.WAYLAND_DISPLAY` and use it when
+starting the app from a terminal. For example, replace the path below with
+the one you received.
+
+```sh
+ssh -t user@compute.example 'env -u WAYLAND_SOCKET WAYLAND_DISPLAY=/tmp/wmc-app-EXAMPLE/wayland vkcube --wsi wayland'
+```
+
+While the app is running, use `return await wayland.windows()` in the same
+console. The usual capture and input commands work on the forwarded window.
+This MCP handles both capture and input. Use `wayland.disconnectSsh()` to end
+the connection. Connecting to a new host closes the old connection after the
+new one is ready.
+
+```text
+Wayland server ↔ Wayland MCP (capture and input) ↔ SSH ↔ Wayland MCP ↔ Wayland client
+```
+
+### Start the bridge from a terminal
+
+Run `--ssh-wayland` from a terminal on the desktop where you want the windows
+to appear. Your local compositor places the windows and handles physical input.
+To run a standalone remote MCP for testing, see
+[MCP and capture over SSH](#mcp-and-capture-over-ssh).
+
+Enable Unix-socket forwarding on the SSH server. The launcher reuses a private
+copy of its exact build on the SSH host and uploads the running executable when
+the cached build differs or the cache is unavailable. The SSH host needs a
+compatible architecture and runtime libraries.
+
+### Run the agent on the SSH host
+
+```sh
+target/release/wayland-mcp --ssh-wayland user@compute.example -- bash
+```
+
+Start your agent in that shell and configure its Wayland MCP server to execute
+`wayland-mcp`. The launcher adds the executable to `PATH` and exports its
+absolute path as `WAYLAND_MCP_EXECUTABLE`. The shell also includes
+`WAYLAND_MCP_BACKEND_SOCKET` for the bridge and `WAYLAND_MCP_SSH_VIDEO_SOCKET`
+for codec settings. Pass these variables through if your MCP client restricts
+the server's environment. Launch tracked apps using the environment returned
+by the agent's `wayland.environment()`. Running an ordinary Wayland app
+directly from the shell also displays it on the local desktop.
+
+### Run the agent on the local desktop
+
+Start the local Wayland MCP server in your desktop session. Use the absolute
+`socket_path` from its `wayland.environment()` as `--local-display`.
+
+```sh
+target/release/wayland-mcp --ssh-wayland user@compute.example \
+  --local-display "$MCP_SOCKET" \
+  --local-control "$XDG_RUNTIME_DIR/wayland-mcp-ssh-video" -- bash
+```
+
+Here `MCP_SOCKET` is the returned absolute path. Launch apps from the SSH shell.
+To enable codec changes, give the local MCP server the `--local-control` path
+as `WAYLAND_MCP_SSH_VIDEO_SOCKET`.
+
+### Buffers and video options
+
+Wayland requests and events travel in order over SSH. Each end creates the
+descriptors it needs. Keyboard keymaps use Zstandard. Supported RGB DMA-BUFs
+and RGB SHM buffers travel as H.265. The bridge passes raw pixels between
+GPU surfaces and sends only compressed video over SSH. SHM pools use
+memfds sealed against shrinking and require Vulkan host-memory import.
+The bridge reuses up to five display slots per buffer. If they are all in
+use, it waits for the compositor to release one. It waits for decode and
+conversion before forwarding the attachment and commit.
+
+Both endpoints need hardware VA-API HEVC and Vulkan compute. The bridge
+checks the remote GPUs against the display host's decoder capabilities before
+launching the application. It prefers the remote boot graphics device for
+Wayland DMA-BUF feedback. For each DMA-BUF, it prefers the producer's GPU
+when the exporter identifies it and it can encode a common profile. Another
+GPU can import the original buffer or receive a GPU copy through a reusable
+linear DMA-BUF when the original layout cannot be shared. The bridge prefers
+the source's integer bit depth and a common 4:4:4 profile. For 10-bit sources it
+tries SCC when the driver supports it in the selected rate-control mode. Use `--remote-gpu`
+for capture and encoding and `--display-gpu` for local DMA-BUF allocation
+on multi-GPU systems. Both take DRM render-node paths. OpenSSH handles
+configuration and host keys. Use `--ssh-config` to select a configuration
+file.
+
+```js
+return await wayland.configureSshVideo({
+  toneMap: "knee",
+  rateControl: {mode: "auto"},
+});
+```
+
+This sets the session's options for newly encoded buffers. Omitted options
+use their defaults. The options include
+`encodeGpu`, `decodeGpu`, `captureGpu`, `chroma`, `bitDepth`,
+`screenContent`, `rateControl`, `toneMap`, `toneCurve`, `exposure`,
+`background`, and `sourceColor`. GPU paths refer to the host that performs
+the operation.
+
+The default `rateControl` mode is `"auto"`. It tries the driver's adaptive
+constant-quality mode, then VBR. When picture transfers consistently stall on
+the SSH link, auto mode can switch that surface's color stream to VBR with a
+target based on the observed transfer rate. Set `mode` to `"constantQuality"`
+to select `quality` from 1 to 51. Lower values request higher quality and 24 is
+the default. With `"vbr"`, `targetBitrate` sets the target in bits per second
+and defaults to a value based on the buffer size. Both explicit modes accept
+a nominal `frameRate`, which defaults to 120.
+
+Each Wayland surface has its own color and alpha reference state. On profiles
+with driver support for inter-frame coding, each picture can reference the
+preceding encoded picture of its stream. Resizes, codec changes, and periodic
+refreshes produce an IDR. Commits from other surfaces can interleave with that
+sequence. Each VA encoder reuses a pool of five input surfaces.
+
+For opaque sRGB DMA-BUFs, the driver can convert directly between RGB and
+encoder or decoder surfaces using VA video processing. The Vulkan shader
+handles other supported layouts. The bridge reads the producer's Wayland
+parametric color description and signals full-range BT.709 YCbCr with sRGB
+transfer. Tone mapping applies to FP16 RGB input. The compositor receives
+the converted SDR buffer, including 10-bit RGB for 10-bit RGB DMA-BUF sources.
+
+Untagged buffers default to sRGB. Use `sourceColor` to supply their color
+description, such as `{transfer: "pq", primaries: "bt2020"}` for a PQ source.
+A color change takes effect on the next attached buffer. ICC-tagged buffers
+and compositor-provided source descriptions are currently unsupported.
+
+The bridge preserves transparency by default. For buffers with nonopaque
+pixels, a separate 8-bit 4:2:0 HEVC stream stores alpha in luma. This can
+round opacity values. When the GPU finds identical opacity samples and the
+codec settings match, it reuses the receiver's alpha surface. X formats
+carry no alpha stream. The GPU produces premultiplied sRGB for the
+compositor. Set `background` to `"black"` or `"checkerboard"` to composite
+on the GPU.
+The bridge supports implicit DMA-BUF synchronization, explicit DRM timelines
+on the application host, and keyboard and pointer events. The bridge forwards
+`wp_presentation` feedback from the display compositor. On separate hosts or in
+separate time namespaces, it translates presentation timestamps to the
+application's `CLOCK_MONOTONIC` using round-trip clock samples. Network delay
+asymmetry affects the accuracy of translated timestamps.
+The bridge exposes the application-side data-device objects GTK needs to
+initialize keyboard input. Clipboard and drag data stay on their own host.
+
+Set `WAYLAND_MCP_TRACE_TIMING=1` on the SSH Wayland launcher to log buffer
+acquisition, GPU conversion, codec work, and publication times on both hosts.
+Vulkan timings separate command finalization, submission, and fence wait.
+
+## MCP and capture over SSH
+
+The Wayland proxy runs on the desktop host and owns the Wayland socket, application
+buffers, and encode GPU. Launch applications on that host with the
+`WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` returned by `wayland.environment()`.
+
+### Start a remote MCP for terminal testing or client configuration
+
+In a terminal on the SSH host's desktop, read its active socket name with
+`printenv WAYLAND_DISPLAY`. Use that socket name and the OpenSSH destination
+in your local MCP client's stdio server configuration.
+
+```json
+{
+  "mcpServers": {
+    "wayland": {
+      "command": "/absolute/path/to/wayland-mcp",
+      "args": ["--ssh", "user@desktop.example", "--remote-display", "wayland-0", "--local-js"]
+    }
+  }
+}
+```
+
+Start or restart the server in your MCP client. In `gui_console`, run
+`return await wayland.environment()` and use its returned `WAYLAND_DISPLAY`
+and `XDG_RUNTIME_DIR` to launch a native Wayland app on the SSH host. Then run
+`return await wayland.windows()` and look for the app with `mapped: true`.
+This checks that the app connected through the remote proxy.
+To keep sessions open for several hosts, configure a separate MCP server entry
+for each destination and use the corresponding `gui_console`.
+
+With `--ssh`, the local launcher starts the remote MCP. It uses the same
+automatic executable staging as `--ssh-wayland`. The local JavaScript console uses
+an OpenSSH reverse Unix-socket forward and requires stream-local forwarding on
+the SSH server. Omit `--local-js` to keep JavaScript on the desktop host while
+the local launcher still decodes video.
+
+```sh
+target/release/wayland-mcp --ssh user@desktop.example \
+  --remote-display wayland-0 --local-js
+```
+
+The launcher uses non-interactive OpenSSH authentication and host-key verification.
+`--remote-display` overrides the desktop host's `WAYLAND_DISPLAY`, and
+`--ssh-config` selects an alternate SSH config.
+
+### Use an installed remote executable
+
+To run the entire MCP and JavaScript console on the desktop host using SSH
+stdio directly, install a release executable on that host.
+
+```sh
+ssh -T -o BatchMode=yes user@desktop.example 'mkdir -p "$HOME/.local/bin"'
+scp -o BatchMode=yes target/release/wayland-mcp user@desktop.example:.local/bin/wayland-mcp
+```
+
+Configure the MCP client to launch this SSH command over stdio. Substitute
+your SSH destination and the socket name from the remote desktop session.
+
+```sh
+ssh -T -o BatchMode=yes user@desktop.example \
+  'WAYLAND_DISPLAY=wayland-0 exec "$HOME/.local/bin/wayland-mcp"'
+```
+
+### H.265 capture
+
+`wayland.videoFrame()` returns a normal in-memory image handle and attaches a PNG
+to the foreground MCP result. With the local launcher, the desktop host sends a
+complete H.265 access unit over SSH and the local GPU decodes it. With the full
+remote MCP, the desktop GPU decodes it before attaching the PNG.
+
+```js
+return await wayland.videoFrame({
+  windowId: (await wayland.windows()).find(w => w.mapped).window_id,
+  chroma: 444,
+  bitDepth: 10,
+  toneMap: "knee",
+  background: "black",
+  qp: 20,
+});
+```
+
+Omit `chroma`, `bitDepth`, and `screenContent` to prefer 10-bit 4:4:4 SCC and
+fall back to 8-bit 4:2:0 HEVC Main when either endpoint lacks SCC support. Exact
+requests also support 8- and 10-bit 4:2:0 and 4:4:4, and 10-bit 4:2:2 in the
+range-extension profile, subject to VA-API support on both codec devices.
+With explicit 4:4:4 sampling and no
+`screenContent` setting, SCC is preferred and the range-extension profile is
+the fallback at the requested bit depth. Set `screenContent` to pin the profile.
+Options can change between calls. `encodeGpu` must match the GPU that owns
+the captured buffer. `decodeGpu` pins the decoder on the receiving host. The image metadata reports
+the selected profile parameters and render nodes. The input is a committed root
+DMA-BUF in buffer coordinates. If the producer does not publish DRM feedback,
+the proxy tries `captureGpu`, then the explicitly selected encode GPU, then
+the only render node if there is one. The import must succeed. Use
+`afterCommitSerial` and `timeoutMs` to request a newer commit.
+
+Vulkan interprets the committed Wayland color description and assumes sRGB
+with BT.709 primaries for untagged surfaces. It uses linear FP16 BT.2020
+internally and composites alpha over black or a fixed checkerboard. Tone
+mapping applies to FP16 RGB input. The default `auto` applies a highlight
+knee to tagged HDR in that format. Set `toneMap: "curve"` and supply up to 16 ordered
+linear input/output knots with `toneCurve` to define a GPU-evaluated curve. The
+H.265 sequence signals full-range
+BT.709 YCbCr with the sRGB transfer function and centered chroma for 4:2:0.
+Source color information and the chosen conversion are included in image
+metadata when available. The PNG preview uses opaque sRGB.
+
+Each access unit carries one IDR picture with parameter sets. There are no
+inter-frame dependencies or reorder delay. The decoder parses the access unit,
+checks the access unit's SHA-256 and its negotiated coding and color parameters,
+and waits for hardware completion. The GPU sizes and compresses the PNG preview.
+An invalid or incomplete picture is returned as a tool error. The next capture
+can recover independently.
 
 ## Build and validation
 
@@ -108,11 +381,19 @@ Evicted handles expire; manual disposal is optional. No PNG files or image paths
 JavaScript does not receive image bytes or arbitrary GPU-buffer access. The server
 does not create SHM pixel snapshots in production. Screenshot imports use the
 same canonical DRM-device context and serialized queue as programmable observers.
+When neither Wayland feedback nor the DMA-BUF exporter identifies a device,
+capture and visual observers can try the only DRM render node on the host.
+The import must succeed.
 For shader bootstrap, `screenshot({windowId, coordinateSpace:"buffer"})` presents
 the selected render buffer at its native extent, so sampled pixel coordinates
 match GLSL images. The default `"window"` mode retains scene composition and its
 input coordinate mapping. Apply `preview_to_full_scale` when viewing a reduced
 MCP preview. Buffer mode does not crop or compose other surfaces.
+If a decoration prevents window capture, the error identifies its surface
+and suggests buffer mode when the render buffer is DMA-BUF-backed.
+Screenshots report `commitSerial`, `baselineCommitSerial`, and `fresh`.
+`fresh: false` means the capture reused pixels already available at the
+baseline. A newer frame can still show an app partway through processing input.
 To capture a specific rendering child rather than a SHM parent, use
 `screenshot({windowId, surfaceId:30, coordinateSpace:"buffer"})` with a numeric
 surface ID from `windows().subsurfaces`. Explicit surface capture validates
@@ -133,7 +414,9 @@ remain reserved until the host releases them, and late duplicate completions are
 suppressed.
 
 `actAndCapture` starts capture observation before invoking its action and releases
-the lease on success or failure. `waitForCommit` holds a scoped observation lease
+the lease on success or failure. An action that closes the target can return
+`surfaceDisappeared: true` with no image and no capture error.
+`waitForCommit` holds a scoped observation lease
 while waiting. Targeted input retains capture pixels for its 500 ms render lease,
 so capture can follow a quick update without rereading a released producer buffer.
 Visual subscriptions drive the frame clock without enabling CPU pixel capture.
@@ -421,8 +704,8 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ### Programmable observer validation
 
-`cargo test` and `cargo clippy --all-targets -- -D warnings` cover console/input
-lifetime and configuration bounds. `python3 tests/visual_program/console_contract_probe.py`
+`./scripts/validate.sh` runs the release tests and lints, including console/input
+lifetime and configuration checks. `python3 tests/visual_program/console_contract_probe.py`
 checks cross-VM ArrayBuffer packing and callback decoding. Run
 `python3 scripts/validate-gpu-boundary.py` against the built production binary
 to check that failed captures create no image files and the memory-only API is advertised.
@@ -457,8 +740,8 @@ formats, all fourteen transfer functions, HDR/extended FP16 values, alpha,
 color-change history resets and import-cache layout identity.
 `normalization_probe --validation` checks channel order, color and
 alpha through predicate outputs, with `--wrong-reference` as a negative control.
-These use DRM 226:128 and never map source frames. Live acquisition/controller
-measurements are separate from synthetic shader tests.
+These probes select DRM device major 226, minor 128 (`/dev/dri/renderD128`)
+and leave source frames on the GPU.
 
 `python3 tests/visual_program/live_capture_probe.py` launches the release MCP and
 an actual Wayland Vulkan cube. It decodes in-memory screenshots, checks that the

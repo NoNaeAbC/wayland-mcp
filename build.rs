@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn compile_baseline(output: &std::path::Path) {
+fn compile_shader(output: &std::path::Path, name: &str, path: &str) {
     let color_header = std::fs::read_to_string("src/visual_color_shader.h")
         .expect("read shared color shader source");
     let color = color_header
@@ -10,7 +10,7 @@ fn compile_baseline(output: &std::path::Path) {
         .and_then(|(_, rest)| rest.split_once(")GLSL\";"))
         .map(|(source, _)| source)
         .expect("shared color shader must use the GLSL raw-string delimiter");
-    let source = std::fs::read_to_string("src/visual.comp")
+    let source = std::fs::read_to_string(path)
         .expect("read baseline shader source")
         .replace("// VISUAL_COLOR_GLSL", color);
     let compiler = shaderc::Compiler::new().expect("initialize static Shaderc compiler");
@@ -25,14 +25,14 @@ fn compile_baseline(output: &std::path::Path) {
         .compile_into_spirv(
             &source,
             shaderc::ShaderKind::Compute,
-            "submitted-program",
+            path,
             "main",
             Some(&options),
         )
         .expect("compile embedded baseline shader");
     let words = spirv.as_binary();
     let mut header = format!(
-        "#pragma once\n#include <array>\n#include <cstdint>\ninline constexpr std::array<std::uint32_t,{}> visual_spirv{{\n",
+        "#pragma once\n#include <array>\n#include <cstdint>\ninline constexpr std::array<std::uint32_t,{}> {name}_spirv{{\n",
         words.len()
     );
     for word in words {
@@ -40,7 +40,8 @@ fn compile_baseline(output: &std::path::Path) {
         writeln!(header, "    0x{word:x},").expect("format SPIR-V word");
     }
     header.push_str("};\n");
-    std::fs::write(output.join("visual_spirv.h"), header).expect("write embedded shader header");
+    std::fs::write(output.join(format!("{name}_spirv.h")), header)
+        .expect("write embedded shader header");
 }
 
 fn main() {
@@ -55,6 +56,7 @@ fn main() {
         "src/visual_color_shader.h",
         "src/visual_program_gpu.h",
         "src/visual_gpu_internal.h",
+        "src/vulkan_instance.h",
         "tools/compile_visual.cpp",
     ] {
         println!("cargo:rerun-if-changed={file}");
@@ -73,7 +75,42 @@ fn main() {
         "-Wold-style-cast",
     ];
 
-    compile_baseline(&gpu_out);
+    compile_shader(&gpu_out, "visual", "src/visual.comp");
+    compile_shader(&gpu_out, "ssh_video", "src/ssh_video.comp");
+    compile_shader(&gpu_out, "ssh_preview", "src/ssh_preview.comp");
+    println!("cargo:rerun-if-changed=src/ssh_video.comp");
+    println!("cargo:rerun-if-changed=src/ssh_preview.comp");
+    println!("cargo:rerun-if-changed=src/ssh_video.h");
+    println!("cargo:rerun-if-changed=src/h265");
+    let video_sources = [
+        "src/ssh_video.cpp",
+        "src/h265/frame_vaapi.cpp",
+        "src/h265/encoder_vaapi.cpp",
+        "src/h265/editor_bitstream_api.cpp",
+        "src/h265/bitstream_parser.cpp",
+        "src/h265/syntax_parser.cpp",
+        "src/h265/vulkan_video.cpp",
+    ];
+    let video_objects: Vec<_> = video_sources
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            println!("cargo:rerun-if-changed={path}");
+            let object = gpu_out.join(format!("video{index}.o"));
+            assert!(
+                Command::new(&native_cxx)
+                    .args(native_flags)
+                    .args(["-O2", "-fPIC", "-Isrc", "-Isrc/h265/include", "-I"])
+                    .arg(&gpu_out)
+                    .args(["-c", path, "-o"])
+                    .arg(&object)
+                    .status()
+                    .expect("C++ compiler required")
+                    .success()
+            );
+            object
+        })
+        .collect();
     assert!(
         Command::new(&native_cxx)
             .args(native_flags)
@@ -100,6 +137,7 @@ fn main() {
             .arg(gpu_out.join("libvisual_gpu.a"))
             .arg(gpu_out.join("visual_gpu.o"))
             .arg(gpu_out.join("shader_compiler.o"))
+            .args(video_objects)
             .status()
             .unwrap()
             .success()
@@ -107,6 +145,9 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", gpu_out.display());
     println!("cargo:rustc-link-lib=static=visual_gpu");
     println!("cargo:rustc-link-lib=stdc++");
+    println!("cargo:rustc-link-lib=va");
+    println!("cargo:rustc-link-lib=va-drm");
+    println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rerun-if-changed=scripts/generate_wayland_protocols.py");
     println!("cargo:rerun-if-env-changed=PYTHON");
 
