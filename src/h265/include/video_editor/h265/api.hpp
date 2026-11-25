@@ -111,6 +111,7 @@ namespace video_editor::h265 {
 		std::uint32_t                intra_period_      = 30;
 		std::uint32_t                intra_idr_period_  = 30;
 		std::uint32_t                ip_period_         = 1;
+		std::uint8_t                 _decoded_picture_buffer_size = 0; // zero uses the mode default
 		std::uint8_t                 level_idc_         = 120;
 		bool                         high_tier_         = false;
 		std::uint8_t                 picture_order_count_lsb_bits_ = 16;
@@ -132,7 +133,9 @@ namespace video_editor::h265 {
 		bool                     reference_            = true;
 		std::vector<Frame_Id>    references_l0_;
 		std::vector<Frame_Id>    references_l1_;
+		std::vector<Frame_Id>    _retained_references{}; // in the RPS, unused by this picture
 		std::optional<std::uint8_t> cqp_;
+		std::uint8_t              _pyramid_level = 0;
 		bool                     read_reconstruction_ = true;
 	};
 

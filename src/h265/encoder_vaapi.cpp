@@ -1,6 +1,7 @@
 #include "h265/encoder.hpp"
 
 #include "h265/frame_vaapi.hpp"
+#include "video_editor/h265/api.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -379,7 +380,8 @@ namespace video_editor::h265::encoder {
 			writer.bits(level_idc, 8U);
 		}
 
-		[[nodiscard]] std::uint32_t max_dpb_minus1(const Mode_Binding &binding) {
+		[[nodiscard]] std::uint32_t max_dpb_minus1(const H265_Encode_Plan &plan, const Mode_Binding &binding) {
+			if (plan._decoded_picture_buffer_size != 0U) { return plan._decoded_picture_buffer_size - 1U; }
 			return std::min<std::uint32_t>(
 					std::max<std::uint32_t>(binding.public_.max_reference_l0_ + binding.public_.max_reference_l1_ + 1U, 1U),
 					16U) - 1U;
@@ -400,7 +402,7 @@ namespace video_editor::h265::encoder {
 					(chroma_idc(binding.public_.chroma_) != 1U ? 4U : binding.public_.bit_depth_ > 8U ? 2U : 1U);
 			profile_tier_level(writer, profile, plan.level_idc_, plan.high_tier_);
 			writer.bit(false); // sub_layer_ordering_info_present
-			writer.ue(max_dpb_minus1(binding));
+			writer.ue(max_dpb_minus1(plan, binding));
 			writer.ue(plan.ip_period_ > 1U ? plan.ip_period_ - 1U : 0U);
 			writer.ue(0U);
 			writer.bits(0U, 6U); // vps_max_layer_id
@@ -432,7 +434,7 @@ namespace video_editor::h265::encoder {
 			writer.ue(binding.public_.bit_depth_ - 8U);
 			writer.ue(plan.picture_order_count_lsb_bits_ - 4U);
 			writer.bit(false);
-			writer.ue(max_dpb_minus1(binding));
+			writer.ue(max_dpb_minus1(plan, binding));
 			writer.ue(plan.ip_period_ > 1U ? plan.ip_period_ - 1U : 0U);
 			writer.ue(0U);
 			writer.ue(0U); // min coding block = 8
@@ -472,7 +474,8 @@ namespace video_editor::h265::encoder {
 			writer.bit(true);  // vui_timing_info_present
 			writer.bits(plan.stream_.framerate_den_, 32U);
 			writer.bits(plan.stream_.framerate_num_, 32U);
-			writer.bit(false); // poc_proportional_to_timing
+			writer.bit(plan.ip_period_ > 1U); // poc_proportional_to_timing
+			if (plan.ip_period_ > 1U) { writer.ue(0U); } // one tick per POC
 			writer.bit(false); // hrd_parameters_present
 			writer.bit(false); // bitstream_restriction
 			writer.bit(binding.public_.screen_content_);
@@ -538,6 +541,7 @@ namespace video_editor::h265::encoder {
 		struct Packed_Slice_Reference {
 			Frame_Id     frame_;
 			std::int32_t poc_ = 0;
+			bool _used = true;
 		};
 
 		[[nodiscard]] std::uint32_t ceil_log2(std::uint32_t value) {
@@ -585,14 +589,14 @@ namespace video_editor::h265::encoder {
 				for (const auto &reference: negative) {
 					const auto distance = static_cast<std::uint32_t>(picture.picture_order_count_ - reference.poc_);
 					writer.ue(distance - previous_distance - 1U);
-					writer.bit(true);
+					writer.bit(reference._used);
 					previous_distance = distance;
 				}
 				previous_distance = 0U;
 				for (const auto &reference: positive) {
 					const auto distance = static_cast<std::uint32_t>(reference.poc_ - picture.picture_order_count_);
 					writer.ue(distance - previous_distance - 1U);
-					writer.bit(true);
+					writer.bit(reference._used);
 					previous_distance = distance;
 				}
 				if (plan.temporal_mvp_) { writer.bit(picture.type_ != H265_Slice_Type::I); }
@@ -611,21 +615,24 @@ namespace video_editor::h265::encoder {
 					if (picture.type_ == H265_Slice_Type::B) { writer.ue(picture.references_l1_.size() - 1U); }
 				}
 
-				const auto list_bits = ceil_log2(references.size());
+				const auto used = std::ranges::count(references, true, &Packed_Slice_Reference::_used);
+				const auto list_bits = ceil_log2(used);
 				const auto write_list = [&](std::span<const Frame_Id> requested,
 											std::span<const Packed_Slice_Reference> first,
 											std::span<const Packed_Slice_Reference> second) {
-					if (references.size() <= 1U) { return; }
+					if (used <= 1) { return; }
 					writer.bit(true);
 					for (const auto id: requested) {
 						std::uint32_t index = 0U;
 						bool found = false;
 						for (const auto &candidate: first) {
+							if (!candidate._used) { continue; }
 							if (candidate.frame_ == id) { found = true; break; }
 							++index;
 						}
 						if (!found) {
 							for (const auto &candidate: second) {
+								if (!candidate._used) { continue; }
 								if (candidate.frame_ == id) { found = true; break; }
 								++index;
 							}
@@ -709,7 +716,8 @@ namespace video_editor::h265::encoder {
 											 "H.265 picture POC must fit the resolved SPS POC-LSB width"));
 				}
 				if (picture.type_ == H265_Slice_Type::I &&
-					(!picture.references_l0_.empty() || !picture.references_l1_.empty())) {
+					(!picture.references_l0_.empty() || !picture.references_l1_.empty() ||
+					 !picture._retained_references.empty())) {
 					return std::unexpected(error(Media_Error_Code::INVALID_ARGUMENT,
 											 "an H.265 I picture cannot have reference lists"));
 				}
@@ -752,6 +760,14 @@ namespace video_editor::h265::encoder {
 				std::vector<std::uint64_t> unique_references;
 				for (const auto id: picture.references_l0_) { unique_references.push_back(id.value_); }
 				for (const auto id: picture.references_l1_) { unique_references.push_back(id.value_); }
+				for (const auto id: picture._retained_references) {
+					if (!references_.contains(id.value_) ||
+						std::ranges::find(unique_references, id.value_) != unique_references.end()) {
+						return std::unexpected(error(Media_Error_Code::INVALID_ARGUMENT,
+													 "invalid unused H.265 reference"));
+					}
+					unique_references.push_back(id.value_);
+				}
 				std::ranges::sort(unique_references);
 				const auto unique_end = std::ranges::unique(unique_references).begin();
 				unique_references.erase(unique_end, unique_references.end());
@@ -859,6 +875,7 @@ namespace video_editor::h265::encoder {
 						plan_.sample_adaptive_offset_ ? 1U : 0U;
 				sequence.seq_fields.bits.sps_temporal_mvp_enabled_flag = plan_.temporal_mvp_ ? 1U : 0U;
 				sequence.seq_fields.bits.low_delay_seq = plan_.ip_period_ == 1U;
+				sequence.seq_fields.bits.hierachical_flag = plan_.ip_period_ > 1U;
 				sequence.log2_min_luma_coding_block_size_minus3 = 0U;
 				const auto ctu_size = binding_.public_.coding_tree_block_size_;
 				sequence.log2_diff_max_min_luma_coding_block_size = std::bit_width(ctu_size) - 4U;
@@ -901,6 +918,7 @@ namespace video_editor::h265::encoder {
 				};
 				for (const auto id: picture.references_l0_) { append_dpb(id, VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE); }
 				for (const auto id: picture.references_l1_) { append_dpb(id, VA_PICTURE_HEVC_RPS_ST_CURR_AFTER); }
+				for (const auto id: picture._retained_references) { append_dpb(id, 0U); }
 				params.coded_buf = coded_;
 				params.collocated_ref_pic_index = plan_.temporal_mvp_ && picture.type_ != H265_Slice_Type::I ? 0U : 0xffU;
 				params.pic_init_qp = plan_.rate_control_.initial_qp_; // same base QP as the packed PPS
@@ -915,6 +933,7 @@ namespace video_editor::h265::encoder {
 				params.pic_fields.bits.coding_type = picture.type_ == H265_Slice_Type::I ? 1U :
 													  (picture.type_ == H265_Slice_Type::P ? 2U : 3U);
 				params.pic_fields.bits.reference_pic_flag = picture.reference_ ? 1U : 0U;
+				if (plan_.ip_period_ > 1U) { params.hierarchical_level_plus1 = picture._pyramid_level + 1U; }
 				params.pic_fields.bits.constrained_intra_pred_flag =
 						plan_.constrained_intra_prediction_ ? 1U : 0U;
 				params.pic_fields.bits.transform_skip_enabled_flag = plan_.transform_skip_ ? 1U : 0U;
@@ -930,12 +949,12 @@ namespace video_editor::h265::encoder {
 				const auto total_ctus = ctu_width * ctu_height;
 				std::vector<VAEncSliceParameterBufferHEVC> slices(plan_.slice_count_);
 				std::vector<Packed_Slice_Reference> packed_references;
-				for (const auto &[id, stored]: references_) {
-					if (std::ranges::find(picture.references_l0_, Frame_Id{.value_ = id}) != picture.references_l0_.end() ||
-						std::ranges::find(picture.references_l1_, Frame_Id{.value_ = id}) != picture.references_l1_.end()) {
-						packed_references.push_back(Packed_Slice_Reference{
-								.frame_ = Frame_Id{.value_ = id}, .poc_ = stored.poc_});
-					}
+				for (const auto id: dpb_ids) {
+					const Frame_Id frame{.value_ = id};
+					packed_references.push_back(Packed_Slice_Reference{
+						.frame_ = frame, .poc_ = references_.at(id).poc_,
+						._used = std::ranges::find(picture._retained_references, frame) == picture._retained_references.end(),
+					});
 				}
 				std::uint32_t next_ctu = 0U;
 				std::optional<Media_Error> slice_buffer_error;
@@ -1266,6 +1285,10 @@ namespace video_editor::h265::encoder {
 			return std::unexpected(error(Media_Error_Code::INVALID_ARGUMENT,
 								 "H.265 sequence or rate-control fields are outside their legal domains"));
 		}
+		if (plan._decoded_picture_buffer_size > 16U ||
+			(plan._decoded_picture_buffer_size != 0U && plan._decoded_picture_buffer_size < plan.ip_period_)) {
+			return std::unexpected(error(Media_Error_Code::INVALID_ARGUMENT, "invalid H.265 decoded picture buffer size"));
+		}
 		if (plan.stream_.rate_control_ != encode::Rate_Control_Mode::CQP &&
 			plan.stream_.rate_control_ != encode::Rate_Control_Mode::ICQ &&
 			plan.rate_control_.target_bitrate_ == 0U) {
@@ -1300,7 +1323,9 @@ namespace video_editor::h265::encoder {
 			mode.public_.max_reference_l1_ = 0;
 		}
 		const auto surface_count = plan.intra_idr_period_ == 1U ? 1U : reference_limit
-			? *reference_limit + 1 : std::max<std::uint32_t>(mode.public_.max_reference_l0_ + mode.public_.max_reference_l1_ + 2U, 4U);
+			? *reference_limit + 1 : plan._decoded_picture_buffer_size != 0U
+			? plan._decoded_picture_buffer_size
+			: std::max<std::uint32_t>(mode.public_.max_reference_l0_ + mode.public_.max_reference_l1_ + 2U, 4U);
 		std::vector<VASurfaceID> surfaces;
 		const Frame_Layout recon_layout{
 			.width = context_width, .height = context_height, .depth = binding->public_.bit_depth_,

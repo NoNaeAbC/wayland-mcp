@@ -1,5 +1,6 @@
 #pragma once
 #include "visual_gpu.h"
+#include <cstddef>
 #include <cstdint>
 
 namespace video_editor::h265 {
@@ -78,6 +79,11 @@ int ssh_video_copy_dma_buf(const char *device, const Video_Options *, const Visu
 	const Visual_Plane *destination, std::uint32_t destination_width, bool implicit_sync, char *error);
 void *ssh_video_encode(const char *device, const Video_Options *, bool scc, std::uint8_t qp,
 					  const Video_Rate *, std::uint32_t stream_poc, char *error, void *stream);
+void *wayland_recording_encoder_create(const char *device, std::uint32_t width,
+	std::uint32_t height, std::uint32_t frame_rate, char *error);
+void *wayland_recording_encoder_group(void *encoder, const std::uint32_t *const *frames,
+	std::size_t count, char *error);
+void wayland_recording_encoder_destroy(void *encoder);
 const std::uint8_t *ssh_video_packet_data(const void *, std::uint32_t *size);
 void ssh_video_packet_destroy(void *);
 int ssh_video_decode(const char *device, const Video_Options *, void *stream,

@@ -378,12 +378,48 @@ images remain in memory, attach to the foreground response and return opaque
 `disposeImage(handle)` releases it early. New captures automatically evict the oldest
 handles when the 16-image/32 MiB cache fills and report `evictedImageHandles`.
 Evicted handles expire; manual disposal is optional. No PNG files or image paths are created.
-JavaScript does not receive image bytes or arbitrary GPU-buffer access. The server
-does not create SHM pixel snapshots in production. Screenshot imports use the
+JavaScript does not receive image bytes or arbitrary GPU-buffer access. Recording
+can capture committed SHM pixels for scene composition. Screenshot imports use the
 same canonical DRM-device context and serialized queue as programmable observers.
 When neither Wayland feedback nor the DMA-BUF exporter identifies a device,
 capture and visual observers can try the only DRM render node on the host.
 The import must succeed.
+
+### Background video recording
+
+```js
+const {window_id: windowId} = (await wayland.windows()).find(w => w.mapped);
+globalThis.recording = await wayland.startRecording({windowId, maxFrames: 300, frameRate: 30});
+return recording;
+```
+
+The server records that window while the console is idle or runs other commands.
+In a later call, use `wayland.recordingStatus({recordingId: recording.recordingId})`
+to see progress and the final stop reason. Pass the same ID to
+`wayland.endRecording({recordingId})` to stop early and finish the buffered
+pictures. The server retains status for the most recent recording.
+
+`maxFrames` is required. `frameRate` defaults to 30 and accepts integers from
+1 to 60. The frame budget can cover up to eight hours at that rate. One
+recording can run per server. Capture stops at the frame limit, the
+corresponding elapsed duration, 512 MiB, or when the next group would leave
+less than 256 MiB free. The file is in the server's artifact directory on the
+capture host (`WAYLAND_MCP_ARTIFACT_DIR` when configured). Status reports the
+number of pictures written, which can be lower than the limit when capture
+or encoding falls behind. A recording that writes zero pictures leaves no
+file.
+
+The output is a raw Annex B `.265` stream encoded by VA-API in HEVC Main with
+a B-frame pyramid. Every sequence carries VUI with BT.709 primaries and matrix,
+sRGB transfer, limited range, and frame timing. Wayland subsurfaces are
+composited in stacking order with alpha blending in linear light. Transparent
+areas are flattened over black. The first composition sets the output size,
+rounded up to the encoder's alignment. Later changes fit within that canvas.
+If the proxy has no retained pixels for a surface whose buffer was already
+released, that surface needs a fresh commit before it can be recorded.
+
+### Screenshots
+
 For shader bootstrap, `screenshot({windowId, coordinateSpace:"buffer"})` presents
 the selected render buffer at its native extent, so sampled pixel coordinates
 match GLSL images. The default `"window"` mode retains scene composition and its

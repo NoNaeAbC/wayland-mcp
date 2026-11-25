@@ -4,6 +4,8 @@
 pub(crate) mod bridge;
 #[path = "wayland_clipboard.rs"]
 mod clipboard;
+#[path = "wayland_recording.rs"]
+mod recording;
 #[path = "wayland_scene.rs"]
 mod scene;
 
@@ -556,6 +558,10 @@ impl WaylandGuiBackend {
             transport.shutdown.cancel();
         }
         let inner = self.state.inner.lock().await;
+        let recording = inner.recording.clone();
+        if let Some(recording) = &recording {
+            recording.cancel();
+        }
         for session in inner.sessions.values() {
             if let Some(writer) = &session.client_event_writer {
                 writer.shutdown();
@@ -563,6 +569,10 @@ impl WaylandGuiBackend {
             if let Some(backend) = &session.backend {
                 let _ = backend.stream.shutdown(Shutdown::Both);
             }
+        }
+        drop(inner);
+        if let Some(mut recording) = recording {
+            recording.wait().await;
         }
     }
 
@@ -2308,6 +2318,7 @@ struct WaylandProxyServer {
     capture_tracking_deadline: Option<Instant>,
     observations: HashMap<u64, (Option<String>, Instant)>,
     video_observations: HashMap<u64, VideoObservation>,
+    recording: Option<recording::Recording>,
     input_render_deadlines: HashMap<String, Instant>,
     visual_windows: HashSet<String>,
     next_observation: u64,
@@ -2369,6 +2380,7 @@ impl WaylandProxyServer {
             capture_tracking_deadline: None,
             observations: HashMap::new(),
             video_observations: HashMap::new(),
+            recording: None,
             input_render_deadlines: HashMap::new(),
             visual_windows: HashSet::new(),
             next_observation: 0,
@@ -2600,11 +2612,15 @@ impl WaylandProxyServer {
         if window.is_some_and(|w| self.visual_windows.contains(w)) {
             return true;
         }
-        self.observations.values().any(|(scope, deadline)| {
-            *deadline > Instant::now() && (scope.is_none() || scope.as_ref() == window)
-        }) || self.video_observations.values().any(|observation| {
-            observation.deadline > Instant::now() && Some(&observation.window) == window
-        })
+        self.recording
+            .as_ref()
+            .is_some_and(|recording| recording.observes(window))
+            || self.observations.values().any(|(scope, deadline)| {
+                *deadline > Instant::now() && (scope.is_none() || scope.as_ref() == window)
+            })
+            || self.video_observations.values().any(|observation| {
+                observation.deadline > Instant::now() && Some(&observation.window) == window
+            })
     }
 
     fn observed_frame_events(
@@ -2684,7 +2700,10 @@ impl WaylandProxyServer {
         if self.capture_tracking_deadline.is_some_and(|d| d <= now) {
             self.disable_capture_tracking();
         }
-        !self.observations.is_empty()
+        self.recording
+            .as_ref()
+            .is_some_and(recording::Recording::is_observing)
+            || !self.observations.is_empty()
             || self.capture_tracking_deadline.is_some()
             || !self.input_render_deadlines.is_empty()
     }
@@ -3037,7 +3056,10 @@ impl WaylandProxyServer {
             .get_mut(&client_id)
             .ok_or_else(|| format!("missing Wayland client session {}", client_id.0))?;
         for intercept in self.registry.intercepts_for(hook_request.id()) {
-            intercept.apply(session, resource_id, hook_request);
+            let record_shm = self.recording.as_ref().is_some_and(|recording| {
+                recording.observes(session.frame_tracker.surface_to_window.get(&resource_id))
+            });
+            intercept.apply(session, resource_id, hook_request, record_shm);
         }
         Ok(())
     }
@@ -3178,7 +3200,15 @@ impl WaylandProxyServer {
                     .colors
                     .request(request.object_id, hook_request);
                 for intercept in self.registry.intercepts_for(hook_request.id()) {
-                    intercept.apply(session, request.object_id, hook_request);
+                    let record_shm = self.recording.as_ref().is_some_and(|recording| {
+                        recording.observes(
+                            session
+                                .frame_tracker
+                                .surface_to_window
+                                .get(&request.object_id),
+                        )
+                    });
+                    intercept.apply(session, request.object_id, hook_request, record_shm);
                 }
             }
         }
@@ -5681,6 +5711,7 @@ impl WaylandInterceptHook {
         session: &mut WaylandClientSession,
         resource_id: u32,
         request: &GeneratedHookRequest,
+        record_shm: bool,
     ) {
         match (self.kind, request) {
             (
@@ -5720,7 +5751,9 @@ impl WaylandInterceptHook {
                 );
             }
             (WaylandInterceptKind::SurfaceCommit, GeneratedHookRequest::WlSurfaceCommit) => {
-                session.frame_tracker.commit_surface(resource_id);
+                session
+                    .frame_tracker
+                    .commit_surface_with_shm(resource_id, record_shm);
             }
             (WaylandInterceptKind::TimelineImport, _)
             | (WaylandInterceptKind::AcquirePoint, _)
@@ -6207,13 +6240,13 @@ impl WaylandFrameTracker {
         if let Some(buffer) = buffer {
             surface.width = buffer.width.max(1);
             surface.height = buffer.height.max(1);
-            surface.rgba = buffer.rgba.clone().unwrap_or_default();
+            surface.rgba = Arc::new(buffer.rgba.clone().unwrap_or_default());
             surface.buffer_kind = Some(buffer.kind_name());
             surface.capture_error = buffer.capture_error();
         } else {
             surface.width = 1;
             surface.height = 1;
-            surface.rgba.clear();
+            surface.rgba = Arc::default();
             surface.buffer_kind = None;
             surface.capture_error = None;
         }
@@ -6236,7 +6269,12 @@ impl WaylandFrameTracker {
         }
         true
     }
+    #[cfg(test)]
     fn commit_surface(&mut self, surface_id: u32) {
+        self.commit_surface_with_shm(surface_id, true);
+    }
+
+    fn commit_surface_with_shm(&mut self, surface_id: u32, record_shm: bool) {
         if let Some(position) = self.pending_popup_positions.remove(&surface_id) {
             self.popup_positions.insert(surface_id, position);
         }
@@ -6267,29 +6305,33 @@ impl WaylandFrameTracker {
             }
             match &buffer.source {
                 TrackedBufferSource::Shm(shm) => {
-                    if cfg!(test) {
+                    // Only a commit that updates pixels authorizes reading this
+                    // use of the client buffer. An empty commit keeps owned pixels.
+                    if (record_shm || cfg!(test))
+                        && (surface.attach_pending || !surface.damage.is_empty())
+                    {
                         match shm.read_rgba() {
                             Ok(frame) => {
                                 surface.width = frame.width;
                                 surface.height = frame.height;
-                                surface.rgba = frame.rgba;
+                                surface.rgba = Arc::new(frame.rgba);
                                 surface.capture_error = None;
                             }
                             Err(error) => {
-                                surface.rgba.clear();
+                                surface.rgba = Arc::default();
                                 surface.capture_error = Some(error);
                             }
                         }
-                    } else {
-                        surface.rgba.clear();
+                    } else if surface.attach_pending || !surface.damage.is_empty() {
+                        surface.rgba = Arc::default();
                         surface.capture_error = Some(
-                            "CPU pixel snapshots are disabled; DMA-BUF visual events required"
+                            "snapshot_unavailable: SHM surface needs a pixel commit during recording"
                                 .into(),
                         );
                     }
                 }
                 TrackedBufferSource::Dmabuf(dmabuf) => {
-                    surface.rgba.clear();
+                    surface.rgba = Arc::default();
                     let result = self.prepared_gpu.remove(&surface_id);
                     if let Some(result) = result {
                         surface.linear_rgba = Arc::new(Vec::new());
@@ -6512,7 +6554,7 @@ impl WaylandFrameTracker {
                 buffer_id: None,
                 width: 1,
                 height: 1,
-                rgba: Vec::new(),
+                rgba: Arc::default(),
                 linear_rgba: Arc::new(Vec::new()),
                 color: None,
                 output_ids: BTreeSet::new(),
@@ -6880,7 +6922,7 @@ impl WaylandFrameTracker {
                 .flat_map(|pixel| crate::gui_color::encode_preview(*pixel, hdr))
                 .collect()
         } else if surface.rgba.len() == pixels * 4 {
-            surface.rgba.clone()
+            surface.rgba.as_ref().clone()
         } else {
             return Err(surface.capture_error.clone().unwrap_or_else(|| {
                 "snapshot_unavailable: render buffer requires a fresh producer commit".into()
@@ -7320,7 +7362,7 @@ struct TrackedSurface {
     buffer_id: Option<u32>,
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    rgba: Arc<Vec<u8>>,
     linear_rgba: Arc<Vec<[f32; 4]>>,
     color: Option<crate::gui_color::ColorDescription>,
     output_ids: BTreeSet<u32>,
@@ -10321,7 +10363,7 @@ mod tests {
         surface.width = 2;
         surface.height = 1;
         surface.has_committed_buffer = true;
-        surface.rgba = vec![20, 30, 40, 255, 200, 210, 220, 255];
+        surface.rgba = Arc::new(vec![20, 30, 40, 255, 200, 210, 220, 255]);
         surface.viewport_destination = Some((800, 420));
         surface.window_geometry_offset = (16, 10);
         surface.buffer_scale = 2;
@@ -11016,7 +11058,7 @@ mod tests {
         let surface = tracker.pending_surface_mut(10);
         surface.has_committed_buffer = true;
         surface.pixel_commit_serial = 1;
-        surface.rgba = vec![255, 0, 0, 255];
+        surface.rgba = Arc::new(vec![255, 0, 0, 255]);
         tracker.commit_surface(10);
         server.sessions.insert(client, session);
         Ok((
@@ -11046,7 +11088,7 @@ mod tests {
             child.has_committed_buffer = true;
             child.pixel_commit_serial = 2;
             child.buffer_kind = Some("dmabuf");
-            child.rgba = vec![0, 0, 255, 255];
+            child.rgba = Arc::new(vec![0, 0, 255, 255]);
             tracker.commit_surface(11);
         }
         let backend = WaylandGuiBackend {
@@ -11079,7 +11121,7 @@ mod tests {
             let serial = tracker.next_commit_serial + 1;
             let child = tracker.pending_surface_mut(11);
             child.pixel_commit_serial = serial;
-            child.rgba = vec![0, 255, 0, 255];
+            child.rgba = Arc::new(vec![0, 255, 0, 255]);
             tracker.commit_surface(11);
         });
         let png = backend.screenshot_surface(window.clone(), 11).await?;
@@ -11145,7 +11187,7 @@ mod tests {
                 let serial = tracker.next_commit_serial + 1;
                 let surface = tracker.pending_surface_mut(10);
                 surface.pixel_commit_serial = serial;
-                surface.rgba.clear();
+                surface.rgba = Arc::default();
                 tracker.commit_surface(10);
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -11158,7 +11200,7 @@ mod tests {
                 .unwrap()
                 .frame_tracker
                 .surface_mut(10)
-                .rgba = vec![0, 255, 0, 255];
+                .rgba = Arc::new(vec![0, 255, 0, 255]);
         });
         for buffer_coordinates in [false, true] {
             let png = state
@@ -11501,7 +11543,7 @@ mod tests {
         let surface = tracker.surface_mut(10);
         surface.width = 100;
         surface.height = 50;
-        surface.rgba = vec![0; 100 * 50 * 4];
+        surface.rgba = Arc::new(vec![0; 100 * 50 * 4]);
         surface.has_committed_buffer = true;
         tracker.sync_window_from_surface(10);
 
@@ -11723,7 +11765,7 @@ mod tests {
         tracker.commit_surface(10);
         tracker.destroy_buffer(41);
         // Exercise the production case where SHM pixels are unavailable.
-        tracker.surfaces.get_mut(&10).unwrap().rgba.clear();
+        tracker.surfaces.get_mut(&10).unwrap().rgba = Arc::default();
         let info = tracker
             .list_windows()
             .into_iter()
@@ -11769,7 +11811,7 @@ mod tests {
             let parent = tracker.surface_mut(10);
             parent.width = 1600;
             parent.height = 1200;
-            parent.rgba = vec![0; 1600 * 1200 * 4];
+            parent.rgba = Arc::new(vec![0; 1600 * 1200 * 4]);
             parent.has_committed_buffer = true;
         }
         tracker.commit_surface(10);
@@ -11780,7 +11822,7 @@ mod tests {
             // output scaling; ancestry must outrank raw pixel area.
             child.width = 1200;
             child.height = 900;
-            child.rgba = vec![0xff; 1200 * 900 * 4];
+            child.rgba = Arc::new(vec![0xff; 1200 * 900 * 4]);
             child.has_committed_buffer = true;
         }
         tracker.commit_surface(11);

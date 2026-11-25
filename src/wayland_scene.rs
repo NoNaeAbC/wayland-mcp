@@ -1,9 +1,10 @@
 //! Window-local observation geometry; the presentation branch stays untouched.
 use super::*;
+use std::borrow::Cow;
 
 #[derive(Clone)]
 struct Layer<'a> {
-    surface: &'a TrackedSurface,
+    surface: Cow<'a, TrackedSurface>,
     x: f64,
     y: f64,
     width: f64,
@@ -82,7 +83,7 @@ impl WaylandFrameTracker {
                 return Err("empty surface viewport".into());
             }
             layers.push(Layer {
-                surface,
+                surface: Cow::Borrowed(surface),
                 x: x + f64::from(surface.offset.0),
                 y: y + f64::from(surface.offset.1),
                 width,
@@ -205,42 +206,83 @@ impl WaylandFrameTracker {
     }
 
     pub(super) fn scene_capture_error(&self, window: &str) -> Option<String> {
-        let scene = match self.observation_scene(window) {
-            Ok(scene) => scene,
-            Err(error) => return Some(error),
-        };
-        for layer in &scene.layers {
-            let surface = layer.surface;
-            if let Some(color) = surface.color.as_ref()
-                && let Err(error) = color.validate()
-            {
-                return Some(error);
-            }
-            if surface.rgba.len() != surface.width as usize * surface.height as usize * 4
-                && surface.linear_rgba.len() != surface.width as usize * surface.height as usize
-            {
-                return Some(self.missing_scene_pixels(window, surface, &scene));
-            }
-        }
-        None
+        self.scene_for_capture(window).err()
     }
     pub(super) fn capture_scene(&self, window: &str) -> Result<CapturedRgbaFrame, String> {
+        let scene = self.scene_for_capture(window)?;
+        Ok(scene.capture(false))
+    }
+
+    pub(super) fn scene_for_capture(&self, window: &str) -> Result<Scene<'_>, String> {
         let scene = self.observation_scene(window)?;
-        let mut output = vec![[0.0f32; 4]; scene.size.0 as usize * scene.size.1 as usize];
-        let mut hdr = false;
-        let mut metadata = vec![];
         for layer in &scene.layers {
-            let surface = layer.surface;
-            let color = surface.color.as_ref();
-            if let Some(color) = color {
+            let surface = &layer.surface;
+            if let Some(color) = &surface.color {
                 color.validate()?;
-                hdr |= color.is_hdr();
-                metadata.push(color.metadata());
             }
             if surface.rgba.len() != surface.width as usize * surface.height as usize * 4
                 && surface.linear_rgba.len() != surface.width as usize * surface.height as usize
             {
                 return Err(self.missing_scene_pixels(window, surface, &scene));
+            }
+        }
+        Ok(scene)
+    }
+}
+
+impl Scene<'_> {
+    pub(super) fn same_pixels(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.origin == other.origin
+            && self.scale == other.scale
+            && self.layers.len() == other.layers.len()
+            && self.layers.iter().zip(&other.layers).all(|(a, b)| {
+                a.x == b.x
+                    && a.y == b.y
+                    && a.width == b.width
+                    && a.height == b.height
+                    && a.source == b.source
+                    && a.surface.buffer_scale == b.surface.buffer_scale
+                    && a.surface.buffer_transform == b.surface.buffer_transform
+                    && a.surface.width == b.surface.width
+                    && a.surface.height == b.surface.height
+                    && a.surface.color == b.surface.color
+                    && Arc::ptr_eq(&a.surface.rgba, &b.surface.rgba)
+                    && Arc::ptr_eq(&a.surface.linear_rgba, &b.surface.linear_rgba)
+            })
+    }
+
+    pub(super) fn into_owned(self) -> Scene<'static> {
+        Scene {
+            layers: self
+                .layers
+                .into_iter()
+                .map(|layer| Layer {
+                    surface: Cow::Owned(layer.surface.into_owned()),
+                    x: layer.x,
+                    y: layer.y,
+                    width: layer.width,
+                    height: layer.height,
+                    source: layer.source,
+                })
+                .collect(),
+            origin: self.origin,
+            size: self.size,
+            scale: self.scale,
+        }
+    }
+
+    pub(super) fn capture(&self, opaque: bool) -> CapturedRgbaFrame {
+        let scene = self;
+        let mut output = vec![[0.0f32; 4]; scene.size.0 as usize * scene.size.1 as usize];
+        let mut hdr = false;
+        let mut metadata = vec![];
+        for layer in &scene.layers {
+            let surface = &layer.surface;
+            let color = surface.color.as_ref();
+            if let Some(color) = color {
+                hdr |= color.is_hdr();
+                metadata.push(color.metadata());
             }
             let x0 = ((layer.x - scene.origin.0) * scene.scale).floor().max(0.0) as u32;
             let y0 = ((layer.y - scene.origin.1) * scene.scale).floor().max(0.0) as u32;
@@ -289,12 +331,18 @@ impl WaylandFrameTracker {
         }
         let rgba = output
             .into_iter()
-            .flat_map(|p| crate::gui_color::encode_preview(p, hdr))
+            .flat_map(|mut p| {
+                if opaque {
+                    // The linear premultiplied RGB is already composited over black.
+                    p[3] = 1.0;
+                }
+                crate::gui_color::encode_preview(p, hdr)
+            })
             .collect();
         let color = Some(
             serde_json::json!({"geometry":{"origin":{"x":scene.origin.0,"y":scene.origin.1},"pixels_per_logical_unit":scene.scale},"surfaces":metadata,"tone_mapped":hdr,"notice":if hdr {Some("HDR content is blended in linear light and tone mapped to SDR; original HDR appearance cannot be judged from this preview")} else {None}}),
         );
-        Ok(CapturedRgbaFrame {
+        CapturedRgbaFrame {
             width: scene.size.0,
             height: scene.size.1,
             rgba,
@@ -305,8 +353,11 @@ impl WaylandFrameTracker {
                 .map(|layer| layer.surface.pixel_visible_serial)
                 .max()
                 .unwrap_or_default(),
-        })
+        }
     }
+}
+
+impl WaylandFrameTracker {
     pub(super) fn surface_pointer_target(
         &self,
         window: &str,
@@ -429,7 +480,7 @@ mod tests {
         let s = tracker.pending_surface_mut(id);
         s.width = size.0;
         s.height = size.1;
-        s.rgba = pixel.repeat((size.0 * size.1) as usize);
+        s.rgba = Arc::new(pixel.repeat((size.0 * size.1) as usize));
         s.has_committed_buffer = true;
     }
     #[test]
@@ -533,7 +584,7 @@ mod tests {
         s.width = 2;
         s.height = 1;
         s.has_committed_buffer = true;
-        s.rgba = vec![255, 0, 0, 255, 0, 255, 0, 255];
+        s.rgba = Arc::new(vec![255, 0, 0, 255, 0, 255, 0, 255]);
         s.buffer_transform = 1;
         tracker.commit_surface(1);
         let frame = tracker.capture_scene(&window)?;

@@ -625,6 +625,14 @@ toneCurve: [[0,0],[1,0.8],[4,1]] in linear reference-white units. The Vulkan
 shader evaluates it. Set afterCommitSerial to require a newer commit, with an
 optional timeoutMs. When the producer omits DRM feedback, captureGpu selects
 the render node used to import its buffer. Each call can change the options.
+startRecording({windowId,maxFrames,frameRate:30}) starts background H.265 capture
+and returns a recordingId and a .265 path on the capture host. maxFrames is required,
+positive, and limited to eight hours at frameRate (1..60).
+recordingStatus({recordingId}) reports framesWritten, bytesWritten and stopReason.
+endRecording({recordingId}) stops early and finishes the buffered pictures.
+The server also stops at maxFrames, the recording duration, 512 MiB, or low disk space.
+Recordings include the window's subsurfaces and alpha blending against black.
+If an idle SHM surface has already released its buffer, it must redraw for capture.
 configureSshVideo(options) changes video settings for the connected bridge.
 For terminal testing, start the bridge with --ssh-wayland user@host -- bash.
 A bridge started from a terminal uses WAYLAND_MCP_SSH_VIDEO_SOCKET for video
@@ -870,6 +878,9 @@ const wayland = Object.freeze({
   resizeWindow: (args) => native("resize_window", args),
   screenshot: (args = {}) => native("screenshot", args),
   videoFrame: (args = {}) => native("video_frame", args),
+  startRecording: (args = {}) => native("start_recording", args),
+  recordingStatus: (args = {}) => native("recording_status", args),
+  endRecording: (args = {}) => native("end_recording", args),
   configureSshVideo: (options = {}) => native("configure_ssh_video", options),
   captureNextFrame: (args = {}) => native("capture_next_frame", args),
   pointerEvent: async (args) => {

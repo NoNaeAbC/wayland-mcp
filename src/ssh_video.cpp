@@ -1,6 +1,7 @@
 #include "ssh_video.h"
 #include "h265/encoder.hpp"
 #include "h265/frame_vaapi.hpp"
+#include "video_editor/h265/api.hpp"
 #include "ssh_video_spirv.h"
 #include "ssh_preview_spirv.h"
 #include "visual_gpu_internal.h"
@@ -1025,6 +1026,84 @@ namespace {
 		}
 	};
 
+	struct Recording_Encoder {
+		static constexpr std::uint32_t GROUP_SIZE = 4;
+		static constexpr std::uint32_t IDR_PERIOD = 121;
+		static constexpr std::uint8_t BASE_QP = 24;
+
+		std::unique_ptr<hevc::H265_Encode_Context> _context;
+		std::size_t _pixels;
+		std::uint32_t _anchor = IDR_PERIOD - 1;
+
+		[[nodiscard]] visual::Status picture(
+			const std::uint32_t *source, std::uint32_t poc, std::optional<std::uint32_t> past,
+			std::optional<std::uint32_t> future, std::optional<std::uint32_t> retained,
+			bool reference, std::uint8_t level, Video_Packet &packet) {
+			const auto list = [](std::optional<std::uint32_t> id) {
+				return id ? std::vector{hevc::Frame_Id{.value_ = *id}} : std::vector<hevc::Frame_Id>{};
+			};
+			const hevc::H265_Encode_Picture request{
+				.frame_ = {.value_ = poc},
+				.type_ = future ? hevc::H265_Slice_Type::B : past ? hevc::H265_Slice_Type::P : hevc::H265_Slice_Type::I,
+				.picture_order_count_ = static_cast<std::int32_t>(poc),
+				.idr_ = !past,
+				.reference_ = reference,
+				.references_l0_ = list(past),
+				.references_l1_ = list(future),
+				._retained_references = list(retained),
+				.cqp_ = static_cast<std::uint8_t>(BASE_QP + 2 * level),
+				._pyramid_level = level,
+				.read_reconstruction_ = false,
+			};
+			auto encoded = _context->encode(std::span(source, _pixels), request);
+			if (!encoded) { return std::unexpected(encoded.error().message_); }
+			packet.insert(packet.end(), encoded->annex_b_.begin(), encoded->annex_b_.end());
+			return {};
+		}
+
+		[[nodiscard]] visual::Status release(std::uint32_t poc) {
+			const auto result = _context->release_reference({.value_ = poc});
+			if (!result) { return std::unexpected(result.error().message_); }
+			return {};
+		}
+
+		[[nodiscard]] visual::Status encode(std::span<const std::uint32_t *const> frames, Video_Packet &packet) {
+			if (_anchor == IDR_PERIOD - 1) {
+				if (frames.size() != 1) { return std::unexpected("expected a single H.265 IDR input"); }
+				_anchor = 0;
+				return picture(frames.front(), 0, {}, {}, {}, true, 0, packet);
+			}
+			if (frames.empty() || frames.size() > GROUP_SIZE || _anchor + frames.size() >= IDR_PERIOD) {
+				return std::unexpected("invalid H.265 pyramid input group");
+			}
+			const auto right = _anchor + static_cast<std::uint32_t>(frames.size());
+			auto status = picture(frames.back(), right, _anchor, {}, {}, true, 0, packet);
+			if (!status) { return status; }
+			// Decode the future anchor first, then the middle reference B,
+			// then the leaf pictures. The right anchor survives the left leaf.
+			const auto middle = (_anchor + right) / 2;
+			if (frames.size() >= 2) {
+				status = picture(frames[middle - _anchor - 1], middle, _anchor, right, {},
+					frames.size() >= 3, 1, packet);
+				if (!status) { return status; }
+			}
+			if (frames.size() == 4) {
+				status = picture(frames.front(), middle - 1, _anchor, middle, right, false, 2, packet);
+				if (!status) { return status; }
+			}
+			status = release(_anchor);
+			if (!status) { return status; }
+			if (frames.size() >= 3) {
+				status = picture(frames[frames.size() - 2], middle + 1, middle, right, {}, false, 2, packet);
+				if (!status) { return status; }
+				status = release(middle);
+				if (!status) { return status; }
+			}
+			_anchor = right;
+			return {};
+		}
+	};
+
 	// A connection can interleave a window and its subsurfaces. Retain the
 	// two most recent layouts independently for color and alpha.
 	using Encoder_Cache = std::array<std::unique_ptr<Encoder>, 2>;
@@ -1479,6 +1558,74 @@ extern "C" void *ssh_video_encode(const char *device, const Video_Options *optio
 	}
 	cached_encoder->previous_poc = predictive ? std::optional{poc} : std::nullopt;
 	return new Video_Packet(std::move(encoded->annex_b_));
+}
+
+extern "C" void *wayland_recording_encoder_create(const char *device, std::uint32_t width,
+	std::uint32_t height, std::uint32_t frame_rate, char *error) {
+	const auto snapshot = hevc::encoder::query_encode_plan_restrictions(device);
+	if (!snapshot) {
+		error_copy(error, snapshot.error().message_);
+		return nullptr;
+	}
+	std::string failure = "no H.265 Main encoder with both forward and backward references";
+	for (const auto &mode : snapshot->modes_) {
+		const auto &capability = mode.public_;
+		if (!can_encode(capability, {.chroma = 420, .depth = 8, .screen_content = false}, Video_Rate_Mode::Fixed_Qp)
+			|| capability.max_reference_l0_ == 0 || capability.max_reference_l1_ == 0) {
+			continue;
+		}
+		const hevc::H265_Encode_Plan plan{
+			.stream_ = {
+				.restrictions_identity_ = snapshot->public_.identity_,
+				.mode_ = capability.id_,
+				.width_ = width,
+				.height_ = height,
+				.framerate_num_ = frame_rate,
+				.framerate_den_ = 1,
+				.source_format_ = VK_FORMAT_R32_UINT,
+				.rate_control_ = encode::Rate_Control_Mode::CQP,
+			},
+			.output_color_ = {
+				.range_ = Color_Range::LIMITED,
+				.matrix_ = Matrix_Coefficients::BT709,
+				.primaries_ = Color_Primaries::BT709,
+				.transfer_ = Transfer_Function::SRGB,
+			},
+			.rate_control_ = {.initial_qp_ = Recording_Encoder::BASE_QP},
+			.intra_period_ = Recording_Encoder::IDR_PERIOD,
+			.intra_idr_period_ = Recording_Encoder::IDR_PERIOD,
+			.ip_period_ = Recording_Encoder::GROUP_SIZE,
+			._decoded_picture_buffer_size = 4,
+			.level_idc_ = 183,
+			.sample_adaptive_offset_ = mode.va_sao_supported_,
+			.temporal_mvp_ = false,
+		};
+		auto context = hevc::encoder::create_encode_context(plan, *snapshot, device);
+		if (context) {
+			return new Recording_Encoder{
+				._context = std::move(*context),
+				._pixels = static_cast<std::size_t>(width) * height,
+			};
+		}
+		failure = context.error().message_;
+	}
+	error_copy(error, failure);
+	return nullptr;
+}
+
+extern "C" void *wayland_recording_encoder_group(void *encoder, const std::uint32_t *const *frames,
+	std::size_t count, char *error) {
+	auto packet = std::make_unique<Video_Packet>();
+	const auto result = static_cast<Recording_Encoder *>(encoder)->encode(std::span(frames, count), *packet);
+	if (!result) {
+		error_copy(error, result.error());
+		return nullptr;
+	}
+	return packet.release();
+}
+
+extern "C" void wayland_recording_encoder_destroy(void *encoder) {
+	delete static_cast<Recording_Encoder *>(encoder);
 }
 
 extern "C" const std::uint8_t *ssh_video_packet_data(const void *pointer, std::uint32_t *size) {

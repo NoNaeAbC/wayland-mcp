@@ -755,6 +755,27 @@ async fn handle_native_call(
             Ok((json!({"delivered":true,"detail":detail}), None))
         }
         "configure_ssh_video" => Ok((crate::ssh_wayland::configure(args).await?, None)),
+        "start_recording" => match backend {
+            GuiBackendHandle::Wayland(backend) => {
+                Ok((backend.start_recording(args, artifacts).await?, None))
+            }
+            _ => Err("startRecording requires the Wayland proxy".into()),
+        },
+        "recording_status" | "end_recording" => match backend {
+            GuiBackendHandle::Wayland(backend) => {
+                let id = args
+                    .get("recordingId")
+                    .and_then(Value::as_u64)
+                    .ok_or("recordingId must be a positive integer")?;
+                Ok((
+                    backend
+                        .recording_status(id, method == "end_recording")
+                        .await?,
+                    None,
+                ))
+            }
+            _ => Err("recording status requires the Wayland proxy".into()),
+        },
         "video_frame" => {
             let GuiBackendHandle::Wayland(backend) = backend else {
                 return Err("videoFrame requires a Wayland backend".into());

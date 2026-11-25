@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -747,6 +747,20 @@ unsafe extern "C" {
     ) -> i32;
     fn ssh_video_packet_data(packet: *const c_void, size: *mut u32) -> *const u8;
     fn ssh_video_packet_destroy(packet: *mut c_void);
+    fn wayland_recording_encoder_create(
+        node: *const c_char,
+        width: u32,
+        height: u32,
+        frame_rate: u32,
+        error: *mut c_char,
+    ) -> *mut c_void;
+    fn wayland_recording_encoder_group(
+        encoder: *mut c_void,
+        frames: *const *const u32,
+        count: usize,
+        error: *mut c_char,
+    ) -> *mut c_void;
+    fn wayland_recording_encoder_destroy(encoder: *mut c_void);
     fn ssh_video_decode_preview(
         device: *const c_char,
         options: *const VideoOptions,
@@ -1443,6 +1457,80 @@ struct NativePacket(*mut c_void);
 impl Drop for NativePacket {
     fn drop(&mut self) {
         unsafe { ssh_video_packet_destroy(self.0) };
+    }
+}
+
+pub(crate) struct RecordingEncoder {
+    native: std::ptr::NonNull<c_void>,
+    pixels: usize,
+}
+
+// The context is exclusively owned. Moving it between blocking workers does
+// not overlap VA-API access or carry any thread-local Vulkan state.
+unsafe impl Send for RecordingEncoder {}
+
+impl RecordingEncoder {
+    pub(crate) fn new(width: u32, height: u32, frame_rate: u32) -> Result<Self, String> {
+        let mut errors = Vec::new();
+        for path in render_nodes() {
+            let node = CString::new(path.as_str()).map_err(|e| e.to_string())?;
+            let mut error = [0; 512];
+            let native = unsafe {
+                wayland_recording_encoder_create(
+                    node.as_ptr(),
+                    width,
+                    height,
+                    frame_rate,
+                    error.as_mut_ptr(),
+                )
+            };
+            if let Some(native) = std::ptr::NonNull::new(native) {
+                return Ok(Self {
+                    native,
+                    pixels: width as usize * height as usize,
+                });
+            }
+            errors.push(format!("{path}: {}", native_error(&error)));
+        }
+        if errors.is_empty() {
+            return Err("recording requires an H.265 VA-API DRM render node".into());
+        }
+        Err(format!(
+            "could not initialize H.265 recording on {}",
+            errors.join(", ")
+        ))
+    }
+
+    pub(crate) fn encode_group(&mut self, frames: &[Arc<Vec<u32>>]) -> Result<Vec<u8>, String> {
+        if frames.iter().any(|frame| frame.len() != self.pixels) {
+            return Err("invalid H.265 recording frame extent".into());
+        }
+        let frames = frames
+            .iter()
+            .map(|frame| frame.as_ptr())
+            .collect::<Vec<_>>();
+        let mut error = [0; 512];
+        let native = unsafe {
+            wayland_recording_encoder_group(
+                self.native.as_ptr(),
+                frames.as_ptr(),
+                frames.len(),
+                error.as_mut_ptr(),
+            )
+        };
+        if native.is_null() {
+            return Err(native_error(&error));
+        }
+        let packet = NativePacket(native);
+        let mut size = 0;
+        let data = unsafe { ssh_video_packet_data(packet.0, &mut size) };
+        Ok(unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec())
+    }
+}
+
+impl Drop for RecordingEncoder {
+    fn drop(&mut self) {
+        unsafe { wayland_recording_encoder_destroy(self.native.as_ptr()) };
     }
 }
 
