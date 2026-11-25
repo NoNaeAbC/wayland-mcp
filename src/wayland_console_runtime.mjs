@@ -602,6 +602,18 @@ live surface in that window's subsurface tree. surfaceId is a positive protocol 
 from windows(). It requires DMA-BUF and waits up to 1 second for a fresh producer
 commit under an observation lease. It excludes the parent and other subsurfaces.
 Window-coordinate composition is not accepted together with surfaceId.
+Wine and Waydroid can put the GPU frame in a child of a shared-memory window.
+For Wine, launch with the proxy environment and DISPLAY unset to use the native
+Wayland driver. Wine using the X11 driver bypasses this proxy.
+For Waydroid, set WAYLAND_DISPLAY to environment().socket_path when running
+\`waydroid session start\`. Keep the desktop's XDG_RUNTIME_DIR so Waydroid can find
+the session services. Launch the Android app with \`waydroid app launch PACKAGE\`.
+If window capture reports shared memory, inspect windows().subsurfaces for a child
+with buffer_kind "dmabuf" and has_committed_buffer true. Pass its numeric surface_id
+as surfaceId to the buffer screenshot above. Capture during animation, or start the
+screenshot before an action that causes a redraw. An idle child can time out.
+The raw child capture leaves out window geometry, decorations and viewport cropping.
+onVisual and onVisualProgram cannot target that child by surfaceId.
 videoFrame({windowId}) captures a root DMA-BUF as a verified H.265 IDR picture. It prefers
 10-bit 4:4:4 SCC and falls back to 8-bit 4:2:0 Main based on both codec devices.
 Set chroma and bitDepth to choose sampling and depth. For 4:4:4, omit screenContent

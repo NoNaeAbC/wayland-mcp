@@ -164,7 +164,12 @@ impl WaylandFrameTracker {
             .max()
     }
 
-    fn missing_scene_pixels(&self, window: &str, surface: &TrackedSurface) -> String {
+    fn missing_scene_pixels(
+        &self,
+        window: &str,
+        surface: &TrackedSurface,
+        scene: &Scene<'_>,
+    ) -> String {
         let detail = surface.capture_error.clone().unwrap_or_else(|| {
             format!(
                 "snapshot_unavailable: surface {} has no owned committed pixels",
@@ -180,6 +185,16 @@ impl WaylandFrameTracker {
                 surface.id
             )
         } else if surface.buffer_kind == Some("shm") {
+            let root = self.windows[window].input_surface_id;
+            if let Some(layer) = scene.layers.iter().rev().find(|layer| {
+                layer.surface.buffer_kind == Some("dmabuf")
+                    && self.surface_descends_from(layer.surface.id, root)
+            }) {
+                return format!(
+                    r#"{detail}. Surface {} blocked window capture. To try the DMA-BUF subsurface on its next commit, use screenshot({{windowId: {window:?}, surfaceId: {}, coordinateSpace: "buffer"}})"#,
+                    surface.id, layer.surface.id,
+                );
+            }
             format!(
                 "{detail}. Surface {} needs DMA-BUF backing for capture",
                 surface.id
@@ -194,7 +209,7 @@ impl WaylandFrameTracker {
             Ok(scene) => scene,
             Err(error) => return Some(error),
         };
-        for layer in scene.layers {
+        for layer in &scene.layers {
             let surface = layer.surface;
             if let Some(color) = surface.color.as_ref()
                 && let Err(error) = color.validate()
@@ -204,7 +219,7 @@ impl WaylandFrameTracker {
             if surface.rgba.len() != surface.width as usize * surface.height as usize * 4
                 && surface.linear_rgba.len() != surface.width as usize * surface.height as usize
             {
-                return Some(self.missing_scene_pixels(window, surface));
+                return Some(self.missing_scene_pixels(window, surface, &scene));
             }
         }
         None
@@ -225,7 +240,7 @@ impl WaylandFrameTracker {
             if surface.rgba.len() != surface.width as usize * surface.height as usize * 4
                 && surface.linear_rgba.len() != surface.width as usize * surface.height as usize
             {
-                return Err(self.missing_scene_pixels(window, surface));
+                return Err(self.missing_scene_pixels(window, surface, &scene));
             }
             let x0 = ((layer.x - scene.origin.0) * scene.scale).floor().max(0.0) as u32;
             let y0 = ((layer.y - scene.origin.1) * scene.scale).floor().max(0.0) as u32;

@@ -669,6 +669,48 @@ Host socket paths, session internals and connection-history details are omitted
 from the JS response. Backend selection is trusted startup configuration through
 `WAYLAND_MCP_BACKEND_SOCKET`; the JS API cannot change it.
 
+### Wine and Waydroid
+
+These tests ran on KWin with Intel Arc B390 graphics. Capture depends on
+the Wayland surface and buffer the app submits.
+
+- **Wine 11.22, native Wayland.** A Win32 Direct3D 11 test app produced 30
+  fresh render-buffer captures across three launches, with the expected
+  pixel changes after injected clicks and keys. This worked with the
+  default WineD3D renderer and with `WINE_D3D_CONFIG=renderer=vulkan`.
+  The app closed via injected input and disappeared from `windows()`.
+  `resizeWindow()` did not change its extent. The GDI-only test accepted
+  input but used shared memory and could not be captured. Wine's X11 driver
+  bypassed the proxy. See [rootless Xwayland status](docs/xwayland-status.md).
+- **Waydroid 1.6.3.** The Android session booted through the proxy and
+  exposed separate Calculator, Settings and Clock toplevels. In a separate
+  Android test app, 12 consecutive child captures per launch showed
+  changing animation across two starts. Fresh frames also confirmed changes
+  from injected keyboard, mouse and touch input. One subsequent keypress
+  produced no visible change. An injected touch also completed Android's
+  uninstall dialog for the test app, and the package disappeared from the
+  app list. Whole-window capture failed on shared-memory parents, and idle
+  Calculator and Clock child captures timed out. Stopping the session
+  removed its windows.
+
+For Wine, set `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` from
+`wayland.environment()`, unset `DISPLAY` and `WAYLAND_SOCKET`, then launch
+`wine app.exe`. For a new Waydroid session, keep the desktop's
+`XDG_RUNTIME_DIR` and use the absolute proxy `socket_path` as
+`WAYLAND_DISPLAY` when running `waydroid session start`. Then run
+`waydroid app launch PACKAGE`. If the app does not map, try
+`waydroid show-full-ui` and launch the app again.
+[Waydroid's session and app commands](https://docs.waydro.id/usage/waydroid-command-line-options).
+
+In these tests the GPU image was in a subsurface. Find its current numeric
+`surface_id` in the target window's `subsurfaces` with
+`has_committed_buffer: true` and `buffer_kind: "dmabuf"`. Use
+`screenshot({windowId, surfaceId, coordinateSpace: "buffer"})` during an
+animation or start the capture before triggering a redraw. The raw image
+omits window decoration and viewport cropping. Input helpers still use
+window coordinates. Both visual subscription APIs rejected the
+shared-memory toplevels, and neither accepts a child `surfaceId`.
+
 ## Configuration
 
 | Variable | Purpose | Default |

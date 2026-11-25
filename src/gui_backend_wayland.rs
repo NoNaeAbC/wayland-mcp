@@ -11722,6 +11722,8 @@ mod tests {
         assert_eq!(tracker.subsurfaces_for_window(&window)[0].buffer_kind, None);
         tracker.commit_surface(10);
         tracker.destroy_buffer(41);
+        // Exercise the production case where SHM pixels are unavailable.
+        tracker.surfaces.get_mut(&10).unwrap().rgba.clear();
         let info = tracker
             .list_windows()
             .into_iter()
@@ -11739,6 +11741,16 @@ mod tests {
         assert!(child.capture_details.as_ref().unwrap().contains("DMA-BUF"));
         assert!(child.commit_serial > 0);
         assert!(child.has_committed_buffer);
+        let capture_hint = format!(
+            r#"screenshot({{windowId: {window:?}, surfaceId: 11, coordinateSpace: "buffer"}})"#
+        );
+        let capture_error = info.capture_error.as_deref().unwrap();
+        assert!(capture_error.contains("Surface 10 blocked window capture"));
+        assert!(capture_error.contains(&capture_hint));
+        assert_eq!(
+            tracker.capture_scene(&window).err().as_deref(),
+            Some(capture_error)
+        );
         let json = serde_json::to_value(&info).map_err(|e| e.to_string())?;
         assert_eq!(json["subsurface_count"], 1);
         assert_eq!(json["subsurfaces"][0]["buffer_kind"], "dmabuf");
