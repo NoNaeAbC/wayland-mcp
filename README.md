@@ -16,7 +16,7 @@ protocol-level testing.
 Build requirements:
 
 - Linux;
-- Rust 1.88 or newer, including Cargo and a native linker;
+- Rust 1.89 or newer, including Cargo and a native linker;
 - Python 3.10 or newer (`python3`, or the executable specified by `PYTHON`);
 - installed Wayland core and `wayland-protocols` XML files under `/usr/share`;
 - libxkbcommon development files providing the `xkbcommon` linker library;

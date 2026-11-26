@@ -7,6 +7,9 @@ mod gui_wayland_generated {
     include!(concat!(env!("OUT_DIR"), "/gui_wayland_generated.rs"));
 }
 mod console_runtime;
+mod dbus_console;
+mod dbus_endpoint;
+mod dbus_fd;
 mod gui_xkb;
 mod input_events;
 mod js_console;

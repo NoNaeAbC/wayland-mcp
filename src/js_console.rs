@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -14,7 +15,11 @@ use crate::gui_backend::{
     GuiWaylandKeyboardEventRequest, GuiWaylandPointerEvent, GuiWaylandPointerEventRequest,
 };
 
-pub(crate) const NODE_RUNTIME: &str = include_str!("wayland_console_runtime.mjs");
+pub(crate) const NODE_RUNTIME: &str = concat!(
+    include_str!("wayland_dbus_helpers.mjs"),
+    "\n",
+    include_str!("wayland_console_runtime.mjs"),
+);
 const MAX_EVAL_CODE_BYTES: usize = 1_048_576;
 const DEFAULT_EVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_EVAL_TIMEOUT_MS: u64 = 1_000;
@@ -296,11 +301,9 @@ async fn run_node_session(
     let worker = tokio::spawn(async move {
         let mut ssh: Option<crate::ssh_wayland::ConsoleBridge> = None;
         while let Some(job) = jobs.recv().await {
-            if job.cancellation.is_cancelled() {
-                continue;
-            }
             let result = tokio::select! {
-                _ = job.cancellation.cancelled() => continue,
+                biased;
+                _ = job.cancellation.cancelled() => Err("native call context ended".into()),
                 result = async {
                     match job.method.as_str() {
                         "ssh_connect" => {
@@ -334,6 +337,7 @@ async fn run_node_session(
         }
     });
     let mut observations = tokio::task::JoinSet::new();
+    let dbus = Arc::new(crate::dbus_console::Console::new(outgoing.clone()));
     let mut subscriptions = HashMap::<u64, tokio_util::sync::CancellationToken>::new();
     let mut streams = tokio::task::JoinSet::new();
     let (stream_ends, mut ended_streams) = tokio::sync::mpsc::channel::<(u64, Value)>(64);
@@ -402,7 +406,7 @@ async fn run_node_session(
                 pending_subscriptions -= 1;
                 let current = active_calls.remove(&completion.call_id).is_some()
                     && (pending.contains_key(&completion.eval_id)
-                        || completion.subscription_id.is_some_and(|id| subscriptions.get(&id).is_some_and(|t| !t.is_cancelled())));
+                        || completion.subscription_id.is_some_and(|id| subscriptions.get(&id).cloned().or_else(|| dbus.context(id)).is_some_and(|t| !t.is_cancelled())));
                 if !current { continue; }
                 match completion.result.take().expect("unclaimed subscription completion") {
                     Ok(mut subscription) => {
@@ -428,8 +432,7 @@ async fn run_node_session(
             }
             completion = completions.recv() => {
                 if let Some(completion) = completion {
-                    active_calls.remove(&completion.call_id);
-                    if !pending.contains_key(&completion.eval_id) && !completion.subscription_id.is_some_and(|id| subscriptions.get(&id).is_some_and(|t| !t.is_cancelled())) { continue; }
+                    if active_calls.remove(&completion.call_id).is_none() { continue; }
                     let reply = match completion.result {
                         Ok((mut value, image)) => {
                             if let Some(image) = image {
@@ -462,18 +465,24 @@ async fn run_node_session(
                 };
                 match message.get("type").and_then(Value::as_str) {
                     Some("heartbeat") | Some("ready") => { last_heartbeat = tokio::time::Instant::now(); }
+                    Some("dbus_event_done") => {
+                        if let Some(event) = message["event"].as_u64() {
+                            dbus.notification_done(event);
+                        }
+                    }
                     Some("native_call") => {
                         let call_id = message.get("id").and_then(Value::as_u64).unwrap_or(0);
                         let eval_id = message.get("evalId").and_then(Value::as_u64).unwrap_or(0);
                         let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
                         let subscription_id = message.get("subscriptionId").and_then(Value::as_u64);
-                        let context_token = subscription_id.and_then(|id| subscriptions.get(&id)).filter(|t| !t.is_cancelled()).cloned();
-                        if call_id == 0 || (!pending.contains_key(&eval_id) && context_token.is_none()) || active_calls.len() >= MAX_NATIVE_CALLS || active_calls.insert(call_id, subscription_id).is_some() {
+                        let context_token = subscription_id.and_then(|id| subscriptions.get(&id).cloned().or_else(|| dbus.context(id))).filter(|t| !t.is_cancelled());
+                        if call_id == 0 || (!pending.contains_key(&eval_id) && context_token.is_none()) || active_calls.len() >= MAX_NATIVE_CALLS || active_calls.contains_key(&call_id) {
                             if outgoing.try_send(json!({"type":"native_result","id":call_id,"ok":false,"error":"invalid, stale, duplicate or over-limit native call"})).is_err() {
                                 break "console transport output queue is full".to_string();
                             }
                             continue;
                         }
+                        active_calls.insert(call_id, subscription_id);
                         let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
                         if matches!(method.as_str(), "subscribe_input" | "subscribe_visual" | "subscribe_visual_program") {
                             if subscriptions.len() + pending_subscriptions >= 32 {
@@ -533,11 +542,27 @@ async fn run_node_session(
                             active_calls.remove(&call_id); if outgoing.try_send(reply).is_err() { break "console output queue is full".into(); } continue;
                         }
                         let job = NativeJob { call_id, eval_id, subscription_id, method, args, cancellation: context_token.unwrap_or_else(|| cancellation.clone()) };
-                        if matches!(job.method.as_str(), "capture_next_frame" | "screenshot" | "video_frame" | "windows" | "diagnostics") {
+                        if job.method.starts_with("dbus_") {
+                            let dbus = dbus.clone(); let completions = completion_sender.clone();
+                            observations.spawn(async move {
+                                let request = dbus.request(&job.method, job.args);
+                                // A D-Bus callback can close the very handle that grants it
+                                // background authority. Let that operation finish and acknowledge.
+                                let result = if matches!(job.method.as_str(), "dbus_close" | "dbus_shutdown") {
+                                    request.await
+                                } else {
+                                    tokio::select! {
+                                        _ = job.cancellation.cancelled() => Err("D-Bus callback or evaluation ended".into()),
+                                        result = request => result,
+                                    }
+                                }.map(|value| (value, None));
+                                let _ = completions.send(NativeCompletion { call_id: job.call_id, eval_id: job.eval_id, subscription_id: job.subscription_id, result }).await;
+                            });
+                        } else if matches!(job.method.as_str(), "capture_next_frame" | "screenshot" | "video_frame" | "windows" | "diagnostics") {
                             let backend = backend.clone(); let artifacts = artifacts.clone(); let completions = completion_sender.clone();
                             observations.spawn(async move {
                                 let result = tokio::select! {
-                                    _ = job.cancellation.cancelled() => return,
+                                    _ = job.cancellation.cancelled() => Err("native call context ended".into()),
                                     result = handle_native_call(&job.method, job.args, &backend, &artifacts) => result,
                                 };
                                 let _ = completions.send(NativeCompletion { call_id: job.call_id, eval_id: job.eval_id, subscription_id: job.subscription_id, result }).await;
@@ -705,6 +730,47 @@ async fn handle_native_call(
             serde_json::to_value(backend.list_windows().await?).map_err(|err| err.to_string())?,
             None,
         )),
+        "clipboard_types" | "clipboard_write" | "clipboard_read" => {
+            let GuiBackendHandle::Wayland(backend) = backend else {
+                return Err("clipboard requires a Wayland proxy".into());
+            };
+            let window = optional_string(&args, "windowId").ok_or("clipboard requires windowId")?;
+            let seat = optional_string(&args, "seatId");
+            let value = match method {
+                "clipboard_types" => {
+                    json!(backend.clipboard_types(&window, seat.as_deref()).await?)
+                }
+                "clipboard_write" => {
+                    let formats = args["formats"]
+                        .as_object()
+                        .ok_or("clipboard write requires a MIME type to data map")?
+                        .iter()
+                        .map(|(mime, data)| {
+                            let data = data.as_str().ok_or("clipboard data must be base64")?;
+                            let bytes = BASE64
+                                .decode(data)
+                                .map_err(|_| "invalid clipboard base64")?;
+                            Ok::<_, &str>((mime.clone(), bytes))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                    backend
+                        .write_clipboard(&window, seat.as_deref(), formats)
+                        .await?;
+                    Value::Null
+                }
+                _ => {
+                    let mime = optional_string(&args, "mimeType")
+                        .ok_or("clipboard read requires mimeType")?;
+                    json!(
+                        backend
+                            .read_clipboard(&window, seat.as_deref(), &mime)
+                            .await?
+                            .map(|bytes| BASE64.encode(bytes))
+                    )
+                }
+            };
+            Ok((value, None))
+        }
         "visual_info" => match backend {
             GuiBackendHandle::Wayland(backend) => Ok((
                 backend

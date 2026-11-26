@@ -1,13 +1,30 @@
 //! Human selection is shared with the host; model selection belongs to this proxy.
 //! Each receive uses the latest trusted input origin of its client and seat.
 use super::*;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
+use tokio::io::{AsyncReadExt, unix::AsyncFd};
 
 #[path = "wayland_drag.rs"]
 mod drag;
 use drag::{Drag, Offer};
 
+const CONSOLE_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+
 type Object = (WaylandClientId, u32);
+enum Selection {
+    App(Object),
+    Console(BTreeMap<String, Arc<[u8]>>),
+}
+impl Selection {
+    fn app(&self) -> Option<Object> {
+        match self {
+            Self::App(owner) => Some(*owner),
+            Self::Console(_) => None,
+        }
+    }
+}
 struct Source {
     mimes: Vec<String>,
     published: bool,
@@ -25,7 +42,7 @@ pub(super) struct Clipboard {
     devices: HashMap<Object, Device>,
     offers: HashMap<Object, u32>,
     host_mimes: HashMap<Object, Vec<String>>,
-    private: HashMap<u32, Object>,
+    private: HashMap<u32, Selection>,
     origins: HashMap<Object, Origin>,
     transfers: Arc<AtomicUsize>,
     drags: HashMap<u32, Drag>,
@@ -164,10 +181,7 @@ impl Clipboard {
                 .and_then(|offer| self.host_mimes.get(&(device.0, offer)))
                 .cloned()
         } else {
-            self.private
-                .get(&info.seat)
-                .and_then(|source| self.sources.get(source))
-                .map(|source| source.mimes.clone())
+            self.private_mimes(info.seat)
         };
         let Some(mimes) = mimes else {
             return Self::emit(
@@ -228,10 +242,95 @@ impl Clipboard {
             })
             .map(|(object, _)| *object)
             .collect::<Vec<_>>();
+        let mut result = Ok(());
         for device in devices {
-            self.notify(sessions, device)?;
+            result = result.and(self.notify(sessions, device));
         }
-        Ok(())
+        result
+    }
+    fn set_private(
+        &mut self,
+        sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
+        seat: u32,
+        selection: Option<Selection>,
+    ) -> Result<(), String> {
+        let next_app = selection.as_ref().and_then(Selection::app);
+        let old = match selection {
+            Some(selection) => self.private.insert(seat, selection),
+            None => self.private.remove(&seat),
+        };
+        let cancelled = if let Some(Selection::App(owner)) = old
+            && Some(owner) != next_app
+            && sessions.contains_key(&owner.0)
+        {
+            Self::emit(sessions, owner, GeneratedEvent::WlDataSourceCancelled, &[])
+        } else {
+            Ok(())
+        };
+        cancelled.and(self.notify_private(sessions, seat))
+    }
+    pub(super) fn private_mimes(&self, seat: u32) -> Option<Vec<String>> {
+        match self.private.get(&seat)? {
+            Selection::App(owner) => self.sources.get(owner).map(|source| source.mimes.clone()),
+            Selection::Console(formats) => Some(formats.keys().cloned().collect()),
+        }
+    }
+    pub(super) fn write_private(
+        &mut self,
+        sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
+        seat: u32,
+        formats: BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
+        if formats.len() > 64 {
+            return Err("clipboard MIME limit exceeded".into());
+        }
+        if formats.keys().any(|mime| !valid_mime(mime)) {
+            return Err("invalid clipboard MIME type".into());
+        }
+        if formats.values().map(Vec::len).sum::<usize>() > CONSOLE_CLIPBOARD_BYTES {
+            return Err("console clipboard payload exceeds 1 MiB".into());
+        }
+        let selection = (!formats.is_empty()).then(|| {
+            Selection::Console(
+                formats
+                    .into_iter()
+                    .map(|(mime, bytes)| (mime, bytes.into()))
+                    .collect(),
+            )
+        });
+        self.set_private(sessions, seat, selection)
+    }
+    pub(super) fn open_private(
+        &self,
+        sessions: &mut HashMap<WaylandClientId, WaylandClientSession>,
+        seat: u32,
+        mime: &str,
+    ) -> Result<Option<ClipboardRead>, String> {
+        match self.private.get(&seat) {
+            Some(Selection::Console(formats)) => {
+                Ok(formats.get(mime).cloned().map(ClipboardRead::Bytes))
+            }
+            Some(Selection::App(owner))
+                if self
+                    .sources
+                    .get(owner)
+                    .is_some_and(|source| source.mimes.iter().any(|offered| offered == mime)) =>
+            {
+                let permit = self.reserve_transfer()?;
+                let (reader, writer) = clipboard_pipe()?;
+                Self::emit(
+                    sessions,
+                    *owner,
+                    GeneratedEvent::WlDataSourceSend {
+                        mime_type: Some(mime.into()),
+                        fd: true,
+                    },
+                    &[writer],
+                )?;
+                Ok(Some(ClipboardRead::Pipe(reader, permit)))
+            }
+            _ => Ok(None),
+        }
     }
     pub(super) fn request(
         &mut self,
@@ -300,7 +399,7 @@ impl Clipboard {
             Some(GeneratedHookRequest::WlDataSourceOffer {
                 mime_type: Some(mime),
             }) => {
-                if mime.is_empty() || mime.len() > 512 {
+                if !valid_mime(mime) {
                     return Err("invalid clipboard MIME type".into());
                 }
                 let source = self
@@ -322,7 +421,7 @@ impl Clipboard {
                 let seats = self
                     .private
                     .iter()
-                    .filter(|(_, owner)| **owner == object)
+                    .filter(|(_, selection)| selection.app() == Some(object))
                     .map(|(seat, _)| *seat)
                     .collect::<Vec<_>>();
                 for seat in seats {
@@ -344,21 +443,19 @@ impl Clipboard {
                     }
                     Self::upstream(sessions, client, message.bytes.clone(), &[])?;
                 } else {
-                    let old = self.private.remove(&device.seat);
-                    if let Some(id) = source {
-                        if !self.sources.contains_key(&(client, *id)) {
-                            return Err("unknown private selection source".into());
-                        }
-                        self.private.insert(device.seat, (client, *id));
+                    let owner = source.map(|id| (client, id));
+                    if owner.is_some_and(|owner| !self.sources.contains_key(&owner)) {
+                        return Err("unknown private selection source".into());
                     }
-                    if let Some(old) = old
-                        && Some(old) != source.map(|id| (client, id))
-                        && sessions.contains_key(&old.0)
-                    {
-                        Self::emit(sessions, old, GeneratedEvent::WlDataSourceCancelled, &[])?;
-                    }
-                    self.notify_private(sessions, device.seat)?;
+                    self.set_private(sessions, device.seat, owner.map(Selection::App))?;
                 }
+                Ok(true)
+            }
+            // Selection offers are local objects. Accept only affects drag
+            // negotiation, which has already been handled by drag_request.
+            Some(GeneratedHookRequest::WlDataOfferAccept { .. })
+                if self.offers.contains_key(&object) =>
+            {
                 Ok(true)
             }
             Some(GeneratedHookRequest::WlDataOfferReceive {
@@ -389,36 +486,18 @@ impl Clipboard {
                             &[destination],
                         )?;
                     }
-                } else if let Some(owner) = self.private.get(&seat).copied()
-                    && self
-                        .sources
-                        .get(&owner)
-                        .is_some_and(|source| source.mimes.contains(mime))
-                {
-                    if self.transfers.fetch_add(1, Ordering::AcqRel) >= 32 {
-                        self.transfers.fetch_sub(1, Ordering::AcqRel);
-                        return Err("clipboard transfer limit exceeded".into());
-                    }
-                    let count = TransferCount(self.transfers.clone());
-                    let (reader, writer) = clipboard_pipe()?;
-                    Self::emit(
-                        sessions,
-                        owner,
-                        GeneratedEvent::WlDataSourceSend {
-                            mime_type: Some(mime.clone()),
-                            fd: true,
-                        },
-                        &[writer],
-                    )?;
+                } else if let Some(transfer) = self.open_private(sessions, seat, mime)? {
+                    let permit = match transfer {
+                        ClipboardRead::Bytes(_) => Some(self.reserve_transfer()?),
+                        ClipboardRead::Pipe(..) => None,
+                    };
                     tokio::runtime::Handle::try_current()
                         .map_err(|e| e.to_string())?
                         .spawn(async move {
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(10),
-                                pump_clipboard(reader, destination),
-                            )
-                            .await;
-                            drop(count);
+                            let _permit = permit;
+                            let _ =
+                                tokio::time::timeout(TRANSFER_TIMEOUT, transfer.send(destination))
+                                    .await;
                         });
                 }
                 Ok(true)
@@ -524,7 +603,7 @@ impl Clipboard {
         let seats = self
             .private
             .iter()
-            .filter(|(_, owner)| owner.0 == client)
+            .filter(|(_, selection)| selection.app().is_some_and(|owner| owner.0 == client))
             .map(|(seat, _)| *seat)
             .collect::<Vec<_>>();
         for seat in seats {
@@ -533,11 +612,49 @@ impl Clipboard {
         }
     }
 }
-struct TransferCount(Arc<AtomicUsize>);
+pub(super) struct TransferCount(Arc<AtomicUsize>);
 impl Drop for TransferCount {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+pub(super) enum ClipboardRead {
+    Bytes(Arc<[u8]>),
+    Pipe(OwnedFd, TransferCount),
+}
+impl ClipboardRead {
+    pub(super) async fn read(self) -> Result<Arc<[u8]>, String> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes),
+            Self::Pipe(reader, _permit) => {
+                let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(reader)
+                    .map_err(|error| error.to_string())?;
+                let mut bytes = Vec::new();
+                tokio::time::timeout(
+                    TRANSFER_TIMEOUT,
+                    reader
+                        .take(CONSOLE_CLIPBOARD_BYTES as u64 + 1)
+                        .read_to_end(&mut bytes),
+                )
+                .await
+                .map_err(|_| "clipboard read timed out")?
+                .map_err(|error| error.to_string())?;
+                if bytes.len() > CONSOLE_CLIPBOARD_BYTES {
+                    return Err("console clipboard payload exceeds 1 MiB".into());
+                }
+                Ok(bytes.into())
+            }
+        }
+    }
+    async fn send(self, destination: OwnedFd) -> Result<(), String> {
+        match self {
+            Self::Bytes(bytes) => write_clipboard(&clipboard_async_fd(destination)?, &bytes).await,
+            Self::Pipe(reader, _permit) => pump_clipboard(reader, destination).await,
+        }
+    }
+}
+fn valid_mime(mime: &str) -> bool {
+    !mime.is_empty() && mime.len() <= 512 && !mime.contains('\0')
 }
 fn string_request(object: u32, opcode: u16, value: &str) -> Vec<u8> {
     let mut payload = vec![(value.len() + 1) as u32];
@@ -560,18 +677,19 @@ fn clipboard_pipe() -> Result<(OwnedFd, OwnedFd), String> {
     }
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
-async fn pump_clipboard(reader: OwnedFd, writer: OwnedFd) -> Result<(), String> {
-    use tokio::io::unix::AsyncFd;
-    for fd in [&reader, &writer] {
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-        {
-            return Err("clipboard FD setup failed".into());
-        }
+fn clipboard_async_fd(fd: OwnedFd) -> Result<AsyncFd<OwnedFd>, String> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err("clipboard FD setup failed".into());
     }
-    let reader = AsyncFd::new(reader).map_err(|e| e.to_string())?;
-    let writer = AsyncFd::new(writer).map_err(|e| e.to_string())?;
+    // OwnedFd keeps the same descriptor open until AsyncFd deregisters it.
+    unsafe { AsyncFd::register(fd) }.map_err(|e| e.to_string())
+}
+async fn pump_clipboard(reader: OwnedFd, writer: OwnedFd) -> Result<(), String> {
+    let reader = clipboard_async_fd(reader)?;
+    let writer = clipboard_async_fd(writer)?;
     let mut buffer = [0u8; 16384];
     let mut total = 0usize;
     loop {
@@ -597,34 +715,28 @@ async fn pump_clipboard(reader: OwnedFd, writer: OwnedFd) -> Result<(), String> 
         if total > 64 * 1024 * 1024 {
             return Err("clipboard transfer exceeded 64 MiB".into());
         }
-        let mut offset = 0;
-        while offset < n {
-            let mut ready = writer.writable().await.map_err(|e| e.to_string())?;
-            match ready.try_io(|fd| {
-                let sent = unsafe {
-                    libc::write(
-                        fd.as_raw_fd(),
-                        buffer[offset..n].as_ptr().cast(),
-                        n - offset,
-                    )
-                };
-                if sent < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(sent as usize)
-                }
-            }) {
-                Ok(sent) => {
-                    let sent = sent.map_err(|e| e.to_string())?;
-                    if sent == 0 {
-                        return Err("clipboard destination stopped accepting data".into());
-                    }
-                    offset += sent;
-                }
-                Err(_) => continue,
+        write_clipboard(&writer, &buffer[..n]).await?;
+    }
+}
+async fn write_clipboard(writer: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> Result<(), String> {
+    while !bytes.is_empty() {
+        let mut ready = writer.writable().await.map_err(|e| e.to_string())?;
+        if let Ok(sent) = ready.try_io(|fd| {
+            let sent = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            if sent < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(sent as usize)
             }
+        }) {
+            let sent = sent.map_err(|e| e.to_string())?;
+            if sent == 0 {
+                return Err("clipboard destination stopped accepting data".into());
+            }
+            bytes = &bytes[sent..];
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -676,12 +788,13 @@ mod tests {
     fn next(stream: &StdUnixStream) -> WaylandWireMessage {
         read_wayland_wire_message_from_fd(stream.as_raw_fd(), 16, 0).unwrap()
     }
-    fn selection(stream: &StdUnixStream) -> u32 {
+    fn selection(stream: &StdUnixStream, mimes: &[&str]) -> u32 {
         let offer = next(stream);
         assert_eq!(decode_wayland_header(&offer.bytes).unwrap().opcode, 0);
         let id = u32::from_ne_bytes(offer.bytes[8..12].try_into().unwrap());
-        let mime = next(stream);
-        assert_eq!(decode_wayland_header(&mime.bytes).unwrap().object_id, id);
+        for mime in mimes {
+            assert_eq!(next(stream).bytes, string_request(id, 0, mime));
+        }
         let selection = next(stream);
         assert_eq!(
             u32::from_ne_bytes(selection.bytes[8..12].try_into().unwrap()),
@@ -776,8 +889,8 @@ mod tests {
             encode_u32_message(4, 1, &[5, 123]),
             vec![],
         )?;
-        let _owner_offer = selection(&owner_events);
-        let private_offer = selection(&receiver_events);
+        let _owner_offer = selection(&owner_events, &["text/plain"]);
+        let private_offer = selection(&receiver_events, &["text/plain"]);
         let host_id = 0xff000000;
         host_event(
             &mut server,
@@ -809,6 +922,12 @@ mod tests {
         request(
             &mut server,
             receiver,
+            encode_u32_message(private_offer, 0, &[123, 0]),
+            vec![],
+        )?;
+        request(
+            &mut server,
+            receiver,
             string_request(private_offer, 1, "text/plain"),
             vec![write],
         )?;
@@ -830,7 +949,7 @@ mod tests {
         server
             .clipboard
             .switch(&mut server.sessions, receiver, 7, Origin::Human)?;
-        let human_offer = selection(&receiver_events);
+        let human_offer = selection(&receiver_events, &["text/plain"]);
         assert!(human_offer > private_offer);
         let (read, write) = clipboard_pipe()?;
         // An older offer follows the current source too.
@@ -848,19 +967,72 @@ mod tests {
         let mut value = vec![];
         File::from(read).read_to_end(&mut value).unwrap();
         assert_eq!(value, b"host sentinel");
+        let transfer = server
+            .clipboard
+            .open_private(&mut server.sessions, 7, "text/plain")?
+            .unwrap();
+        let mut send = next(&owner_events);
+        assert_eq!(decode_wayland_header(&send.bytes)?.object_id, 5);
+        File::from(send.fds.pop().unwrap())
+            .write_all(b"app copied text")
+            .unwrap();
+        assert_eq!(&*transfer.read().await?, b"app copied text");
         server
             .clipboard
             .switch(&mut server.sessions, receiver, 7, Origin::Model)?;
-        let model_offer = selection(&receiver_events);
+        let model_offer = selection(&receiver_events, &["text/plain"]);
         assert!(model_offer > human_offer);
-        assert_eq!(server.clipboard.private.get(&7), Some(&(owner, 5)));
+        assert_eq!(
+            server.clipboard.private.get(&7).and_then(Selection::app),
+            Some((owner, 5))
+        );
         assert_eq!(
             server.clipboard.devices[&(receiver, 4)].selected_host,
             Some(host_id)
         );
         server.remove_client_session(owner);
         assert_eq!(next(&receiver_events).bytes, encode_u32_message(4, 5, &[0]));
-        assert!(!server.clipboard.private.contains_key(&7));
+        assert!(server.clipboard.private_mimes(7).is_none());
+
+        let html = b"<b>private HTML</b>";
+        server.clipboard.write_private(
+            &mut server.sessions,
+            7,
+            BTreeMap::from([
+                ("text/html".into(), html.to_vec()),
+                ("text/plain".into(), b"private HTML".to_vec()),
+            ]),
+        )?;
+        let offer = selection(&receiver_events, &["text/html", "text/plain"]);
+        let (read, write) = clipboard_pipe()?;
+        request(
+            &mut server,
+            receiver,
+            string_request(offer, 1, "text/html"),
+            vec![write],
+        )?;
+        // A transfer already requested by the app retains the old selection.
+        server
+            .clipboard
+            .write_private(&mut server.sessions, 7, BTreeMap::new())?;
+        assert_eq!(next(&receiver_events).bytes, encode_u32_message(4, 5, &[0]));
+        let mut bytes = Vec::new();
+        tokio::net::unix::pipe::Receiver::from_owned_fd(read)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .await
+            .unwrap();
+        assert_eq!(bytes, html);
+        assert!(
+            server
+                .clipboard
+                .open_private(&mut server.sessions, 7, "text/html")?
+                .is_none()
+        );
+        assert_eq!(
+            server.clipboard.devices[&(receiver, 4)].selected_host,
+            Some(host_id)
+        );
         Ok(())
     }
 
@@ -918,7 +1090,7 @@ mod tests {
             encode_u32_message(4, 1, &[5, 123]),
             vec![],
         )?;
-        let _ = selection(&events);
+        let _ = selection(&events, &["text/plain"]);
         request(&mut server, client, encode_u32_message(1, 0, &[6]), vec![])?;
         assert_eq!(next(&host).bytes, encode_u32_message(2, 0, &[5]));
         assert_eq!(next(&host).bytes, encode_u32_message(1, 0, &[6]));
@@ -950,7 +1122,10 @@ mod tests {
         assert_eq!(next(&host).bytes, encode_u32_message(2, 0, &[7]));
         assert_eq!(next(&host).bytes, string_request(7, 0, "text/plain"));
         assert_eq!(next(&host).bytes, encode_u32_message(4, 1, &[7, 456]));
-        assert_eq!(server.clipboard.private.get(&7), Some(&(client, 5)));
+        assert_eq!(
+            server.clipboard.private.get(&7).and_then(Selection::app),
+            Some((client, 5))
+        );
         request(&mut server, client, encode_u32_message(5, 1, &[]), vec![])?;
         assert_eq!(next(&host).bytes, encode_u32_message(5, 1, &[]));
         let deletion = encode_u32_message(1, 1, &[5]);

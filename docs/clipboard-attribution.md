@@ -21,3 +21,25 @@ Each operation uses the current source, including delayed requests and requests
 using older offer IDs. Overlap requires no detection, reporting, warnings,
 rejection, transfer UI or special handling. Client-supplied actor labels cannot
 change the source.
+
+## JavaScript clipboard access
+
+```js
+await wayland.clipboard.write({
+  windowId,
+  formats: { "text/html": "<p><strong>Ready</strong> for review.</p>",
+             "text/plain": "Ready for review." },
+});
+await wayland.pressShortcut({ windowId, keys: ["CTRL", "v"] });
+```
+
+`wayland.clipboard.types({windowId})` lists the current MIME types in the
+window's private model selection. Use `read({windowId, mimeType})` for bytes
+or `readText({windowId, mimeType})` for UTF-8. Both return `null` when the
+requested format is absent. This works for selections copied by applications
+through model input as well as selections published by JS.
+
+`write` replaces the selection with the supplied MIME types. Values can be
+strings or `Uint8Array` objects. An empty format map clears the selection.
+Console reads and writes are limited to 1 MiB. For a window with multiple
+Wayland seats, pass the `seatId` reported by `wayland.inputCapabilities`.

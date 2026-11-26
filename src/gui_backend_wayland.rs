@@ -10,6 +10,7 @@ mod recording;
 mod scene;
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -758,6 +759,54 @@ impl GuiBackend for WaylandGuiBackend {
 }
 
 impl WaylandGuiBackend {
+    pub(crate) async fn clipboard_types(
+        &self,
+        window: &str,
+        seat_id: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let inner = self.state.inner.lock().await;
+        let seat = inner.clipboard_seat(window, seat_id)?;
+        Ok(inner.clipboard.private_mimes(seat).unwrap_or_default())
+    }
+
+    pub(crate) async fn write_clipboard(
+        &self,
+        window: &str,
+        seat_id: Option<&str>,
+        formats: BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
+        self.state
+            .deliver_mutation(|inner| {
+                let seat = inner.clipboard_seat(window, seat_id)?;
+                inner
+                    .clipboard
+                    .write_private(&mut inner.sessions, seat, formats)
+            })
+            .await
+    }
+
+    pub(crate) async fn read_clipboard(
+        &self,
+        window: &str,
+        seat_id: Option<&str>,
+        mime: &str,
+    ) -> Result<Option<Arc<[u8]>>, String> {
+        let transfer = {
+            let mut inner = self.state.inner.lock().await;
+            let seat = inner.clipboard_seat(window, seat_id)?;
+            let WaylandProxyServer {
+                clipboard,
+                sessions,
+                ..
+            } = &mut *inner;
+            clipboard.open_private(sessions, seat, mime)?
+        };
+        match transfer {
+            Some(transfer) => transfer.read().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn begin_observation(
         &self,
         window: String,
@@ -2360,6 +2409,31 @@ struct WaylandProxyServer {
 }
 
 impl WaylandProxyServer {
+    fn clipboard_seat(&self, window: &str, seat_id: Option<&str>) -> Result<u32, String> {
+        let session = self
+            .sessions
+            .values()
+            .find(|session| {
+                session
+                    .frame_tracker
+                    .windows
+                    .get(window)
+                    .is_some_and(|w| w.mapped)
+            })
+            .ok_or("clipboard target is not mapped")?;
+        let mut seats = session.seat_globals.values().copied();
+        if let Some(seat_id) = seat_id {
+            return seats
+                .find(|seat| seat_id == format!("seat:{}:{seat}", session.client_id.0))
+                .ok_or_else(|| "clipboard seat is not bound by the target window".into());
+        }
+        let seat = seats.next().ok_or("clipboard target has no Wayland seat")?;
+        if seats.any(|other| other != seat) {
+            return Err("clipboard target has multiple Wayland seats; specify seatId".into());
+        }
+        Ok(seat)
+    }
+
     fn mark_model_origin(&mut self, window: &str) -> Result<(), String> {
         let targets = self
             .sessions

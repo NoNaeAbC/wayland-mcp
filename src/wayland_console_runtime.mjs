@@ -1,6 +1,8 @@
 import vm from "node:vm";
 import readline from "node:readline";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { Buffer } from "node:buffer";
+import { inspect } from "node:util";
 
 // Permission categories are validated on every runtime start and restart.
 if (Number(process.versions.node.split(".")[0]) < 26 || !process.permission) {
@@ -14,6 +16,7 @@ const pendingNative = new Map();
 let nextNativeId = 1;
 const evalContext = new AsyncLocalStorage();
 const inputContext = new AsyncLocalStorage();
+const backgroundLogs = [];
 const MAX_LOG_ENTRIES = 500;
 const MAX_LOG_CHARS = 4096;
 const MAX_RESULT_CHARS = 1_000_000;
@@ -34,8 +37,7 @@ function printable(value) {
   return `${rendered.slice(0, MAX_LOG_CHARS)}… [truncated]`;
 }
 
-function appendLog(args) {
-  const logs = evalContext.getStore()?.logs;
+function appendLog(args, logs = evalContext.getStore()?.logs) {
   if (!logs) return;
   if (logs.length < MAX_LOG_ENTRIES) {
     logs.push(args.map(printable).join(" "));
@@ -43,6 +45,16 @@ function appendLog(args) {
     logs.push(`[additional console output omitted after ${MAX_LOG_ENTRIES} entries]`);
   }
 }
+
+process.on("unhandledRejection", reason => {
+  let detail;
+  try {
+    detail = inspect(reason, { customInspect: false, depth: 1, maxArrayLength: 10, maxStringLength: MAX_LOG_CHARS });
+  } catch {
+    detail = "Rejected promise could not be inspected";
+  }
+  appendLog(["Unhandled promise rejection:", detail], backgroundLogs);
+});
 
 function boundedResult(value) {
   let encoded;
@@ -59,10 +71,18 @@ function native(method, args = {}) {
   const id = nextNativeId++;
   const evalId = evalContext.getStore()?.id ?? null;
   const subscriptionId = inputContext.getStore()?.id ?? null;
-  write({type:"native_call", id, evalId, subscriptionId, method, args});
+  const message = {type:"native_call", id, evalId, subscriptionId, method, args};
+  if (method.startsWith("dbus_")) {
+    const frame = `${JSON.stringify(message)}\n`;
+    if (Buffer.byteLength(frame) > 2 * 1024 * 1024) {
+      return Promise.reject(new RangeError("D-Bus request exceeds the 2 MiB console limit"));
+    }
+    process.stdout.write(frame);
+  } else {
+    write(message);
+  }
   const promise = new Promise((resolve, reject) => pendingNative.set(id, {resolve, reject, evalId, subscriptionId}));
-  // Detached calls still reject when their evaluation ends; avoid turning that
-  // lifecycle cleanup into an unrelated unhandled-rejection process exit.
+  // Evaluation cleanup can reject an internal call after its consumer has ended.
   promise.catch(() => {});
   return promise;
 }
@@ -566,6 +586,18 @@ function resetInputState() {
 }
 
 const apiHelp = `Persistent JavaScript console. State survives calls.
+Await foreground operations before returning. Unhandled promise rejections
+from background work appear in the next evaluation's console output.
+
+D-Bus scripts use wayland.dbus. Open a normal client with connect({address})
+and invoke bus.call({destination,path,interface,member,signature,body}).
+For an app-specific bus, use open({session:true,accessibility:true}) and pass
+bridge.environment to the target app at launch. Use bridge.session and
+bridge.accessibility to call methods, observe app traffic, or serve JS handlers.
+Read ordinary client signals with bus.subscribe(matchRule, callback).
+Publish a local service with bus.serve({name}) and service.exportObject().
+List D-Bus protocol guides with wayland.dbus.help().
+Close resources with bus.close() or bridge.close().
 
 Open a Wayland connection over SSH from this console.
   return await wayland.connectSsh({host:"user@host"})
@@ -758,6 +790,13 @@ intervalMs/holdMs 0..60000. For spacing accents such as ^ on German keyboards,
 typeText can send the dead key followed by Space with a minimum interval of 35 ms around
 the sequence. This uses the app's compose support.
 "unicode-hex" is an opt-in application convention.
+Use wayland.clipboard.write({windowId,formats:{"text/html":"<b>Hello</b>","text/plain":"Hello"}})
+then pressShortcut({windowId,keys:["CTRL","v"]}) for rich text. Clipboard methods
+use the private model selection for the window's seat. types({windowId}) lists MIME
+types. read({windowId,mimeType}) returns a Uint8Array or null if the format is absent.
+readText({windowId,mimeType}) decodes UTF-8. Writes accept strings or Uint8Arrays.
+An empty formats map clears the selection. The console clipboard limit is 1 MiB.
+Pass a seatId from inputCapabilities if the window binds multiple seats.
 resizeWindow({windowId,width,height}) requests 1..8192 logical surface units; wait for
 a subsequent commit and reread dimensions/preview scale before using coordinates.
 resetInputState() clears helper pointer routing state, not delivered pressed keys.
@@ -905,8 +944,261 @@ const onVisualProgram = (args,callback) => {
   },"subscribe_visual_program");
 };
 
+const dbusDescriptors = new WeakMap();
+
+function dbusDescriptor(id) {
+  const descriptor = Object.freeze({
+    async read(maxBytes = 65536) {
+      return DBusBytes.from(Buffer.from(await native("dbus_fd_read", { id, limit: maxBytes }), "base64"));
+    },
+    async write(bytes) {
+      if (Object.prototype.toString.call(bytes) !== "[object Uint8Array]") {
+        throw new TypeError("descriptor writes require a Uint8Array");
+      }
+      let offset = 0;
+      while (offset < bytes.length) {
+        const chunk = bytes.subarray(offset, offset + 4096);
+        const count = await native("dbus_fd_write", { id, bytes: Buffer.from(chunk).toString("base64") });
+        if (!count) throw new Error("descriptor write made no progress");
+        offset += count;
+      }
+      return offset;
+    },
+    close: () => native("dbus_fd_close", { id }),
+  });
+  dbusDescriptors.set(descriptor, id);
+  return descriptor;
+}
+
+function encodeDBusValue(value, depth) {
+  if (depth >= 64) throw new RangeError("D-Bus value nesting exceeds the console limit");
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0))) {
+    return { double: Object.is(value, -0) ? "-0" : String(value) };
+  }
+  const tag = Object.prototype.toString.call(value);
+  if (tag === "[object Uint8Array]") return { bytes: Buffer.from(value).toString("base64") };
+  if (Array.isArray(value)) return Array.from(value, item => encodeDBusValue(item, depth + 1));
+  if (tag === "[object Object]") {
+    if (dbusDescriptors.has(value)) return { descriptor: dbusDescriptors.get(value) };
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodeDBusValue(item, depth + 1)]));
+  }
+  if (value === null || ["number", "string", "boolean"].includes(typeof value)) {
+    return value;
+  }
+  throw new TypeError(`unsupported D-Bus value ${tag}`);
+}
+
+function encodeDBusMessage(message) {
+  if (Object.prototype.toString.call(message) !== "[object Object]") {
+    throw new TypeError("expected a D-Bus message or reply object");
+  }
+  const { body, ...fields } = message;
+  if (body === undefined) return fields;
+  if (!Array.isArray(body)) throw new TypeError("D-Bus body must be an array");
+  return { ...fields, body: encodeDBusValue(body, 0) };
+}
+
+function decodeDBusValue(value) {
+  if (Array.isArray(value)) return value.map(decodeDBusValue);
+  switch (value?.kind) {
+    case "integer": return BigInt(value.value);
+    case "double": return Number(value.value);
+    case "bytes": return DBusBytes.from(Buffer.from(value.value, "base64"));
+    case "fd": return dbusDescriptor(value.value);
+    case "fdMetadata": return Object.freeze({ type: "unixFd" });
+    case "variant": return { signature: value.signature, value: decodeDBusValue(value.value) };
+    case "dictionary": {
+      const pairs = value.value.map(decodeDBusValue);
+      return value.stringKeys ? Object.fromEntries(pairs) : pairs;
+    }
+    default: return value;
+  }
+}
+
+const dbusHandlers = new Map();
+let nextDBusHandler = 1;
+
+function removeDBusHandlers(predicate) {
+  for (const [id, entry] of dbusHandlers) {
+    if (predicate(entry)) dbusHandlers.delete(id);
+  }
+}
+
+function dbusHandle({ id, uniqueName }, bridgeId, appFacing = false) {
+  let closing;
+  const register = async (operation, fields, callback) => {
+    const handler = nextDBusHandler++;
+    dbusHandlers.set(handler, { scope: id, bridgeId, callback });
+    try {
+      await native(operation, { id, handler, ...fields });
+    } catch (error) {
+      dbusHandlers.delete(handler);
+      throw error;
+    }
+    return handler;
+  };
+  const unregister = async (operation, handler) => {
+    try {
+      await native(operation, { id, handler });
+    } finally {
+      dbusHandlers.delete(handler);
+    }
+  };
+  return Object.freeze({
+    uniqueName,
+    fds: Object.freeze({ async pipe() {
+      const result = await native("dbus_pipe", { id });
+      return { readEnd: decodeDBusValue(result.readEnd), writeEnd: decodeDBusValue(result.writeEnd) };
+    } }),
+    async call(message) {
+      const result = await native("dbus_call", { id, message: encodeDBusMessage(message) });
+      return { ...result, body: decodeDBusValue(result.body) };
+    },
+    async emitSignal(message) {
+      await native("dbus_signal", { id, message: encodeDBusMessage(message) });
+    },
+    async subscribe(rule, callback) {
+      if (typeof callback !== "function") throw new TypeError("subscribe requires a callback");
+      const handler = await register("dbus_subscribe", { rule }, callback);
+      return Object.freeze({ unsubscribe: () => unregister("dbus_unsubscribe", handler) });
+    },
+    close() {
+      closing ??= native("dbus_close", { id }).then(() => {
+        removeDBusHandlers(entry => entry.scope === id);
+      }).catch(error => {
+        closing = undefined;
+        throw error;
+      });
+      return closing;
+    },
+    ...(appFacing ? {
+      async observe(match, callback) {
+        if (typeof callback !== "function") throw new TypeError("observe requires a callback");
+        const handler = await register("dbus_observe", { match }, callback);
+        return Object.freeze({ unsubscribe: () => unregister("dbus_unobserve", handler) });
+      },
+      async serve({ name }) {
+        const service = await native("dbus_serve", { id, name });
+        return dbusHandle(service, bridgeId);
+      },
+    } : bridgeId === null ? {} : {
+      async exportObject(definition, methods) {
+        const callbacks = new Map(Object.keys(definition.methods).map(name => {
+          if (!Object.hasOwn(methods, name) || typeof methods[name] !== "function") {
+            throw new TypeError(`missing handler for ${name}`);
+          }
+          return [name, methods[name]];
+        }));
+        const handler = await register("dbus_export", { definition }, call => callbacks.get(call.member)(call));
+        return Object.freeze({ unexport: () => unregister("dbus_unexport", handler) });
+      },
+    }),
+  });
+}
+
+async function acceptDBusEvent(event) {
+  const registration = dbusHandlers.get(event.handler);
+  if (!registration || registration.scope !== event.scope) return;
+  const message = { ...event.message, body: decodeDBusValue(event.message.body) };
+  if (event.direction !== undefined) {
+    message.direction = event.direction;
+    message.connection = event.connection;
+  }
+  return inputContext.run({ id: event.scope }, async () => {
+    if (event.call === undefined) {
+      await registration.callback(message);
+      return;
+    }
+    const afterReply = [];
+    let replying = false;
+    let answer;
+    try {
+      const result = await registration.callback({ ...message, afterReply(callback) {
+        if (replying) throw new Error("afterReply must be registered before returning a reply");
+        if (typeof callback !== "function") throw new TypeError("afterReply requires a callback");
+        afterReply.push(callback);
+      } });
+      answer = encodeDBusMessage(result ?? {});
+    } catch (error) {
+      answer = { errorName: "org.freedesktop.DBus.Error.Failed", errorMessage: String(error).slice(0, 4096) };
+    }
+    replying = true;
+    await native("dbus_reply", { id: event.call, answer });
+    if (!answer.errorName) {
+      for (const callback of afterReply) await callback();
+    }
+  });
+}
+
+const dbus = Object.freeze({
+  help: dbusProtocolHelp,
+  async connect({ address }) {
+    return dbusHandle(await native("dbus_connect", { address }), null);
+  },
+  async open(options = {}) {
+    const { id, environment, session, accessibility } = await native("dbus_open", options);
+    let closing;
+    return Object.freeze({ environment: Object.freeze(environment),
+      session: session ? dbusHandle(session, id, true) : undefined,
+      accessibility: accessibility ? dbusHandle(accessibility, id, true) : undefined,
+      close() {
+        closing ??= native("dbus_shutdown", { id }).then(() => {
+          removeDBusHandlers(entry => entry.bridgeId === id);
+        }).catch(error => {
+          closing = undefined;
+          throw error;
+        });
+        return closing;
+      },
+    });
+  },
+  atspi,
+  clipboard,
+  fileChooser: Object.freeze({ onChooseFile }),
+});
+
+async function readPrivateClipboard(args) {
+  const base64 = await native("clipboard_read", args);
+  return base64 === null ? null : Buffer.from(base64, "base64");
+}
+
+const privateClipboard = Object.freeze({
+  types: args => native("clipboard_types", args),
+  async write({ windowId, seatId, formats }) {
+    if (formats === null || typeof formats !== "object" || Array.isArray(formats)) {
+      throw new TypeError("clipboard write requires a MIME type to data map");
+    }
+    const entries = Object.entries(formats);
+    if (entries.length > 64) throw new Error("clipboard MIME limit exceeded");
+    let size = 0;
+    const encoded = Object.fromEntries(entries.map(([mime, data]) => {
+      if (!mime || Buffer.byteLength(mime) > 512 || mime.includes("\0")) {
+        throw new TypeError("invalid clipboard MIME type");
+      }
+      if (typeof data !== "string" && Object.prototype.toString.call(data) !== "[object Uint8Array]") {
+        throw new TypeError("clipboard data must be a string or Uint8Array");
+      }
+      size += Buffer.byteLength(data);
+      if (size > 1024 * 1024) throw new Error("console clipboard payload exceeds 1 MiB");
+      return [mime, Buffer.from(data).toString("base64")];
+    }));
+    await native("clipboard_write", { windowId, seatId, formats: encoded });
+  },
+  async read(args) {
+    const bytes = await readPrivateClipboard(args);
+    return bytes === null ? null : Uint8Array.from(bytes);
+  },
+  async readText(args) {
+    const bytes = await readPrivateClipboard(args);
+    return bytes === null ? null : bytes.toString("utf8");
+  },
+});
+
 const wayland = Object.freeze({
   help: apiHelp,
+  clipboard: privateClipboard,
+  dbus,
   onInput,
   onVisual,
   onVisualProgram,
@@ -968,10 +1260,11 @@ const context = vm.createContext({
   }),
 });
 context.globalThis = context;
+const DBusBytes = vm.runInContext("Uint8Array", context);
 
 async function evaluate(message) {
   const { id, code } = message;
-  const logs = [];
+  const logs = backgroundLogs.splice(0);
   await evalContext.run({ id, logs }, async () => {
     try {
       const source = `(async () => {\n${code}\n})()`;
@@ -1008,6 +1301,18 @@ lines.on("line", (line) => {
     return;
   }
   if (message.type === "input_event" || message.type === "input_end") { acceptInput(message); return; }
+  if (message.type === "dbus_event") {
+    void acceptDBusEvent(message)
+      .catch(error => console.error("D-Bus callback failed", error))
+      .finally(() => {
+        if (message.event !== undefined) write({ type: "dbus_event_done", event: message.event });
+      });
+    return;
+  }
+  if (message.type === "dbus_closed") {
+    removeDBusHandlers(entry => entry.scope === message.scope);
+    return;
+  }
   if (message.type === "native_result") {
     const pending = pendingNative.get(message.id);
     if (!pending) return;
