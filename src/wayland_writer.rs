@@ -138,11 +138,11 @@ impl ClientWriter {
     pub(crate) async fn wait(&self, sequence: u64) -> Result<(), String> {
         let mut delivered = self.shared.delivered.subscribe();
         loop {
-            if let Some(error) = self.shared.error.lock().unwrap().clone() {
-                return Err(error);
-            }
             if *delivered.borrow_and_update() >= sequence {
                 return Ok(());
+            }
+            if let Some(error) = self.shared.error.lock().unwrap().clone() {
+                return Err(error);
             }
             delivered
                 .changed()
@@ -157,5 +157,5 @@ impl ClientWriter {
 fn fail(shared: &Shared, error: String) {
     *shared.error.lock().unwrap() = Some(error);
     let _ = shared.socket.shutdown(std::net::Shutdown::Both);
-    shared.delivered.send_replace(u64::MAX);
+    shared.delivered.send_modify(|_| {});
 }

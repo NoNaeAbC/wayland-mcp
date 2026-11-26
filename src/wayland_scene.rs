@@ -197,7 +197,7 @@ impl WaylandFrameTracker {
                 );
             }
             format!(
-                "{detail}. Surface {} needs DMA-BUF backing for capture",
+                "{detail}. Trigger a redraw of surface {} while capture is waiting",
                 surface.id
             )
         } else {

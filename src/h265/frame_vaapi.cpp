@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 #include <unistd.h>
+#include <va/va.h>
 #include <va/va_drmcommon.h>
 #include <va/va_drm.h>
 #include <unordered_map>
@@ -269,13 +270,27 @@ namespace video_editor::h265 {
 			return std::unexpected(va_error("invalid upload extent", VA_STATUS_ERROR_INVALID_PARAMETER));
 		}
 		Image image{.display = display};
-		if (auto result = image.init(layout); !result) { return result; }
+		image.image.image_id = VA_INVALID_ID;
+		const char *vendor = vaQueryVendorString(display);
+		// iHD's NV12 vaPutImage can return success with corrupted rows when
+		// uploading a partial tile height. Map the synchronized surface directly.
+		const bool direct = layout.chroma == 420 && layout.depth == 8 && layout.height % 32 != 0 &&
+			vendor && std::string_view(vendor).starts_with("Intel iHD");
+		if (direct) {
+			const auto ready = vaSyncSurface(display, surface);
+			if (ready != VA_STATUS_SUCCESS) { return std::unexpected(va_error("synchronize upload surface", ready)); }
+			const auto derived = vaDeriveImage(display, surface, &image.image);
+			if (derived != VA_STATUS_SUCCESS) { return std::unexpected(va_error("derive upload surface", derived)); }
+		} else if (auto result = image.init(layout); !result) {
+			return result;
+		}
 		if (!fits_image(image.image, layout)) {
 			return std::unexpected(va_error("unexpected upload image layout", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT));
 		}
 		if (auto result = image.mapping(); !result) { return result; }
 		if (auto result = transfer<true>(image, layout, words); !result) { return result; }
 		if (auto result = image.unmap(); !result) { return result; }
+		if (direct) { return {}; }
 		const auto status = vaPutImage(display, surface, image.image.image_id, 0, 0, layout.width, layout.height,
 									   0, 0, layout.width, layout.height);
 		if (status != VA_STATUS_SUCCESS) { return std::unexpected(va_error("upload video frame", status)); }

@@ -178,7 +178,8 @@ For opaque sRGB DMA-BUFs, the driver can convert directly between RGB and
 encoder or decoder surfaces using VA video processing. The Vulkan shader
 handles other supported layouts. The bridge reads the producer's Wayland
 parametric color description and signals full-range BT.709 YCbCr with sRGB
-transfer. Tone mapping applies to FP16 RGB input. The compositor receives
+transfer. Explicit tone maps apply to FP16 RGB and tagged packed 10-bit HDR
+input. The compositor receives
 the converted SDR buffer, including 10-bit RGB for 10-bit RGB DMA-BUF sources.
 
 Untagged buffers default to sRGB. Use `sourceColor` to supply their color
@@ -289,7 +290,8 @@ return await wayland.videoFrame({
 ```
 
 Omit `chroma`, `bitDepth`, and `screenContent` to prefer 10-bit 4:4:4 SCC and
-fall back to 8-bit 4:2:0 HEVC Main when either endpoint lacks SCC support. Exact
+fall back to 8-bit 4:2:0 HEVC Main when either endpoint lacks SCC support. Set
+`chroma` with a number such as `444` or a string such as `"4:4:4"`. Exact
 requests also support 8- and 10-bit 4:2:0 and 4:4:4, and 10-bit 4:2:2 in the
 range-extension profile, subject to VA-API support on both codec devices.
 With explicit 4:4:4 sampling and no
@@ -305,9 +307,10 @@ the only render node if there is one. The import must succeed. Use
 
 Vulkan interprets the committed Wayland color description and assumes sRGB
 with BT.709 primaries for untagged surfaces. It uses linear FP16 BT.2020
-internally and composites alpha over black or a fixed checkerboard. Tone
-mapping applies to FP16 RGB input. The default `auto` applies a highlight
-knee to tagged HDR in that format. Set `toneMap: "curve"` and supply up to 16 ordered
+internally and composites alpha over black or a fixed checkerboard. Explicit
+tone maps apply to FP16 RGB and tagged packed 10-bit HDR input. The default
+`auto` applies a highlight knee to tagged FP16 HDR and clips other inputs. Set
+`toneMap: "curve"` and supply up to 16 ordered
 linear input/output knots with `toneCurve` to define a GPU-evaluated curve. The
 H.265 sequence signals full-range
 BT.709 YCbCr with the sRGB transfer function and centered chroma for 4:2:0.
@@ -378,8 +381,9 @@ images remain in memory, attach to the foreground response and return opaque
 `disposeImage(handle)` releases it early. New captures automatically evict the oldest
 handles when the 16-image/32 MiB cache fills and report `evictedImageHandles`.
 Evicted handles expire; manual disposal is optional. No PNG files or image paths are created.
-JavaScript does not receive image bytes or arbitrary GPU-buffer access. Recording
-can capture committed SHM pixels for scene composition. Screenshot imports use the
+JavaScript does not receive image bytes or arbitrary GPU-buffer access.
+Screenshots and recordings can capture committed SHM pixels for scene
+composition. Screenshot imports use the
 same canonical DRM-device context and serialized queue as programmable observers.
 When neither Wayland feedback nor the DMA-BUF exporter identifies a device,
 capture and visual observers can try the only DRM render node on the host.
@@ -430,6 +434,11 @@ and suggests buffer mode when the render buffer is DMA-BUF-backed.
 Screenshots report `commitSerial`, `baselineCommitSerial`, and `fresh`.
 `fresh: false` means the capture reused pixels already available at the
 baseline. A newer frame can still show an app partway through processing input.
+For example, an animation can commit while the app is handling a touch
+sequence. Use an application acknowledgment or check the intended visual
+state when the outcome matters. `captureNextFrame` waits for a newer pixel
+commit and times out if the producer stays idle. An idle SHM surface needs
+to redraw when the proxy has no copy and has already released its buffer.
 To capture a specific rendering child rather than a SHM parent, use
 `screenshot({windowId, surfaceId:30, coordinateSpace:"buffer"})` with a numeric
 surface ID from `windows().subsurfaces`. Explicit surface capture validates
@@ -582,21 +591,24 @@ Neither pixel counts nor samples are returned. Thresholds are finite and nonnega
 HDR values may exceed 1. Both fixed and programmable observers use the tracked
 source color profile or an explicit fallback for untagged buffers.
 
-Events contain only `windowId`, `ruleId`, `active`, processed `frame`,
+Events contain `windowId`, optional target `surfaceId`, `ruleId`, `active`, processed `frame`,
 `commitSerial`, observation `timestampMs`, `deliveryTimestampMs`, `sequence`,
 `sourceColor`, `epoch`, and `historyValid`.
 Rule order is stable within a processed commit. Frame debounce and cooldown run
 in the embedded compute kernel and count processed frames, not wall time.
-`maxFps` limits processing; intermediate commits may intentionally be skipped.
-History compares consecutive processed frames.
+`maxFps` limits processing. A busy GPU or running analysis can also cause
+commits to be skipped. History compares consecutive processed frames.
+Set `requireEveryFrame: true` on either observer to end the subscription
+with a gap error on the first skipped pixel commit. An active subscription
+can be idle while its producer submits no new pixels.
 
 The handle offers `status()` and `unsubscribe({drain:true})`. Inside its own
 callback use `drain:false`. Callback exceptions/timeouts, bounded-queue overflow,
 expiry, window destruction, and geometry/format/device changes terminate the
-stream explicitly. An overflow reports a gap; it does not silently drop events.
-Terminal status includes processed frames and CPU wall time spent in GPU
-submission/wait, including import work. These are operational metrics, not
-image-derived values.
+stream explicitly. An overflow reports a gap. `metrics()` remains available
+after termination and includes frame admission counts, the age of the last
+pixel commit and CPU wall time spent in GPU submission and wait, including
+import work.
 
 Budgets: one subscription per window, at most eight windows and sixteen rules
 per window. Each rectangle needs width/height at least four and area at least
@@ -744,8 +756,9 @@ In these tests the GPU image was in a subsurface. Find its current numeric
 `screenshot({windowId, surfaceId, coordinateSpace: "buffer"})` during an
 animation or start the capture before triggering a redraw. The raw image
 omits window decoration and viewport cropping. Input helpers still use
-window coordinates. Both visual subscription APIs rejected the
-shared-memory toplevels, and neither accepts a child `surfaceId`.
+window coordinates. Both visual subscription APIs accept that numeric
+`surfaceId` if the child commits independently. Synchronized children
+can still be captured by screenshot.
 
 ## Configuration
 
@@ -771,7 +784,8 @@ the environment in which the server runs.
   tree; assertions are based on frames, surface metadata, and application
   commits.
 - `typeText` supports characters directly represented in the target client's
-  active XKB layout by default. The opt-in `unicode-hex` method requires
+  active XKB layout. Spacing accents supplied by a dead key and Space are
+  paced to give the toolkit time to compose. The opt-in `unicode-hex` method requires
   application support for Ctrl+Shift+U; other compose or input-method-mediated
   text requires an input-method companion.
 

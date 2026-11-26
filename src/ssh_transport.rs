@@ -64,12 +64,24 @@ pub(crate) async fn stage_executable(
         .arg(format!("sh -c {}", quote(script.into())?))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(if batch {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("start SSH executable staging: {error}"))?;
     let mut stdin = child.stdin.take().ok_or("missing SSH staging stdin")?;
     let stdout = child.stdout.take().ok_or("missing SSH staging stdout")?;
+    let diagnostic = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = (&mut stderr).take(8192).read_to_end(&mut bytes).await;
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+            bytes
+        })
+    });
     let request = format!("wayland-mcp upload {digest}");
     let mut uploaded = false;
     let mut lines = BufReader::new(stdout).take(4096).lines();
@@ -97,7 +109,20 @@ pub(crate) async fn stage_executable(
             });
         }
     }
-    Err("SSH did not report a staged wayland-mcp executable".into())
+    drop(stdin);
+    let failure = "SSH did not report a staged wayland-mcp executable";
+    if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        if let Some(diagnostic) = diagnostic
+            && let Ok(Ok(stderr)) = tokio::time::timeout(Duration::from_secs(1), diagnostic).await
+        {
+            let message = String::from_utf8_lossy(&stderr);
+            if !message.trim().is_empty() {
+                return Err(format!("{failure} ({status}): {}", message.trim()));
+            }
+        }
+        return Err(format!("{failure} ({status})"));
+    }
+    Err(failure.into())
 }
 
 fn executable_digest(executable: &[u8]) -> Result<String, String> {

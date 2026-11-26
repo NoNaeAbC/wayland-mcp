@@ -269,6 +269,7 @@ struct Rule {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Args {
     window_id: String,
+    surface_id: Option<u32>,
     rules: Vec<Rule>,
     #[serde(default)]
     source_color: Option<Value>,
@@ -278,6 +279,8 @@ struct Args {
     duration_ms: u64,
     #[serde(default)]
     callback_timeout_ms: Option<u32>,
+    #[serde(default)]
+    require_every_frame: bool,
 }
 fn validate(args: &Args) -> Result<(Vec<GpuRule>, Vec<Rect>), String> {
     if args.window_id.is_empty()
@@ -395,6 +398,7 @@ fn default_feedback() -> String {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProgramArgs {
     window_id: String,
+    surface_id: Option<u32>,
     passes: Vec<PassArgs>,
     result_bytes: u32,
     #[serde(default = "default_state")]
@@ -415,6 +419,8 @@ struct ProgramArgs {
     duration_ms: u64,
     #[serde(default)]
     callback_timeout_ms: Option<u32>,
+    #[serde(default)]
+    require_every_frame: bool,
 }
 impl ProgramArgs {
     fn config(&self, width: u32, height: u32) -> Result<ProgramConfig, String> {
@@ -470,6 +476,7 @@ impl ProgramArgs {
 }
 struct Stream {
     window: String,
+    surface: Option<u32>,
     affinity: (u32, u32),
     program: Arc<ProgramSlot>,
     names: Vec<String>,
@@ -478,6 +485,8 @@ struct Stream {
     bytes: Arc<AtomicUsize>,
     deadline: Instant,
     period: Duration,
+    require_every_frame: bool,
+    last_pixel_commit: Option<Instant>,
     last: Option<Instant>,
     sequence: u64,
     frames: u64,
@@ -490,6 +499,29 @@ struct Stream {
     alpha_mode: u32,
     color_profile: Option<GpuColorProfile>,
     epoch: u64,
+}
+impl Stream {
+    fn metrics(&self, active: bool) -> Value {
+        let processing_ms = self.gpu_ns as f64 / 1e6;
+        json!({
+            "framesProcessed": self.frames,
+            "processingMs": processing_ms,
+            "meanProcessingMs": if self.frames > 0 { processing_ms / self.frames as f64 } else { 0.0 },
+            "acquisitionMs": self.acquisition_ns as f64 / 1e6,
+            "analysisInFlight": active && self.in_flight,
+            "admission": self.admission,
+            "lastPixelCommitAgeMs": self.last_pixel_commit.map(|time| time.elapsed().as_millis()),
+            "leaseRemainingMs": if active { self.deadline.saturating_duration_since(Instant::now()).as_millis() } else { 0 },
+        })
+    }
+
+    fn skip(&mut self, reason: &'static str) -> Result<Option<CapturedFrame>, String> {
+        *self.admission.entry(reason).or_default() += 1;
+        if self.require_every_frame {
+            return Err(format!("visual stream missed a pixel commit ({reason})"));
+        }
+        Ok(None)
+    }
 }
 #[derive(Default)]
 struct State {
@@ -878,6 +910,7 @@ impl VisualHub {
             id,
             Stream {
                 window: args.window_id.clone(),
+                surface: args.surface_id,
                 affinity,
                 program: Arc::new(ProgramSlot {
                     native: Mutex::new(Program(program, false)),
@@ -889,6 +922,8 @@ impl VisualHub {
                 bytes: bytes.clone(),
                 deadline: Instant::now() + Duration::from_millis(args.duration_ms),
                 period: Duration::from_secs_f64(1.0 / f64::from(args.max_fps)),
+                require_every_frame: args.require_every_frame,
+                last_pixel_commit: None,
                 last: None,
                 sequence: 0,
                 frames: 0,
@@ -905,7 +940,7 @@ impl VisualHub {
         );
         Ok(crate::input_events::Subscription {
             id,
-            initial: json!({"windowId":args.window_id,"coordinateSpace":"buffer","drmDevice":{"major":affinity.0,"minor":affinity.1},"pixelsReadable":false,"maxFps":args.max_fps}),
+            initial: json!({"windowId":args.window_id,"surfaceId":args.surface_id,"coordinateSpace":"buffer","drmDevice":{"major":affinity.0,"minor":affinity.1},"pixelsReadable":false,"maxFps":args.max_fps}),
             events,
             bytes,
             end,
@@ -990,6 +1025,7 @@ impl VisualHub {
             id,
             Stream {
                 window: args.window_id.clone(),
+                surface: args.surface_id,
                 affinity,
                 program,
                 names: Vec::new(),
@@ -998,6 +1034,8 @@ impl VisualHub {
                 bytes: bytes.clone(),
                 deadline: Instant::now() + Duration::from_millis(args.duration_ms),
                 period: Duration::from_secs_f64(1.0 / f64::from(args.max_fps)),
+                require_every_frame: args.require_every_frame,
+                last_pixel_commit: None,
                 last: None,
                 sequence: 0,
                 frames: 0,
@@ -1014,7 +1052,7 @@ impl VisualHub {
         );
         Ok(crate::input_events::Subscription {
             id,
-            initial: json!({"windowId":args.window_id,"bufferWidth":width,"bufferHeight":height,"coordinateSpace":"buffer","frameFormat":"rgba16f-linear-bt2020","resultBytes":args.result_bytes,"pixelsReadable":false,"maxFps":args.max_fps}),
+            initial: json!({"windowId":args.window_id,"surfaceId":args.surface_id,"bufferWidth":width,"bufferHeight":height,"coordinateSpace":"buffer","frameFormat":"rgba16f-linear-bt2020","resultBytes":args.result_bytes,"pixelsReadable":false,"maxFps":args.max_fps}),
             events,
             bytes,
             end,
@@ -1023,13 +1061,18 @@ impl VisualHub {
     pub(crate) fn is_visual(id: u64) -> bool {
         id >= (1u64 << 52)
     }
+    #[cfg(test)]
     pub(crate) fn interested(&self, window: &str) -> bool {
+        self.target(window).is_some()
+    }
+    pub(crate) fn target(&self, window: &str) -> Option<(u64, Option<u32>)> {
         self.inner
             .lock()
             .unwrap()
             .streams
-            .values()
-            .any(|s| s.window == window && s.deadline > Instant::now())
+            .iter()
+            .find(|(_, s)| s.window == window && s.deadline > Instant::now())
+            .map(|(id, s)| (*id, s.surface))
     }
     pub(crate) fn active_windows(&self) -> HashSet<String> {
         let now = Instant::now();
@@ -1060,15 +1103,17 @@ impl VisualHub {
             .streams
             .get(&id)
             .ok_or("visual subscription is not active")?;
-        Ok(
-            json!({"framesProcessed":s.frames,"processingMs":s.gpu_ns as f64/1e6,"meanProcessingMs":if s.frames>0{s.gpu_ns as f64/1e6/s.frames as f64}else{0.0},"acquisitionMs":s.acquisition_ns as f64/1e6,"analysisInFlight":s.in_flight,"admission":s.admission,"leaseRemainingMs":s.deadline.saturating_duration_since(Instant::now()).as_millis()}),
-        )
+        Ok(s.metrics(true))
     }
     pub(crate) fn stop(&self, id: u64, reason: &str) -> Result<Value, String> {
         let stream = self.inner.lock().unwrap().streams.remove(&id);
         Ok(if let Some(stream) = stream {
             let error = reason.strip_prefix("visual_error: ");
-            let end = json!({"reason":reason,"error":error,"sequence":stream.sequence,"framesProcessed":stream.frames,"processingMs":stream.gpu_ns as f64/1e6,"acquisitionMs":stream.acquisition_ns as f64/1e6,"meanProcessingMs":if stream.frames>0 {stream.gpu_ns as f64/1e6/stream.frames as f64}else{0.0}});
+            let metrics = stream.metrics(false);
+            let end = json!({"reason":reason,"error":error,"sequence":stream.sequence,
+                "framesProcessed":metrics["framesProcessed"],"processingMs":metrics["processingMs"],
+                "acquisitionMs":metrics["acquisitionMs"],"meanProcessingMs":metrics["meanProcessingMs"],
+                "metrics": metrics});
             stream.end.send_replace(Some(end.clone()));
             end
         } else {
@@ -1120,7 +1165,7 @@ impl VisualHub {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture(
         &self,
-        window: &str,
+        id: u64,
         affinity: (u32, u32),
         key: u64,
         width: u32,
@@ -1134,8 +1179,7 @@ impl VisualHub {
     ) -> Result<Option<CapturedFrame>, String> {
         let selected = {
             let mut state = self.inner.lock().unwrap();
-            let Some((id, stream)) = state.streams.iter_mut().find(|(_, s)| s.window == window)
-            else {
+            let Some(stream) = state.streams.get_mut(&id) else {
                 return Ok(None);
             };
             if stream.affinity != affinity {
@@ -1152,27 +1196,25 @@ impl VisualHub {
             if now >= stream.deadline {
                 return Ok(None);
             }
+            stream.last_pixel_commit = Some(now);
             if stream.in_flight {
-                *stream.admission.entry("analysisBusy").or_default() += 1;
-                return Ok(None);
+                return stream.skip("analysisBusy");
             }
             if stream
                 .last
                 .is_some_and(|t| now.duration_since(t) < stream.period)
             {
-                *stream.admission.entry("rateLimited").or_default() += 1;
-                return Ok(None);
+                return stream.skip("rateLimited");
             }
             stream.in_flight = true;
             (
-                *id,
                 stream.program.clone(),
                 now,
                 stream.fallback_color.clone(),
                 stream.alpha_mode,
             )
         };
-        let (id, program, start, fallback_color, alpha_mode) = selected;
+        let (program, start, fallback_color, alpha_mode) = selected;
         let (acquired, profile, color) = {
             let native = program.native.lock().unwrap();
             let mut wait_acquire = Some(wait_acquire);
@@ -1184,7 +1226,7 @@ impl VisualHub {
                         let mut state = self.inner.lock().unwrap();
                         if let Some(stream) = state.streams.get_mut(&id) {
                             stream.in_flight = false;
-                            *stream.admission.entry("deviceBusy").or_default() += 1;
+                            return stream.skip("deviceBusy");
                         }
                         return Ok(None);
                     }
@@ -1308,7 +1350,7 @@ impl VisualHub {
                     .iter()
                     .map(|b| u32::from_le_bytes(*b))
                     .collect();
-                let value = json!({"windowId":stream.window,"words":words,"frame":stream.frames,"commitSerial":captured.serial,"timestampMs":captured.timestamp,"deliveryTimestampMs":self.start.elapsed().as_secs_f64()*1000.0,"sequence":stream.sequence,"sourceColor":captured.color,"epoch":captured.epoch,"historyValid":captured.history_valid});
+                let value = json!({"windowId":stream.window,"surfaceId":stream.surface,"words":words,"frame":stream.frames,"commitSerial":captured.serial,"timestampMs":captured.timestamp,"deliveryTimestampMs":self.start.elapsed().as_secs_f64()*1000.0,"sequence":stream.sequence,"sourceColor":captured.color,"epoch":captured.epoch,"historyValid":captured.history_valid});
                 let bytes = value.to_string().len();
                 stream.bytes.fetch_add(bytes, Ordering::Relaxed);
                 if stream
@@ -1324,7 +1366,7 @@ impl VisualHub {
                 events[..n as usize].sort_by_key(|e| e.rule);
                 for event in &events[..n as usize] {
                     stream.sequence += 1;
-                    let value = json!({"windowId":stream.window,"ruleId":stream.names[event.rule as usize],"active":event.active!=0,"frame":event.frame,"commitSerial":captured.serial,"timestampMs":captured.timestamp,"deliveryTimestampMs":self.start.elapsed().as_secs_f64()*1000.0,"sequence":stream.sequence,"sourceColor":captured.color,"epoch":captured.epoch,"historyValid":captured.history_valid});
+                    let value = json!({"windowId":stream.window,"surfaceId":stream.surface,"ruleId":stream.names[event.rule as usize],"active":event.active!=0,"frame":event.frame,"commitSerial":captured.serial,"timestampMs":captured.timestamp,"deliveryTimestampMs":self.start.elapsed().as_secs_f64()*1000.0,"sequence":stream.sequence,"sourceColor":captured.color,"epoch":captured.epoch,"historyValid":captured.history_valid});
                     let bytes = value.to_string().len();
                     stream.bytes.fetch_add(bytes, Ordering::Relaxed);
                     if stream
@@ -1466,7 +1508,7 @@ mod tests {
         }
         assert!(
             hub.capture(
-                "w",
+                sub.id,
                 (226, minor),
                 0,
                 64,
@@ -1490,7 +1532,7 @@ mod tests {
         let submission = device.submission.lock().unwrap();
         assert!(
             hub.capture(
-                "w",
+                sub.id,
                 (226, minor),
                 0,
                 64,

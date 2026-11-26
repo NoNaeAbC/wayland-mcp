@@ -57,6 +57,7 @@ pub(crate) struct FrameRequest {
     pub after_commit_serial: Option<u64>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    #[serde(default, deserialize_with = "deserialize_chroma")]
     chroma: Option<u32>,
     bit_depth: Option<u32>,
     screen_content: Option<bool>,
@@ -73,6 +74,29 @@ pub(crate) struct FrameRequest {
     pub exposure: f32,
     #[serde(default)]
     pub background: Background,
+}
+
+fn deserialize_chroma<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Sampling {
+        Number(u32),
+        Label(String),
+    }
+    match Option::<Sampling>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Sampling::Number(chroma)) => Ok(Some(chroma)),
+        Some(Sampling::Label(label)) => match label.as_str() {
+            "420" | "4:2:0" => Ok(Some(420)),
+            "422" | "4:2:2" => Ok(Some(422)),
+            "444" | "4:4:4" => Ok(Some(444)),
+            _ => Err(serde::de::Error::custom(
+                "chroma must be 420, 422, or 444 (also 4:2:0, 4:2:2, or 4:4:4)",
+            )),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -546,11 +570,14 @@ impl FrameRequest {
     }
 
     pub(crate) fn effective_tone_map(&self, format: u32, hdr: bool) -> ToneMap {
-        if !matches!(format.to_le_bytes(), [b'X' | b'A', b'B', b'4', b'H']) {
+        let bytes = format.to_le_bytes();
+        let float = matches!(bytes, [b'X' | b'A', b'B', b'4', b'H']);
+        let packed_hdr = hdr && matches!(bytes, [b'X' | b'A', b'R' | b'B', b'3', b'0']);
+        if !float && !packed_hdr {
             return ToneMap::Clip;
         }
         match self.tone_map {
-            ToneMap::Auto if hdr => ToneMap::Knee,
+            ToneMap::Auto if hdr && float => ToneMap::Knee,
             ToneMap::Auto => ToneMap::Clip,
             mode => mode,
         }
@@ -2754,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_is_only_enabled_for_float_sources() {
+    fn explicit_tone_mapping_accepts_tagged_packed_hdr_as_well_as_float() {
         let request =
             serde_json::from_value::<FrameRequest>(json!({"windowId": "", "toneMap": "knee"}))
                 .unwrap();
@@ -2765,18 +2792,34 @@ mod tests {
             decode_gpu: DECODE.into(),
             format: MAIN,
         };
-        for (fourcc, mode) in [
-            (b"XR24", ToneMap::Clip),
-            (b"XR30", ToneMap::Clip),
-            (b"XB4H", ToneMap::Knee),
+        for (fourcc, hdr, mode) in [
+            (b"XR24", true, ToneMap::Clip),
+            (b"XR30", false, ToneMap::Clip),
+            (b"XR30", true, ToneMap::Knee),
+            (b"XB4H", true, ToneMap::Knee),
         ] {
             assert_eq!(
                 request
-                    .options(64, 64, u32::from_le_bytes(*fourcc), true, &selection)
+                    .options(64, 64, u32::from_le_bytes(*fourcc), hdr, &selection)
                     .unwrap()
                     .tone_map,
                 mode as u32
             );
+        }
+    }
+
+    #[test]
+    fn chroma_accepts_numeric_and_colon_separated_formats() {
+        for (input, chroma) in [
+            (json!(420), 420),
+            (json!("4:2:2"), 422),
+            (json!("444"), 444),
+            (json!("4:4:4"), 444),
+        ] {
+            let request =
+                serde_json::from_value::<FrameRequest>(json!({"windowId":"w","chroma":input}))
+                    .unwrap();
+            assert_eq!(request.chroma, Some(chroma));
         }
     }
 }

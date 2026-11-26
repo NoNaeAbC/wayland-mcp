@@ -60,6 +60,8 @@ pub(crate) struct GuiWaylandKeyboardEventRequest {
     pub(crate) window_id: Option<String>,
     pub(crate) surface_id: Option<String>,
     pub(crate) event: GuiWaylandKeyboardEvent,
+    pub(crate) ensure_focus: bool,
+    pub(crate) allow_missing_window: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +88,7 @@ pub(crate) struct GuiKeyboardTextPlan {
     pub(crate) alt_modifier: Option<u32>,
     pub(crate) logo_modifier: Option<u32>,
     pub(crate) strokes: Vec<GuiKeyboardTextStroke>,
+    pub(crate) compose_starts: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -294,7 +297,7 @@ pub(crate) trait GuiBackend: Send + Sync {
     async fn emit_wayland_keyboard_event(
         &self,
         request: GuiWaylandKeyboardEventRequest,
-    ) -> Result<String, String>;
+    ) -> Result<Option<String>, String>;
 
     async fn keyboard_text_plan(
         &self,
@@ -433,7 +436,7 @@ impl GuiBackendHandle {
     pub(crate) async fn emit_wayland_keyboard_event(
         &self,
         request: GuiWaylandKeyboardEventRequest,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         match self {
             Self::Command(backend) => backend.emit_wayland_keyboard_event(request).await,
             #[cfg(unix)]
@@ -542,7 +545,7 @@ impl GuiBackend for CommandGuiBackend {
     async fn emit_wayland_keyboard_event(
         &self,
         _request: GuiWaylandKeyboardEventRequest,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         Err("raw Wayland keyboard events are unavailable on the command backend".to_string())
     }
 

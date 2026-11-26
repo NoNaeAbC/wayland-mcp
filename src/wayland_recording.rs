@@ -203,42 +203,11 @@ async fn capture_scene(
     }) else {
         return Ok(None);
     };
-    let tracker = &mut session.frame_tracker;
     if recover_shm {
-        // Only the initial observation needs to recover an in-flight SHM use.
-        // A compositor release already delivered to the client is irreversible.
-        for surface in tracker.surfaces.values_mut().filter(|surface| {
-            tracker
-                .surface_to_window
-                .get(&surface.id)
-                .is_some_and(|id| id == window)
-                && surface.has_committed_buffer
-                && surface.rgba.is_empty()
-        }) {
-            let Some(buffer_id) = surface.buffer_id else {
-                continue;
-            };
-            if session.released_buffers.contains(&buffer_id)
-                || surface.last_release.is_some()
-                || surface.last_acquire.is_some()
-                || session
-                    .object_interfaces
-                    .get(&buffer_id)
-                    .map(String::as_str)
-                    != Some("wl_buffer")
-            {
-                continue;
-            }
-            if let Some(TrackedBufferSource::Shm(shm)) =
-                surface.buffer_ref.as_ref().map(|buffer| &buffer.source)
-                && let Ok(frame) = shm.read_rgba()
-            {
-                surface.rgba = Arc::new(frame.rgba);
-                surface.capture_error = None;
-            }
-        }
+        session.retain_current_shm(window);
     }
-    tracker
+    session
+        .frame_tracker
         .scene_for_capture(window)
         .map(|scene| Some(scene.into_owned()))
 }
@@ -254,7 +223,7 @@ async fn initial_scene(
                 if tokio::time::Instant::now() >= deadline {
                     return Err(error);
                 }
-                tokio::time::timeout_at(deadline, state.snapshot_current_gpu(Some(window)))
+                tokio::time::timeout_at(deadline, state.snapshot_current_pixels(Some(window)))
                     .await
                     .map_err(|_| error)??;
                 tokio::time::sleep(Duration::from_millis(30)).await;

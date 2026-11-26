@@ -23,6 +23,7 @@
 #include <poll.h>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <unordered_map>
 #include <variant>
@@ -31,6 +32,7 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <va/va.h>
 #include <va/va_drmcommon.h>
 #include <va/va_vpp.h>
 #include <vulkan/vulkan_core.h>
@@ -1339,7 +1341,10 @@ extern "C" int ssh_video_convert_buffer(const Video_Options *options, const Vide
 			config.exposure == 1.0f && config.background == 0 && (config.mode & WITH_ALPHA) == 0) {
 			config.mode |= IDENTITY_SDR;
 		}
-		if (plane && (config.mode & IDENTITY_SDR) != 0 && !target->_with_alpha &&
+		// iHD VPP can silently misread the integrated Tile 4 CCS layout.
+		// The Vulkan import path honors this modifier.
+		if (plane && plane->_modifier != I915_FORMAT_MOD_4_TILED_LNL_CCS &&
+			(config.mode & IDENTITY_SDR) != 0 && !target->_with_alpha &&
 			!((config.width | config.height) & 1U) && (config.format == DRM_FORMAT_XRGB8888 ||
 				config.format == DRM_FORMAT_XBGR8888 || config.format == DRM_FORMAT_XRGB2101010 ||
 				config.format == DRM_FORMAT_XBGR2101010)) {
@@ -1671,7 +1676,12 @@ extern "C" int ssh_video_decode(const char *device, const Video_Options *options
 			if (!surface) { return std::unexpected("decode produced no GPU alpha surface"); }
 			mask = *surface;
 		}
-		if (destination && !mask && !((options->width | options->height) & 1U)) {
+		// Use compute to crop padded pictures. iHD VPP can leave the bottom
+		// right corner unwritten when the visible and coded extents differ.
+		const char *vendor = vaQueryVendorString(va_color->display);
+		const bool padded_ihd = (options->width != layout.width || options->height != layout.height) &&
+			vendor && std::string_view(vendor).starts_with("Intel iHD");
+		if (destination && !mask && !padded_ihd && !((options->width | options->height) & 1U)) {
 			if (state.presentation_owner != va_color->owner) {
 				state.presentation_owner = va_color->owner;
 				state.presentation = std::make_unique<Va_Processor>(*va_color);

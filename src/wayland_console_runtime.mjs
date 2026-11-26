@@ -249,9 +249,14 @@ async function scroll({ windowId, deltaY, ...coordinates }) {
 }
 
 async function enterKeyboardTarget(windowId, events) {
-  // A wl_keyboard.key has no surface argument; establish the requested target
-  // for every operation, independently of desktop input and previous calls.
-  events.push(await native("keyboard_event", { windowId, event: { type: "enter", keys: [] } }));
+  events.push(await native("keyboard_event", { windowId, ensureFocus: true, event: { type: "enter", keys: [] } }));
+}
+
+async function finishKeyboardEvent(windowId, event, events) {
+  const result = await native("keyboard_event", { windowId, event, allowMissingWindow: true });
+  if (result.surfaceDisappeared) return true;
+  events.push(result);
+  return false;
 }
 
 async function pressKey({ windowId, key, holdMs = 40 }) {
@@ -269,6 +274,7 @@ async function pressKey({ windowId, key, holdMs = 40 }) {
   await enterKeyboardTarget(windowId, events);
   let keyDown = false;
   let modifiersChanged = false;
+  let surfaceDisappeared = false;
   try {
     if (plan !== null) {
       modifiersChanged = true;
@@ -280,28 +286,28 @@ async function pressKey({ windowId, key, holdMs = 40 }) {
     keyDown = true;
     events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
     if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
-    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
+    surfaceDisappeared = await finishKeyboardEvent(windowId, { type: "key", key: keyCode, state: 0 }, events);
     keyDown = false;
   } finally {
     try {
       if (keyDown) {
-        await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } });
+        surfaceDisappeared = await finishKeyboardEvent(windowId, { type: "key", key: keyCode, state: 0 }, events);
       }
     } finally {
-      if (modifiersChanged) {
-        events.push(await native("keyboard_event", { windowId, event: {
+      if (modifiersChanged && !surfaceDisappeared) {
+        surfaceDisappeared = await finishKeyboardEvent(windowId, {
           type: "modifiers",
           mods_depressed: plan.restore_mods_depressed,
           mods_latched: plan.restore_mods_latched,
           mods_locked: plan.restore_mods_locked,
           group: plan.layout_group,
-        } }));
+        }, events);
       }
     }
   }
   return {
     delivered: true, key, keyCode, holdMs, keymapDriven: plan !== null,
-    modifierMask: stroke?.modifiers ?? null, events,
+    modifierMask: stroke?.modifiers ?? null, events, ...(surfaceDisappeared ? {surfaceDisappeared} : {}),
   };
 }
 
@@ -340,6 +346,7 @@ async function pressShortcut({ windowId, keys, holdMs = 40 }) {
   await enterKeyboardTarget(windowId, events);
   let keyDown = false;
   let modifiersChanged = false;
+  let surfaceDisappeared = false;
   try {
     modifiersChanged = true;
     events.push(await native("keyboard_event", { windowId, event: {
@@ -349,26 +356,26 @@ async function pressShortcut({ windowId, keys, holdMs = 40 }) {
     keyDown = true;
     events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 1 } }));
     if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
-    events.push(await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } }));
+    surfaceDisappeared = await finishKeyboardEvent(windowId, { type: "key", key: keyCode, state: 0 }, events);
     keyDown = false;
   } finally {
     try {
       if (keyDown) {
-        await native("keyboard_event", { windowId, event: { type: "key", key: keyCode, state: 0 } });
+        surfaceDisappeared = await finishKeyboardEvent(windowId, { type: "key", key: keyCode, state: 0 }, events);
       }
     } finally {
-      if (modifiersChanged) {
-        events.push(await native("keyboard_event", { windowId, event: {
+      if (modifiersChanged && !surfaceDisappeared) {
+        surfaceDisappeared = await finishKeyboardEvent(windowId, {
           type: "modifiers",
           mods_depressed: plan.restore_mods_depressed,
           mods_latched: plan.restore_mods_latched,
           mods_locked: plan.restore_mods_locked,
           group: plan.layout_group,
-        } }));
+        }, events);
       }
     }
   }
-  return { delivered: true, keys, keyCode, modifierMask: depressed, holdMs, events };
+  return { delivered: true, keys, keyCode, modifierMask: depressed, holdMs, events, ...(surfaceDisappeared ? {surfaceDisappeared} : {}) };
 }
 
 async function typeText({ windowId, text, intervalMs = 0, inputMethod = "keymap" }) {
@@ -392,12 +399,13 @@ async function typeText({ windowId, text, intervalMs = 0, inputMethod = "keymap"
     return { delivered: true, text, inputMethod };
   }
   const plan = await native("keyboard_text_plan", { windowId, text, allowCompose: true });
+  const composeStarts = new Set(plan.compose_starts);
   const events = [];
   await enterKeyboardTarget(windowId, events);
   let depressed = null;
   let keyDown = null;
   try {
-    for (const stroke of plan.strokes) {
+    for (const [index, stroke] of plan.strokes.entries()) {
       if (stroke.modifiers !== depressed) {
         depressed = stroke.modifiers;
         events.push(await native("keyboard_event", { windowId, event: {
@@ -409,7 +417,11 @@ async function typeText({ windowId, text, intervalMs = 0, inputMethod = "keymap"
       events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 1 } }));
       events.push(await native("keyboard_event", { windowId, event: { type: "key", key: stroke.key, state: 0 } }));
       keyDown = null;
-      if (intervalMs > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      // Give the toolkit time to process the prior edit, the dead key, and
+      // its compose commit. Plain typing keeps the caller's requested pace.
+      const compose = composeStarts.has(index + 1) || composeStarts.has(index) || composeStarts.has(index - 1);
+      const delay = compose ? Math.max(intervalMs, 35) : intervalMs;
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     }
   } finally {
     try {
@@ -613,14 +625,15 @@ with buffer_kind "dmabuf" and has_committed_buffer true. Pass its numeric surfac
 as surfaceId to the buffer screenshot above. Capture during animation, or start the
 screenshot before an action that causes a redraw. An idle child can time out.
 The raw child capture leaves out window geometry, decorations and viewport cropping.
-onVisual and onVisualProgram cannot target that child by surfaceId.
+onVisual and onVisualProgram accept a numeric surfaceId for an independently committed DMA-BUF child.
 videoFrame({windowId}) captures a root DMA-BUF as a verified H.265 IDR picture. It prefers
 10-bit 4:4:4 SCC and falls back to 8-bit 4:2:0 Main based on both codec devices.
-Set chroma and bitDepth to choose sampling and depth. For 4:4:4, omit screenContent
+Set chroma (for example 444 or "4:4:4") and bitDepth to choose sampling and depth. For 4:4:4, omit screenContent
 to prefer SCC with a range-extension fallback, or set it to pin the profile. Options include
 encodeGpu and decodeGpu (DRM render-node
 paths), qp (0..51), toneMap ("auto", "clip", "knee", "reinhard", "curve"),
-exposure, and background ("black", "checkerboard"). Tone maps apply to FP16 input. A custom curve accepts
+exposure, and background ("black", "checkerboard"). Explicit tone maps apply to FP16 and
+tagged packed 10-bit HDR. A custom curve accepts
 toneCurve: [[0,0],[1,0.8],[4,1]] in linear reference-white units. The Vulkan
 shader evaluates it. Set afterCommitSerial to require a newer commit, with an
 optional timeoutMs. When the producer omits DRM feedback, captureGpu selects
@@ -632,7 +645,7 @@ recordingStatus({recordingId}) reports framesWritten, bytesWritten and stopReaso
 endRecording({recordingId}) stops early and finishes the buffered pictures.
 The server also stops at maxFrames, the recording duration, 512 MiB, or low disk space.
 Recordings include the window's subsurfaces and alpha blending against black.
-If an idle SHM surface has already released its buffer, it must redraw for capture.
+An idle SHM surface with no retained pixels must redraw after capture starts.
 configureSshVideo(options) changes video settings for the connected bridge.
 For terminal testing, start the bridge with --ssh-wayland user@host -- bash.
 A bridge started from a terminal uses WAYLAND_MCP_SSH_VIDEO_SOCKET for video
@@ -649,7 +662,7 @@ screenshot in window coordinates waits up to 250 ms for new pixels, then returns
 the readable current frame. Each screenshot reports commitSerial, baselineCommitSerial,
 and fresh. fresh is true when the captured pixels were updated after the baseline.
 A new frame can still show an app partway through processing input.
-captureNextFrame({windowId,afterCommitSerial,timeoutMs:5000}) requires newer pixels;
+captureNextFrame({windowId,afterCommitSerial,timeoutMs:1000}) requires newer pixels;
 timeoutMs is 1..10000. Omitting afterCommitSerial uses the current commit as baseline.
 Prefer actAndCapture({windowId,action:()=>wayland.click({windowId,x,y}),timeoutMs:5000});
 it starts observation BEFORE action, captures relative to the prior commit, and returns
@@ -660,13 +673,14 @@ beginObservation({windowId,durationMs:5000}) returns {id,durationMs}; duration i
 endObservation({id}) ends that lease. Leases expire automatically (at most 32 active).
 Capture/input leases and active visual subscriptions drive committed frame callbacks
 without raising host windows. Input keeps its target rendering/capturable for 500 ms.
-An already-released producer buffer is never reread; a missing/stale owned GPU copy
-is a capture error. Enable observation before an action to retain its fresh pixels.
+The proxy retains SHM and GPU pixels for capture during a lease and may reuse an
+owned copy. It cannot reread released buffers. Enable observation before an action
+to retain its fresh pixels.
 Continuous onVisual/onVisualProgram analysis keeps frames/history/scratch/state on GPU;
 only declared bounded result records reach JS. No shader-file/SPIR-V uploads.
 GLSL source strings compile in memory; fixed trusted kernels are embedded at build time.
 Observe mapped proxied windows with environment(), diagnostics(), windows(), waitForWindow().
-visualInfo({windowId}) reports buffer dimensions, scale/viewport, format and DRM affinity;
+visualInfo({windowId,surfaceId}) reports buffer dimensions, scale/viewport, format and DRM affinity;
 these are protocol metadata, without reading pixels or certifying a successful GPU import.
 Programmable GPU observer: await wayland.onVisualProgram({windowId,
  passes:[{source:glslString,dispatch:[groupsX,groupsY,groupsZ]}],resultBytes:32,
@@ -696,7 +710,9 @@ For linear BT.709 RGB use rows (1.660491,-0.587641,-0.072850),
 1..8 passes, each source <=256KiB. Use uint atomics for boolean flags.
 Scratch/result zero each frame; state carried forward or previousResult copied GPU-only.
 Geometry/format/device changes terminate; resubscribe resets history and state.
-Callbacks can conditionally emit input between console calls. handle.metrics() reports cost/skips.
+Callbacks can conditionally emit input between console calls. handle.metrics() reports
+cost, skips and last pixel commit age, including after the subscription ends.
+Set requireEveryFrame:true to terminate on the first skipped pixel commit.
 Subscribe: await wayland.onVisual({windowId,rules:[{id:"signal",rect:[x,y,width,height],
 kind:"luminance",threshold:0.5,minPixels:8,polarity:"below",debounceFrames:1,cooldownFrames:1}],
 maxFps:60,durationMs:120000}, async event => { /* programmed reaction */ });
@@ -713,11 +729,11 @@ Supports all advertised 8-bit/10-bit/FP16 RGB DMA-BUF formats, known DRM feedbac
 sourceColor has the same fallback/alpha semantics as onVisualProgram.
 Buffer scaling and destination-only viewport scaling are supported in raw buffer coordinates.
 Unsupported geometry/buffers terminate with an error; no CPU/software fallback.
-Events: {windowId,ruleId,active,frame,commitSerial,timestampMs,deliveryTimestampMs,sequence}.
+Events: {windowId,surfaceId,ruleId,active,frame,commitSerial,timestampMs,deliveryTimestampMs,sequence}.
 Only events are transferred to CPU. Rule order is stable within each observed commit.
 The callback runs between evaluations and may perform asynchronous input operations.
 Handle: {id,initialState,status(),unsubscribe({drain:true})}; use drain:false inside callback.
-callbackTimeoutMs defaults to 5000 (1..120000); status reports active/queued/error/end.
+callbackTimeoutMs defaults to 5000 (1..120000); a timeout ends with reason callback_timeout.
 Visual handles also have metrics(): CPU operational counters for commits/admission/timing/lease;
 these counters report no pixel-derived values and do not read any GPU pixel state.
 Bounded queues fail with a gap on overflow; callback errors terminate the subscription.
@@ -739,7 +755,8 @@ modifiers CTRL/SHIFT/ALT/META first, primary key last. Character keys use the ta
 keymap; required character modifiers (for example Shift for +) are added automatically.
 typeText({windowId,text,intervalMs:0,inputMethod:"keymap"}); max 512 characters,
 intervalMs/holdMs 0..60000. For spacing accents such as ^ on German keyboards,
-typeText can send the dead key followed by Space. This uses the app's compose support.
+typeText can send the dead key followed by Space with a minimum interval of 35 ms around
+the sequence. This uses the app's compose support.
 "unicode-hex" is an opt-in application convention.
 resizeWindow({windowId,width,height}) requests 1..8192 logical surface units; wait for
 a subsequent commit and reread dimensions/preview scale before using coordinates.
@@ -796,9 +813,9 @@ function acceptInput(message) {
   if (state.cancelled) { state.discarded++; return; }
   const bytes = JSON.stringify(message.event).length;
   if (state.queued >= 256 || state.bytes + bytes > 4*1024*1024) {
-    state.error = "input callback queue overflow; recording has a gap";
+    state.error = state.visual ? "visual callback queue overflow; stream has a gap" : "input callback queue overflow; recording has a gap";
     state.cancelled = true;
-    void inputContext.run({id:state.id}, () => native("unsubscribe_input", {id:state.id})).catch(() => {});
+    void inputContext.run({id:state.id}, () => stopFailedCallback(state, "callback_overflow"));
     return;
   }
   state.queued++; state.bytes += bytes;
@@ -807,24 +824,41 @@ function acceptInput(message) {
     if (state.cancelled) { state.discarded++; return; }
     await inputContext.run({id:state.id}, async () => {
       let timer;
+      let timedOut = false;
       try {
         await Promise.race([
           Promise.resolve().then(() => state.callback(message.event)),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("input callback exceeded its time limit")), state.callbackTimeoutMs); }),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              reject(new Error(`${state.visual ? "visual" : "input"} callback exceeded its time limit`));
+            }, state.callbackTimeoutMs);
+          }),
         ]);
       } catch (error) {
         state.error = printable(error?.stack ?? error); state.cancelled = true;
-        try { await native("unsubscribe_input", {id:state.id}); await native("finish_input", {id:state.id}); } catch {}
+        await stopFailedCallback(state, timedOut ? "callback_timeout" : "callback_error");
       } finally { clearTimeout(timer); }
     });
   });
+}
+async function stopFailedCallback(state, reason) {
+  try {
+    const end = await native("unsubscribe_input", {id:state.id, reason});
+    if (!state.end && end.reason !== "already_stopped") {
+      state.end = end;
+      state.resolveEnd();
+      inputSubscriptions.delete(state.id);
+    }
+    await native("finish_input", {id:state.id});
+  } catch {}
 }
 async function subscribeStream(args, callback, method) {
   if (typeof callback !== "function") throw new TypeError("onInput callback must be a function");
   const callbackTimeoutMs = args?.callbackTimeoutMs ?? 5000;
   if (!Number.isInteger(callbackTimeoutMs) || callbackTimeoutMs < 1 || callbackTimeoutMs > 120000) throw new RangeError("callbackTimeoutMs must be from 1 through 120000");
   const start = await native(method, args);
-  const state = {id:start.id, callback, callbackTimeoutMs, tail:Promise.resolve(), queued:0, bytes:0, cancelled:false, discarded:0, error:null, end:null};
+  const state = {id:start.id, callback, callbackTimeoutMs, visual:method.startsWith("subscribe_visual"), tail:Promise.resolve(), queued:0, bytes:0, cancelled:false, discarded:0, error:null, end:null};
   state.ended = new Promise(resolve => { state.resolveEnd = resolve; });
   inputSubscriptions.set(state.id, state);
   const buffered = earlyInput.get(state.id) ?? []; earlyInput.delete(state.id);
@@ -832,7 +866,17 @@ async function subscribeStream(args, callback, method) {
   return Object.freeze({
     id:state.id, initialState:start.initialState,
     status: () => ({active:!state.end && !state.cancelled, queued:state.queued, discarded:state.discarded, error:state.error ?? state.end?.error ?? null, end:state.end}),
-    ...(method.startsWith("subscribe_visual") ? {metrics: () => native("visual_metrics",{id:state.id})} : {}),
+    ...(state.visual ? {metrics: async () => {
+      if (state.end?.metrics) return structuredClone(state.end.metrics);
+      try {
+        return await native("visual_metrics",{id:state.id});
+      } catch (error) {
+        if (error.message !== "visual subscription is not active") throw error;
+        await state.ended;
+        if (!state.end?.metrics) throw error;
+        return structuredClone(state.end.metrics);
+      }
+    }} : {}),
     unsubscribe: async ({drain=true}={}) => {
       if (drain && inputContext.getStore()?.id === state.id) throw new Error("cannot drain a subscription from its own callback; use drain:false");
       if (!drain) state.cancelled = true;

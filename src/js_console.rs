@@ -491,7 +491,7 @@ async fn run_node_session(
                                     match backend.input_hub() { Some(hub) => hub.subscribe(&args), None => Err("input subscriptions require the Wayland proxy".into()) }
                                 } else {
                                     match &backend {
-                                        GuiBackendHandle::Wayland(backend) => if method == "subscribe_visual_program" { backend.subscribe_visual_program(&args).await } else { backend.subscribe_visual(&args).await },
+                                        GuiBackendHandle::Wayland(backend) => backend.subscribe_visual(&args, method == "subscribe_visual_program").await,
                                         _ => Err("visual subscriptions require the Wayland proxy".into()),
                                     }
                                 };
@@ -511,9 +511,12 @@ async fn run_node_session(
                         }
                         if method == "unsubscribe_input" {
                             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
+                            let reason = args["reason"].as_str()
+                                .filter(|reason| matches!(*reason, "callback_timeout" | "callback_error" | "callback_overflow"))
+                                .unwrap_or("unsubscribed");
                             let result = if crate::visual_events::VisualHub::is_visual(id) {
-                                match (&visual_hub,subscriptions.get(&id)) { (Some(hub),Some(_)) => hub.stop(id,"unsubscribed"), _ => Err("unknown subscription".into()) }
-                            } else { match (&hub, subscriptions.get(&id)) { (Some(hub), Some(_)) => hub.stop(id,"unsubscribed"), _ => Err("unknown subscription".into()) } };
+                                match (&visual_hub,subscriptions.get(&id)) { (Some(hub),Some(_)) => hub.stop(id,reason), _ => Err("unknown subscription".into()) }
+                            } else { match (&hub, subscriptions.get(&id)) { (Some(hub), Some(_)) => hub.stop(id,reason), _ => Err("unknown subscription".into()) } };
                             let reply = match result { Ok(value) => json!({"type":"native_result","id":call_id,"ok":true,"value":value}), Err(error) => json!({"type":"native_result","id":call_id,"ok":false,"error":error}) };
                             active_calls.remove(&call_id); if outgoing.try_send(reply).is_err() { break "console output queue is full".into(); } continue;
                         }
@@ -708,6 +711,7 @@ async fn handle_native_call(
                     .visual_info(
                         &optional_string(&args, "windowId")
                             .ok_or("visualInfo requires windowId")?,
+                        crate::gui_backend_wayland::surface_object_id(&args)?,
                     )
                     .await?,
                 None,
@@ -809,16 +813,7 @@ async fn handle_native_call(
                     .filter(|id| !id.is_empty())
                     .ok_or("screenshot requires an explicit windowId")?,
             );
-            let surface_id = match args.get("surfaceId") {
-                None => None,
-                Some(value) => Some(
-                    value
-                        .as_u64()
-                        .and_then(|id| u32::try_from(id).ok())
-                        .filter(|id| *id > 0)
-                        .ok_or("screenshot surfaceId must be a positive protocol object ID")?,
-                ),
-            };
+            let surface_id = crate::gui_backend_wayland::surface_object_id(&args)?;
             if surface_id.is_some()
                 && args.get("coordinateSpace").and_then(Value::as_str) == Some("window")
             {
@@ -959,8 +954,16 @@ async fn handle_native_call(
                     window_id: window_id.clone(),
                     surface_id: optional_string(&args, "surfaceId"),
                     event,
+                    ensure_focus: args["ensureFocus"] == true,
+                    allow_missing_window: args["allowMissingWindow"] == true,
                 })
                 .await?;
+            let Some(result) = result else {
+                return Ok((
+                    json!({"delivered": false, "surfaceDisappeared": true}),
+                    None,
+                ));
+            };
             artifacts.record(
                 "console_wayland_keyboard_event_emitted",
                 json!({"window_id":window_id, "event":retained_event, "result":result}),
@@ -1076,6 +1079,8 @@ mod tests {
         keyboard_events: StdMutex<Vec<GuiWaylandKeyboardEventRequest>>,
         fail_pointer_event_once_at: StdMutex<Option<usize>>,
         fail_keyboard_event_once_at: StdMutex<Option<usize>>,
+        close_on_key_down: bool,
+        window_closed: std::sync::atomic::AtomicBool,
         pointer_event_attempts: AtomicUsize,
         keyboard_event_attempts: AtomicUsize,
     }
@@ -1098,7 +1103,11 @@ mod tests {
             Some(self.input.clone())
         }
         async fn list_windows(&self) -> Result<Vec<GuiWindowInfo>, String> {
-            Ok(self.windows.clone())
+            Ok(if self.window_closed.load(Ordering::Relaxed) {
+                Vec::new()
+            } else {
+                self.windows.clone()
+            })
         }
 
         async fn screenshot(&self, _request: GuiScreenshotRequest) -> Result<Vec<u8>, String> {
@@ -1152,7 +1161,19 @@ mod tests {
         async fn emit_wayland_keyboard_event(
             &self,
             request: GuiWaylandKeyboardEventRequest,
-        ) -> Result<String, String> {
+        ) -> Result<Option<String>, String> {
+            if self.window_closed.load(Ordering::Relaxed) {
+                return if request.allow_missing_window {
+                    Ok(None)
+                } else {
+                    Err("test window is no longer mapped".into())
+                };
+            }
+            if self.close_on_key_down
+                && matches!(request.event, GuiWaylandKeyboardEvent::Key { state: 1, .. })
+            {
+                self.window_closed.store(true, Ordering::Relaxed);
+            }
             let attempt = self.keyboard_event_attempts.fetch_add(1, Ordering::Relaxed);
             let mut fail_once = self
                 .fail_keyboard_event_once_at
@@ -1167,7 +1188,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(request);
-            Ok("recorded keyboard event".to_string())
+            Ok(Some("recorded keyboard event".to_string()))
         }
 
         async fn keyboard_text_plan(
@@ -1241,6 +1262,7 @@ mod tests {
                 // These are inverse mappings from a German XKB keymap,
                 // notably Z on evdev 21 and ? on evdev 12.
                 strokes,
+                compose_starts: Vec::new(),
             })
         }
     }
@@ -1413,6 +1435,23 @@ mod tests {
                 .unwrap()
                 .contains("injected pointer event failure")
         );
+        assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn act_and_capture_reports_close_during_key_sequence() {
+        let mut backend = observed_action_backend();
+        Arc::get_mut(&mut backend).unwrap().close_on_key_down = true;
+        let console = JsConsole::new(
+            GuiBackendHandle::Test(backend.clone()),
+            Arc::new(ArtifactStore::new()),
+        );
+        let output = console.eval("return await wayland.actAndCapture({windowId:'fixture',action:()=>wayland.pressKey({windowId:'fixture',key:'Escape',holdMs:0})});".into()).await.unwrap();
+        assert_eq!(output.value["surfaceDisappeared"], true);
+        assert_eq!(output.value["actionResult"]["delivered"], true);
+        assert_eq!(output.value["actionResult"]["surfaceDisappeared"], true);
+        assert_eq!(output.value["captureError"], Value::Null);
+        assert!(output.images.is_empty());
         assert_eq!(backend.observation_count.load(Ordering::Relaxed), 0);
     }
 

@@ -1,15 +1,44 @@
 #!/usr/bin/env python3
 """Exercise release MCP captures and both observers against a live Vulkan cube.
 
-Requires vkcube, Pillow, the built release binary and an accessible Wayland/DRM
-session. Decodes returned PNGs in memory; writes no image artifacts. No mock
-backend or synthetic frame source is used.
+Requires vkcube, Pillow, FFmpeg, the release binary and a Wayland session with
+Vulkan and VA-API access. Decodes PNGs and recordings in memory. Recordings
+are written in the temporary test directory.
 """
 import importlib.util, pathlib, tempfile, os, json, time, base64, hashlib, io
+import subprocess
 from PIL import Image
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('live',ROOT/'scripts/validate-live.py')
 live=importlib.util.module_from_spec(spec);spec.loader.exec_module(live)
+
+def check_recording(mcp, window_id, producer_height):
+    start = mcp.js(
+        f"return await wayland.startRecording({{windowId:{window_id}, maxFrames:8, frameRate:12}});"
+    )
+
+    def finished():
+        status = mcp.js(f"return await wayland.recordingStatus({{recordingId:{start['recordingId']}}});")
+        return status if status["stopReason"] else None
+
+    status = live.wait_until(finished, "complete H.265 recording")
+    assert status["framesWritten"] == 8 and status["stopReason"] == "frame_limit", status
+    width, height = status["width"], status["height"]
+    decoded = subprocess.run(
+        ["ffmpeg", "-v", "error", "-threads", "1", "-i", start["path"], "-filter_threads", "1",
+         "-pix_fmt", "rgb24", "-c:v", "rawvideo", "-threads:v", "1", "-f", "rawvideo", "pipe:1"],
+        capture_output=True, check=True,
+    ).stdout
+    frame_bytes = width * height * 3
+    assert len(decoded) == 8 * frame_bytes, (width, height, len(decoded))
+    for frame in range(8):
+        start_byte = frame * frame_bytes
+        image = Image.frombytes("RGB", (width, height), decoded[start_byte:start_byte + frame_bytes])
+        for x, y in [(8, 8), (width - 9, 8), (8, producer_height - 9), (width - 9, producer_height - 9)]:
+            pixel = image.getpixel((x, y))
+            assert all(abs(channel - 51) <= 6 for channel in pixel), (width, height, frame, x, y, pixel)
+    print("RECORDING", width, producer_height, height, "eight frames with correct background pixels", flush=True)
+
 with tempfile.TemporaryDirectory(prefix='mcp-live-review-') as temp:
  d=pathlib.Path(temp)
  try:
@@ -65,6 +94,20 @@ with tempfile.TemporaryDirectory(prefix='mcp-live-review-') as temp:
   reclaimed=m.js('const w=await wayland.onVisualProgram('+json.dumps(args)+',()=>{});const id=w.id;await w.unsubscribe();return id;')
   assert reclaimed,'late compiler registration was not reclaimed'
   print('CANCELLED_COMPILATION_RECLAIMED',reclaimed,flush=True)
+  cube.terminate()
+  cube.wait(timeout=5)
+  m.js('return await wayland.waitForWindowGone({windowId:'+wid+'});')
+  for width, height in ((480, 300), (480, 320), (512, 300), (512, 320)):
+   producer = live.spawn(['vkcube','--wsi','wayland','--width',str(width),'--height',str(height)],
+                         client_env,d,f'recording-client-{width}x{height}')
+   try:
+    window = m.js('return await wayland.waitForWindow({});')
+    assert (window['width'], window['height']) == (width, height), window
+    check_recording(m, json.dumps(window['window_id']), height)
+   finally:
+    producer.terminate()
+    producer.wait(timeout=5)
+   m.js('return await wayland.waitForWindowGone({windowId:'+json.dumps(window['window_id'])+'});')
   assert not list(d.rglob('*.png')),'unexpected image files'
   print('PASS: live release MCP captures changing Vulkan frames and delivers GPU program callbacks, no image files.',flush=True)
  finally:

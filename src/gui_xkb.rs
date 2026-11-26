@@ -12,6 +12,7 @@ pub(crate) struct TextStroke {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextPlan {
     pub(crate) strokes: Vec<TextStroke>,
+    pub(crate) compose_starts: Vec<usize>,
     pub(crate) shift_modifier: Option<u32>,
     pub(crate) control_modifier: Option<u32>,
     pub(crate) alt_modifier: Option<u32>,
@@ -117,6 +118,7 @@ pub(crate) fn plan_text(
     }
 
     let mut strokes = Vec::with_capacity(text.chars().count());
+    let mut compose_starts = Vec::new();
     let find = |symbol| find_stroke(keymap.0, layout_group, symbol);
     for character in text.chars() {
         if let Some(stroke) = find(character_keysym(character)) {
@@ -125,6 +127,7 @@ pub(crate) fn plan_text(
             && let Some(dead_key) = spacing_accent_keysym(character).and_then(find)
             && let Some(space) = find(character_keysym(' '))
         {
+            compose_starts.push(strokes.len());
             strokes.extend([dead_key, space]);
         } else {
             let hint = if allow_compose {
@@ -140,6 +143,7 @@ pub(crate) fn plan_text(
     }
     Ok(TextPlan {
         strokes,
+        compose_starts,
         shift_modifier: modifier_mask(keymap.0, b"Shift\0"),
         control_modifier: modifier_mask(keymap.0, b"Control\0"),
         alt_modifier: modifier_mask(keymap.0, b"Mod1\0"),
